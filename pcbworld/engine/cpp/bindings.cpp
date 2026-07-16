@@ -24,6 +24,13 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
         .def_readonly( "x", &PNS_BRIDGE::DRCViolation::x )
         .def_readonly( "y", &PNS_BRIDGE::DRCViolation::y );
 
+    py::class_<PNS_BRIDGE::NetPad>( m, "NetPad" )
+        .def_readonly( "net", &PNS_BRIDGE::NetPad::net )
+        .def_readonly( "pad_name", &PNS_BRIDGE::NetPad::padName )
+        .def_readonly( "x", &PNS_BRIDGE::NetPad::x )
+        .def_readonly( "y", &PNS_BRIDGE::NetPad::y )
+        .def_readonly( "layer", &PNS_BRIDGE::NetPad::layer );
+
     py::class_<PNS_BRIDGE>( m, "PNSBridge" )
         .def( py::init<>() )
         .def( "load_board", &PNS_BRIDGE::LoadBoard, py::arg( "path" ) )
@@ -39,6 +46,8 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
               py::arg( "force_finish" ) = false, py::arg( "force_commit" ) = false )
         .def( "commit_routing", &PNS_BRIDGE::CommitRouting )
         .def( "stop_routing", &PNS_BRIDGE::StopRouting )
+        .def( "reset", &PNS_BRIDGE::Reset )
+        .def( "net_pads", &PNS_BRIDGE::NetPads )
         .def( "run_drc", &PNS_BRIDGE::RunDRC )
         .def( "set_mode", &PNS_BRIDGE::SetMode )
         .def( "set_track_width", &PNS_BRIDGE::SetTrackWidth )

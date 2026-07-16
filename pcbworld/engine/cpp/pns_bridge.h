@@ -91,6 +91,33 @@ public:
     void CommitRouting();
     void StopRouting();
 
+    // Removes all routed copper (tracks/vias/arcs -- BOARD::Tracks()
+    // includes all three, PCB_VIA/PCB_ARC derive from PCB_TRACK) while
+    // leaving footprint placement untouched, then rebuilds the PNS world
+    // against the now-bare board. Lets an RL episode retry routing (or
+    // move on to a differently-ordered net sequence) without a disk
+    // round-trip through LoadBoard(). Roadmap item: "reset() needs to walk
+    // the board's tracks/vias and remove them while preserving footprint
+    // placement."
+    void Reset();
+
+    struct NetPad
+    {
+        std::string net;
+        std::string padName;   // "<footprint reference>:<pad number>"
+        int x, y;
+        int layer;   // always -1 (pad may span multiple copper layers) --
+                      // matches query_hover_items's "any layer" convention
+    };
+
+    // Enumerates every pad on the board. The only other way to find a pad
+    // is QueryHoverItems() at a specific (x, y), which requires already
+    // knowing where every pad is from some external source -- fine for a
+    // hand-written toy-board test, not workable for an agent or generator
+    // that needs to route an arbitrary board's nets programmatically.
+    // Group by `net` in Python to get per-net pad lists for sequencing.
+    std::vector<NetPad> NetPads() const;
+
     struct DRCViolation
     {
         int errorCode;            // DRCE_* (drc_rule.h) -- stable numeric id

@@ -105,27 +105,66 @@ direction gets picked below — do these first.
    introducing a real violation (e.g. a too-tight clearance) on the toy
    board to confirm `RunDRC()` actually catches it, not just that it runs
    clean.
-2. **`reset()` + multi-net routing.** Only proven on exactly one net on a
-   toy board so far. `PNS_BRIDGE_IFACE::RemoveItem` already exists;
-   `reset()` needs to walk the board's tracks/vias and remove them while
-   preserving footprint placement. Then test on boards with real net
-   counts (5-40+), including net *sequencing* (order matters a lot for
-   final routing quality — this is itself a design decision for the env).
-3. **Synthetic board generator** (`pcbworld/data/`, currently empty).
-   Something D2-like from the PCBWorld paper: small gridless boards,
-   4-6 nets, 2 layers, via support — needed as training data regardless
-   of which agent architecture gets built. Use the system `pcbnew` module
-   (subprocess, per constraint #1 above) to construct these, the same way
-   `scripts/make_toy_board.py` does.
-4. **The Gym environment** (`pcbworld/env/`, currently empty). Wrap
-   `PNS_BRIDGE` in `step()`/`reset()`. Reward: potential-based shaping on
-   DRC violations, wirelength, via count (see the PCBWorld paper summary
-   in `docs/engine_access.md`'s intro context, or re-derive from
-   `docs/performance.md`'s framing). Multi-process env workers per
-   constraint #2.
-5. **Baseline agent.** Small PPO on the synthetic boards, matching the
-   paper's setup closely enough to sanity-check against their numbers
-   before attempting anything novel.
+2. **`reset()` + multi-net routing — code written, not yet Colab-verified.**
+   Added `PNS_BRIDGE::Reset()` (walks `BOARD::Tracks()` — covers segments/
+   vias/arcs — removing each via `BOARD::Remove()`, then `ClearWorld()`/
+   `SyncWorld()` against the same `BOARD` instance, preserving footprint
+   placement) and `PNS_BRIDGE::NetPads()` (enumerates every pad on the
+   board so an agent/script can find route endpoints programmatically
+   instead of guessing coordinates via `query_hover_items()`). Bound as
+   `PNSBridge.reset()`/`PNSBridge.net_pads()`. Only ever tested on one net
+   on a toy board so far, still — this is new, uncompiled C++, same
+   "expect iteration from real Colab output" caveat as everything else in
+   this doc.
+3. **Synthetic board generator — implemented and locally verified.**
+   `pcbworld/data/generate_board.py`: gridless 2-layer boards, N two-pad
+   nets (default 5), positions rejection-sampled for minimum spacing.
+   Deliberately simpler than the paper's full D2 spec (two-terminal nets
+   only, not arbitrary fanout) — matches `scripts/make_toy_board.py`'s
+   existing pattern rather than introducing new pcbnew API risk. Actually
+   run against the local KiCad 9.0 install
+   (`C:\Program Files\KiCad\9.0\bin\python.exe`) and round-tripped through
+   `pcbnew.LoadBoard()` to confirm footprint/pad/net counts and positions
+   — this one *is* verified, unlike the C++ pieces, since it only uses
+   system `pcbnew` (no Colab/bridge dependency).
+4. **The Gym environment — implemented, Python logic locally verified,
+   real router behavior not yet observed.** `pcbworld/env/pcb_route_env.py`:
+   `PCBRouteEnv(gym.Env)`, one net routed per "leg", nets sequenced across
+   an episode (`net_order` param — deliberately left as a caller choice,
+   not decided here, since ROADMAP already flagged sequencing as its own
+   design question). Action: `Box(4,)` = push delta (x, y) + fix/via
+   thresholds. Reward: potential-based shaping on wirelength, via count,
+   and `run_drc()`-reported error count (checked once per net-finish, not
+   every step — `DRC_ENGINE` is a full-board check). Observation is a
+   small 5-vector (delta-to-target, progress, via count, DRC errors) —
+   deliberately not the paper's Fourier-feature geometry encoding; see
+   "novel SOTA agent" below for where a richer encoder could go later.
+   Verified locally with `tests/fake_bridge.py` (a stand-in
+   `pcbworld_pns_bridge` module) exercising `reset()`/`step()` control flow
+   end to end (`tests/test_pcb_route_env.py`) — this catches Python bugs
+   only, not whether the reward signal makes sense against real routing,
+   which needs the actual bridge in Colab.
+5. **Baseline PPO agent — implemented, training loop locally verified,
+   never seen a real reward signal.** `pcbworld/agents/ppo_baseline.py`:
+   plain-PyTorch single-process PPO (MLP actor-critic, GAE, clipped
+   surrogate) — deliberately not matching the paper's Transformer policy,
+   this is the "does the plumbing work" baseline ROADMAP asked for, not a
+   paper-matching comparison yet. `tests/test_ppo_baseline.py` runs the
+   full rollout-collect → GAE → update loop against the fake bridge and
+   confirms finite losses/weights — real per-CPU-core multiprocessing
+   (`docs/performance.md`) isn't implemented, single env only.
+
+Items 2-5 above are batched into one commit deliberately, so only **one**
+more Colab rebuild is needed to pick up all of it (per-item rebuilds were
+the slow part previously). Item 2 is the only piece touching the compiled
+bridge; items 3-5 are pure Python and need no recompile at all once item
+2's build succeeds. First things to check once that Colab run happens:
+does `b.reset()` actually leave footprints in place and let a second
+`start_route()` succeed on the same board; does an episode of
+`PCBRouteEnv` against a real `generate_board.py` board produce sane
+(non-exploding) rewards; does `ppo_baseline.py` training against that env
+show *any* learning signal (even just "manages to finish nets more often
+over time") as opposed to just "doesn't crash".
 
 ## The "novel SOTA agent" — candidate directions
 

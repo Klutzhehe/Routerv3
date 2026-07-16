@@ -5,6 +5,7 @@
 #include <board_item_container.h>
 #include <board_design_settings.h>
 #include <project/net_settings.h>
+#include <footprint.h>
 #include <netinfo.h>
 #include <pad.h>
 #include <padstack.h>
@@ -394,6 +395,73 @@ void PNS_BRIDGE::StopRouting()
 {
     if( m_router )
         m_router->StopRouting();
+}
+
+void PNS_BRIDGE::Reset()
+{
+    if( !m_board || !m_router )
+        return;
+
+    // Drop PNS's own world model of the current routing first -- nothing
+    // in it should reference a BOARD_ITEM after this call, so it's safe to
+    // delete those items outright below rather than leaving anything that
+    // could transiently dangle.
+    m_router->ClearWorld();
+
+    // Snapshot pointers before removing -- BOARD::Remove() mutates the
+    // container BOARD::Tracks() returns a view over, so removing while
+    // iterating it directly would invalidate the iteration.
+    std::vector<BOARD_ITEM*> toRemove;
+    for( PCB_TRACK* track : m_board->Tracks() )
+        toRemove.push_back( track );
+
+    for( BOARD_ITEM* item : toRemove )
+    {
+        // BOARD::Remove() only unlinks the item from the board's own
+        // containers -- it does not free it (ownership transfers back to
+        // the caller, same as PNS_BRIDGE_IFACE::Commit()'s handling of
+        // m_pendingRemoves elsewhere in this file, which has the same
+        // gap). Reset() is meant to be called every RL episode -- without
+        // this delete, every track/via/arc ever routed away would leak
+        // for the rest of the process's life.
+        m_board->Remove( item, REMOVE_MODE::BULK );
+        delete item;
+    }
+
+    m_board->BuildConnectivity();
+
+    // Same SyncWorld() LoadBoard() does, but against the same BOARD
+    // instance (footprint placement, any other board-level state the
+    // caller set up survives) instead of reloading from disk.
+    m_router->SyncWorld();
+
+    m_candidateItems.clear();
+    m_candidateIds.clear();
+}
+
+std::vector<PNS_BRIDGE::NetPad> PNS_BRIDGE::NetPads() const
+{
+    std::vector<NetPad> out;
+
+    if( !m_board )
+        return out;
+
+    for( FOOTPRINT* fp : m_board->Footprints() )
+    {
+        for( PAD* pad : fp->Pads() )
+        {
+            NetPad np;
+            np.net = pad->GetNetname().ToStdString();
+            np.padName = fp->GetReference().ToStdString() + ":" + pad->GetNumber().ToStdString();
+            VECTOR2I pos = pad->GetPosition();
+            np.x = pos.x;
+            np.y = pos.y;
+            np.layer = -1;
+            out.push_back( np );
+        }
+    }
+
+    return out;
 }
 
 void PNS_BRIDGE::SetMode( int aMode )
