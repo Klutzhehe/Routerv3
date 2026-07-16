@@ -12,22 +12,33 @@ find_package( pybind11 CONFIG REQUIRED )
 pybind11_add_module( pcbworld_pns_bridge
     pns_bridge.cpp
     bindings.cpp
-    kicad_headless_mocks.cpp
-    # GetStandardColors() (pcbnew/pcb_io/ipc2581/pcb_io_ipc2581.cpp, part of
-    # PCBNEW_IO_LIBRARIES below) is a real, GUI-free data function -- not a
-    # dead code path like kicad_headless_mocks.cpp's stubs, so we compile
-    # the actual implementation rather than mocking it. Same file
-    # qa/tools/pns/CMakeLists.txt compiles directly for the same reason.
-    ${CMAKE_SOURCE_DIR}/pcbnew/board_stackup_manager/stackup_predefined_prms.cpp
 )
 
-# KiCad's Release config enables LTO project-wide, which silently stripped
-# an earlier, narrower version of kicad_headless_mocks.cpp's symbols (LTO's
-# dead-code analysis only sees this target's own files, with no visibility
-# into the separately pre-built pcbcommon.a/pnsrouter.a members that
-# actually need them -- see the comment at the top of that file).
-# Disabling LTO for this tiny target removes that whole risk class; cost is
-# unmeasurable given the target is a handful of small files.
+# kicad_headless_mocks.cpp and the standalone stackup_predefined_prms.cpp
+# compile (both previously listed above) are gone as of the DRC work
+# below: kicad_headless_mocks.cpp existed purely to satisfy the linker for
+# GUI-tool-framework symbols (PCB_SELECTION_TOOL, ZONE_FILLER_TOOL,
+# PCB_TOOL_BASE, Kiface(), GFootprintTable, ROUTER_TOOL::
+# NeighboringSegmentFilter) that weren't otherwise linked when this target
+# only pulled in pnsrouter/pcbcommon/connectivity/gal/common/scripting.
+# Now that pcbnew_kiface_objects (below) is linked for DRC_ENGINE, it
+# already provides *real* definitions of every one of those symbols (it's
+# pcbnew's own full object library) -- keeping the mocks around caused
+# "multiple definition" link errors against the real ones. Same reasoning
+# for stackup_predefined_prms.cpp: pcbnew_kiface_objects already compiles
+# it for real, so our own extra copy was a duplicate, not a supplement.
+# kicad_headless_mocks.cpp is deleted, not just unlisted here -- nothing
+# in the current architecture (bridge always links pcbnew_kiface_objects)
+# can need it again without reintroducing the exact conflict just fixed.
+
+# KiCad's Release config enables LTO project-wide. Originally disabled here
+# because an earlier, narrower version of kicad_headless_mocks.cpp's
+# symbols got silently stripped by LTO's dead-code analysis (no visibility
+# into separately pre-built static library members needing them). That
+# file is gone now, but LTO stays off for this target regardless -- it's a
+# handful of small files, the cost is unmeasurable, and it removes a whole
+# class of "did LTO just silently strip something" risk for whatever gets
+# added here next.
 set_target_properties( pcbworld_pns_bridge PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE )
 
 target_include_directories( pcbworld_pns_bridge PRIVATE

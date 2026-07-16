@@ -47,14 +47,17 @@ way; see `docs/engine_access.md` / `docs/performance.md` for the full
    build path.** It compiles `pcbworld_pns_bridge` as an extra CMake
    target inside a real KiCad 9.0.8 source checkout (`add_subdirectory`),
    linking against `pnsrouter`, `pcbcommon`, `connectivity`, `gal`,
-   `common`, `scripting`, `${PCBNEW_IO_LIBRARIES}`, plus
-   `pcbworld/engine/cpp/kicad_headless_mocks.cpp` (headless stand-ins for
-   GUI-tool-framework symbols that leak in transitively — dead code from
-   this bridge's perspective, safe, but required to link). Building
-   outside this exact flow (different KiCad version, skipping the mocks,
-   linking `pnsrouter` without the IO libraries, etc.) will very likely
-   resurface some of the same missing-symbol/crash issues already solved.
-   Drive caching (`$DRIVE_CACHE_TARBALL`) makes re-runs fast — don't skip
+   `common`, `scripting`, `pcbnew_kiface_objects`, `${PCBNEW_IO_LIBRARIES}`.
+   (`pcbworld/engine/cpp/kicad_headless_mocks.cpp` used to stand in for
+   GUI-tool-framework symbols before `pcbnew_kiface_objects` was linked for
+   DRC support — deleted once that library made it redundant and
+   conflicting; see `docs/engine_access.md`'s "Update, once DRC support
+   needed `pcbnew_kiface_objects`" note for the full story if this ever
+   needs to be split apart again.) Building outside this exact flow
+   (different KiCad version, linking `pnsrouter` without the IO libraries,
+   etc.) will very likely resurface some of the same missing-symbol/crash
+   issues already solved. Drive caching (`$DRIVE_CACHE_TARBALL`) makes
+   re-runs fast — don't skip
    step 2 (`git pull`) before rebuilding, or you'll rebuild against stale
    local code.
 4. **`ROUTER::LoadSettings()` must be called before any routing call.**
@@ -217,10 +220,13 @@ an advisor, not a step toward the autorouting goal.
 ```
 pcbworld/
   engine/cpp/     # The proven bridge -- pns_bridge.{h,cpp}, bindings.cpp,
-                  # kicad_headless_mocks.cpp, CMakeLists.txt
-  env/            # Empty -- next major piece to build
-  agents/         # Empty
-  data/           # Empty -- synthetic board generator goes here
+                  # CMakeLists.txt
+  env/            # pcb_route_env.py -- Gym env, Python logic verified,
+                  # real router behavior not yet observed
+  agents/         # ppo_baseline.py -- PPO loop verified, no real reward
+                  # signal observed yet
+  data/           # generate_board.py -- synthetic board generator,
+                  # verified against local KiCad install
 kicad_plugin/     # LLM advisor Action Plugin, separate track, untested
 notebooks/        # 00_setup.ipynb -- the only proven build/run path
 scripts/          # make_toy_board.py, verify_routed_board.py -- both

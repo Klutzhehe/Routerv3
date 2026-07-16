@@ -181,6 +181,28 @@ fine as long as the signatures match.
 cleanly after the `Kiface()` fix, so that speculative concern turned out
 to be unnecessary.
 
+**Update, once DRC support needed `pcbnew_kiface_objects`:** everything in
+this section describes why `kicad_headless_mocks.cpp` was necessary *at
+the time* — when this target only linked `pnsrouter`/`pcbcommon`/
+`connectivity`/`gal`/`common`/`scripting`, none of which contain real
+`PCB_SELECTION_TOOL`/`ZONE_FILLER_TOOL`/`PCB_TOOL_BASE`/`Kiface()`/
+`GFootprintTable` definitions. Adding `pcbnew_kiface_objects` to the link
+line later (for `DRC_ENGINE`, since `drc/*.cpp` lives in pcbnew's own
+object library, not `pcbcommon`) changed that: `pcbnew_kiface_objects` *is*
+pcbnew's full object library, so it already contains real definitions of
+every symbol this file mocked, plus its own copy of
+`stackup_predefined_prms.cpp` (originally compiled directly into this
+target for the same "not a dead code path" reason described below).
+Keeping the mocks after that point caused "multiple definition" link
+errors against the real ones — `kicad_headless_mocks.cpp` and the extra
+`stackup_predefined_prms.cpp` source were both deleted from
+`pcbworld/engine/cpp/CMakeLists.txt` once `pcbnew_kiface_objects` made
+them redundant. If this bridge is ever split back apart (DRC dropped,
+`pcbnew_kiface_objects` unlinked again), these mocks would need to come
+back — this section stays as the reference for why, and the git history
+around the DRC commit has the working implementation if that ever
+happens.
+
 ## Runtime crash: stale candidate ids (not a linker issue)
 
 Once the bridge imported successfully, the first real routing attempt
