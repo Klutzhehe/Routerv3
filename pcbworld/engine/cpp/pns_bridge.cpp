@@ -248,6 +248,10 @@ bool PNS_BRIDGE::LoadBoard( const std::string& aPath )
 
     m_router = std::make_unique<PNS::ROUTER>();
     m_router->SetInterface( m_iface.get() );
+
+    m_routingSettings = std::make_unique<PNS::ROUTING_SETTINGS>( nullptr, "" );
+    m_router->LoadSettings( m_routingSettings.get() );
+
     m_router->ClearWorld();
     m_router->SyncWorld();
 

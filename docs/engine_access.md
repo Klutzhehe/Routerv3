@@ -203,6 +203,35 @@ deduplication, cleared only in `LoadBoard()` (a genuinely new PNS world),
 not on every query. An id from an earlier query stays valid no matter how
 many subsequent queries happen in between.
 
+Real bug, worth having fixed — but it turned out **not** to be the actual
+cause of the crash: it persisted after this fix too. See below.
+
+## Runtime crash, take 2: `ROUTER::m_settings` is never initialized
+
+Isolated by splitting the routing sequence into one cell per call (load,
+net query, both pad queries, mode/width setup all succeeded and printed
+fine) — the crash was in `start_route` specifically, KiCad's
+`PNS::ROUTER::StartRouting()` itself.
+
+`StartRouting()`'s very first action is `GetRuleResolver()->ClearCaches()`,
+then `isStartingPointRoutable()`, whose first line is
+`Settings().AllowDRCViolations()`. `ROUTER::Settings()`
+(`pcbnew/router/pns_router.h:197`) is a bare `return *m_settings;` —
+and `ROUTER::ROUTER()` (`pcbnew/router/pns_router.cpp:75`) sets
+`m_settings = nullptr;` in the constructor. It's *only* ever assigned via
+`LoadSettings(ROUTING_SETTINGS*)`, an explicit call every real KiCad code
+path makes (the GUI's `router_tool.cpp`, and headlessly,
+`qa/tools/pns/pns_log_player.cpp: m_router->LoadSettings(m_routingSettings.get())`)
+— which our bridge never did. First real call into the router = immediate
+null dereference = the whole process dies with no Python-catchable
+exception, since it's a C++ fault below pybind11's exception translation
+layer.
+
+Fixed in `LoadBoard()`: construct a `PNS::ROUTING_SETTINGS` the same way
+`pns_log_player.cpp` does (`new ROUTING_SETTINGS(nullptr, "")` — no parent
+JSON_SETTINGS, no path, a standalone in-memory settings object) and call
+`m_router->LoadSettings(...)` before `SyncWorld()`.
+
 ## Build plan
 
 Link the same targets KiCad's own headless PNS/DRC unit tests link against

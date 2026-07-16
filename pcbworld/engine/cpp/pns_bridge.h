@@ -32,6 +32,7 @@
 
 #include <router/pns_kicad_iface.h>
 #include <router/pns_router.h>
+#include <router/pns_routing_settings.h>
 
 class BOARD;
 class BOARD_CONNECTED_ITEM;
@@ -103,6 +104,16 @@ private:
     std::unique_ptr<BOARD> m_board;
     std::unique_ptr<PNS_BRIDGE_IFACE> m_iface;
     std::unique_ptr<PNS::ROUTER> m_router;
+
+    // ROUTER::m_settings starts as nullptr (pns_router.cpp ROUTER::ROUTER())
+    // and is only ever assigned via LoadSettings() -- there's no built-in
+    // default. Without this, ROUTER::Settings() (a bare *m_settings
+    // dereference) null-derefs and crashes the whole process the moment
+    // StartRouting() calls isStartingPointRoutable(), which reads
+    // Settings().AllowDRCViolations() as its very first line. Same
+    // nullptr-parent/empty-path construction qa/tools/pns/pns_log_player.cpp
+    // uses.
+    std::unique_ptr<PNS::ROUTING_SETTINGS> m_routingSettings;
 
     // PNS::ITEM pointers handed to Python as opaque, stable ids. Previously
     // this was cleared on every QueryHoverItems() call, which silently
