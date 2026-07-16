@@ -16,7 +16,6 @@
 #include <drc/drc_engine.h>
 #include <drc/drc_item.h>
 #include <rc_item.h>
-#include <report_severity.h>
 
 #include <router/pns_arc.h>
 #include <router/pns_item.h>
