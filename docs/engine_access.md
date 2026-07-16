@@ -138,6 +138,17 @@ exact method signatures referenced. Two follow-on problems surfaced:
    (`pcb_test_frame.cpp`, `stackup_predefined_prms.cpp`), which we don't
    compile, not by `pnsrouter`/`pcbcommon`/`connectivity` themselves.
 
+One symbol turned out not to be dead code at all:
+`GetStandardColors(BOARD_STACKUP_ITEM_TYPE)`, called from
+`pcbnew/pcb_io/ipc2581/pcb_io_ipc2581.cpp` — part of `PCBNEW_IO_LIBRARIES`,
+which we genuinely need for board load/save, not something we can treat as
+unreachable. Its real implementation
+(`pcbnew/board_stackup_manager/stackup_predefined_prms.cpp`) is a small,
+GUI-free pure-data file (standard fabrication color lists), so rather than
+mock it we compile the real file directly as an extra source in
+`pcbworld/engine/cpp/CMakeLists.txt` — the same thing
+`qa/tools/pns/CMakeLists.txt` does for the same reason.
+
 All of this is safe for the same reason KiCad's own QA tooling is safe:
 none of this GUI-tool-framework code (`PCB_SELECTION_TOOL`,
 `ZONE_FILLER_TOOL`, `PCB_TOOL_BASE`, dialogs) is ever actually invoked by

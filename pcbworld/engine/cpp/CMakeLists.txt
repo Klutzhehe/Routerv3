@@ -13,6 +13,12 @@ pybind11_add_module( pcbworld_pns_bridge
     pns_bridge.cpp
     bindings.cpp
     kicad_headless_mocks.cpp
+    # GetStandardColors() (pcbnew/pcb_io/ipc2581/pcb_io_ipc2581.cpp, part of
+    # PCBNEW_IO_LIBRARIES below) is a real, GUI-free data function -- not a
+    # dead code path like kicad_headless_mocks.cpp's stubs, so we compile
+    # the actual implementation rather than mocking it. Same file
+    # qa/tools/pns/CMakeLists.txt compiles directly for the same reason.
+    ${CMAKE_SOURCE_DIR}/pcbnew/board_stackup_manager/stackup_predefined_prms.cpp
 )
 
 # KiCad's Release config enables LTO project-wide, which silently stripped
