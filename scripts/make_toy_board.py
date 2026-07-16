@@ -7,9 +7,10 @@ independent of the code we're trying to test, so a passing round-trip test
 (generate -> route via our bridge -> reload here and check) isn't just
 checking our own code against itself.
 
-Unverified like the rest of this repo: written from KiCad's documented
-scripting API, not yet run. Likely candidates for a first-run fix: exact
-PAD_ATTRIB/PAD_SHAPE enum names can drift between KiCad versions.
+Verified against a real local KiCad 9.0 install (round-tripped: generates,
+reloads, footprints/pads/net/layer assignment all confirmed correct) --
+unlike most of this repo, which only runs on Linux/Colab, this script uses
+nothing PNS-specific so it was straightforward to test directly.
 """
 
 import argparse
@@ -43,14 +44,18 @@ def make_toy_board(path: str) -> None:
         pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
         pad.SetShape(pcbnew.PAD_SHAPE_CIRCLE)
         pad.SetSize(pcbnew.VECTOR2I(pcbnew.FromMM(1.5), pcbnew.FromMM(1.5)))
-        # LSET's constructors take std::initializer_list/std::vector<PCB_LAYER_ID>
-        # (SWIG doesn't auto-convert a plain Python list to either here) or
-        # explicitly `= delete`s the single-int form (include/lset.h) to
-        # prevent enum/bitmask mixups. Build via the empty ctor + the
-        # inherited BASE_SET::set(pos) bit-setter instead.
-        layers = pcbnew.LSET()
-        layers.set(pcbnew.F_Cu)
-        pad.SetLayerSet(layers)
+        # LSET(unsigned long) is explicitly `= delete`d in C++ (lset.h,
+        # prevents enum/bitmask mixups), a plain Python list doesn't
+        # implicitly convert to the vector<PCB_LAYER_ID> ctor overload
+        # through SWIG here, and BASE_SET's set()/test() (from its
+        # dynamic_bitset base) aren't exposed to Python at all -- confirmed
+        # by reading the actual generated pcbnew.py, not just the C++
+        # header. SWIG does wrap std::vector<PCB_LAYER_ID> as its own
+        # list-like proxy class (base_seqVect) with .append(), which LSET's
+        # constructor does accept.
+        layer_vec = pcbnew.base_seqVect()
+        layer_vec.append(pcbnew.F_Cu)
+        pad.SetLayerSet(pcbnew.LSET(layer_vec))
         pad.SetPosition(pos)
         pad.SetNet(net)
         fp.Add(pad)
