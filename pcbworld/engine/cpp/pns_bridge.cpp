@@ -516,9 +516,15 @@ std::vector<PNS_BRIDGE::DRCViolation> PNS_BRIDGE::RunDRC()
 
     DRC_ENGINE engine( m_board.get(), &designSettings );
 
+    // DRC_VIOLATION_HANDLER's real signature (drc_engine.h) -- confirmed by
+    // the actual Colab compiler error, not guessed a second time: 2nd param
+    // is a const VECTOR2I&, and the 4th is an optional marker-creation
+    // callback (std::function<void(PCB_MARKER*)>*), not a DRC_CONSTRAINT*
+    // as first assumed. We don't need to create markers ourselves -- just
+    // collecting violations into `out` -- so it's unused here.
     engine.SetViolationHandler(
-        [&]( const std::shared_ptr<DRC_ITEM>& aItem, VECTOR2I aPos, int /* aLayer */,
-             DRC_CONSTRAINT* /* aConstraint */ )
+        [&]( const std::shared_ptr<DRC_ITEM>& aItem, const VECTOR2I& aPos, int /* aLayer */,
+             std::function<void( PCB_MARKER* )>* /* aCreateMarker */ )
         {
             DRCViolation v;
             v.errorCode = aItem->GetErrorCode();
