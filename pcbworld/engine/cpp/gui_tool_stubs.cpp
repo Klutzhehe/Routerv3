@@ -22,6 +22,15 @@
 // stub regardless of the layout/inheritance mismatch with the real
 // class. Since the referencing code never actually runs, that mismatch
 // never manifests as a behavioral difference.
+//
+// __attribute__((used)) matters here: this target builds with LTO
+// (confirmed via the "lto-wrapper ... 3 LTRANS jobs" build log line,
+// matching our 3 source files). LTO's dead-code analysis only sees this
+// compilation unit -- it has no visibility into board_commit.cpp.o (a
+// separately pre-built pcbcommon.a member) still needing these symbols,
+// so without `used` it silently strips them as apparently-unreachable,
+// even though the build and link both "succeed" -- the ImportError only
+// shows up at runtime once the symbol is actually missing from the .so.
 
 class TOOL_EVENT;
 class ZONE;
@@ -29,14 +38,23 @@ class ZONE;
 class ZONE_FILLER_TOOL
 {
 public:
-    virtual ~ZONE_FILLER_TOOL() = default;
-    static bool IsZoneFillAction( const TOOL_EVENT* aEvent ) { return false; }
-    void DirtyZone( ZONE* aZone ) {}
+    ZONE_FILLER_TOOL() = default;
+    __attribute__(( used )) virtual ~ZONE_FILLER_TOOL();
+    __attribute__(( used )) static bool IsZoneFillAction( const TOOL_EVENT* aEvent );
+    __attribute__(( used )) void DirtyZone( ZONE* aZone );
 };
+
+ZONE_FILLER_TOOL::~ZONE_FILLER_TOOL() = default;
+bool ZONE_FILLER_TOOL::IsZoneFillAction( const TOOL_EVENT* ) { return false; }
+void ZONE_FILLER_TOOL::DirtyZone( ZONE* ) {}
 
 class PCB_SELECTION_TOOL
 {
 public:
-    virtual ~PCB_SELECTION_TOOL() = default;
-    void RebuildSelection() {}
+    PCB_SELECTION_TOOL() = default;
+    __attribute__(( used )) virtual ~PCB_SELECTION_TOOL();
+    __attribute__(( used )) void RebuildSelection();
 };
+
+PCB_SELECTION_TOOL::~PCB_SELECTION_TOOL() = default;
+void PCB_SELECTION_TOOL::RebuildSelection() {}
