@@ -20,6 +20,18 @@ run in parallel**. Concretely, for RL training throughput:
   `gymnasium.vector.AsyncVectorEnv`) sidesteps that risk entirely and also
   sidesteps Python's GIL, which would otherwise serialize the C++ calls
   anyway even if the C++ side were thread-safe.
+- **Confirmed, not just theoretical:** `pcbworld_pns_bridge` and the system
+  `pcbnew` module crash if loaded into the *same* process (see
+  `docs/engine_access.md`'s crash-hunting log) -- both statically link
+  overlapping chunks of KiCad's own C++ code and both define KiCad's
+  "exactly one instance per process" globals (`Kiface()`,
+  `GFootprintTable`). This is a hard constraint for the env design, not
+  just a nice-to-have: **never `import pcbnew` (the system module) in a
+  worker process that has `pcbworld_pns_bridge` loaded**, for anything --
+  board generation, independent verification, whatever. If a worker needs
+  system-`pcbnew`-only functionality, do it in a genuinely separate
+  process/subprocess call (`scripts/verify_routed_board.py` is the
+  reference pattern), never inline in the same interpreter.
 - **Release build flags** are already set in `notebooks/00_setup.ipynb`
   (`-DCMAKE_BUILD_TYPE=Release`) -- a debug KiCad build is dramatically
   slower and would be the first thing to check if routing feels slow.

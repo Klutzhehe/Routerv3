@@ -232,6 +232,39 @@ Fixed in `LoadBoard()`: construct a `PNS::ROUTING_SETTINGS` the same way
 JSON_SETTINGS, no path, a standalone in-memory settings object) and call
 `m_router->LoadSettings(...)` before `SyncWorld()`.
 
+## Runtime crash, take 3: `pcbworld_pns_bridge` + system `pcbnew` in one process
+
+With routing itself fixed, the notebook's final verification cell —
+`import pcbnew` for an independent reload-and-check, in the *same* kernel
+that already had `import pcbworld_pns_bridge as bridge` from step 4 —
+started crashing. Isolated by splitting that cell line-by-line
+(`import pcbnew` alone was the one that died) and by the crash's own
+signature: it didn't reproduce in a fresh process (`import pcbnew` alone
+works fine, as `scripts/make_toy_board.py` already proved), only when run
+after the bridge module was already loaded in the same interpreter.
+
+This is architectural, not a one-line bug. `pcbworld_pns_bridge` statically
+links large, overlapping chunks of KiCad's own C++ code (`BOARD`,
+`PCB_TRACK`, connectivity, GAL, ...) into its `.so` — including our own
+`kicad_headless_mocks.cpp` definitions of `Kiface()` and `GFootprintTable`,
+both of which KiCad's own headers document as "KIFACE scope" /
+one-instance-per-process globals (`include/kiface_base.h:134`,
+`include/fp_lib_table.h:294`). The system `pcbnew` module has its own
+*real* versions of the exact same globals, with the same
+must-be-unique-per-process contract. KiCad's multi-DSO architecture was
+designed around exactly one such set existing per process (one running
+`pcbnew`/`eeschema`/etc at a time) — never two independently-compiled
+copies coexisting via `dlopen`, which is exactly what two separate Python
+`import`s of two different KiCad-derived `.so`s does.
+
+No in-process fix attempted — the correct fix is architectural: never let
+both modules land in the same process. `scripts/verify_routed_board.py`
+runs the reload-and-check as a genuinely separate script/subprocess
+(mirroring `scripts/make_toy_board.py`'s existing pattern), and the
+notebook's step 5 now calls it via `%%bash`, not an inline `import`. This
+is a hard constraint for the RL environment too, not just this notebook —
+see `docs/performance.md`.
+
 ## Build plan
 
 Link the same targets KiCad's own headless PNS/DRC unit tests link against
