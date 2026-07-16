@@ -43,7 +43,7 @@ def make_toy_board(path: str) -> None:
         pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
         pad.SetShape(pcbnew.PAD_SHAPE_CIRCLE)
         pad.SetSize(pcbnew.VECTOR2I(pcbnew.FromMM(1.5), pcbnew.FromMM(1.5)))
-        pad.SetLayerSet(pcbnew.LSET(pcbnew.F_Cu))
+        pad.SetLayerSet(pcbnew.LSET([pcbnew.F_Cu]))
         pad.SetPosition(pos)
         pad.SetNet(net)
         fp.Add(pad)
