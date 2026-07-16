@@ -32,20 +32,18 @@ is the heavier path to real routing: compiling a bridge to KiCad's actual
 
 ## Status
 
-Early scaffolding. See [`docs/engine_access.md`](docs/engine_access.md) for the
-current findings on how to drive KiCad's router headlessly (IPC API vs.
-scripting console vs. custom build) — this is the load-bearing technical
-question the rest of the project depends on.
+**The hard part is done and verified.** `pcbworld/engine/cpp/` compiles into
+a real pybind11 module that drives KiCad's actual `PNS::ROUTER` headlessly —
+confirmed end-to-end in Colab: load a board, find pads, start a route, push
+a point, fix the route, commit, save, then independently reload with a
+*separate* KiCad Python process and confirm a real track landed on disk.
+Nothing about this was obvious going in (see below) — start with
+[`ROADMAP.md`](ROADMAP.md) before writing more code, especially in a fresh
+conversation with no memory of how this was built.
 
-## Milestones
+## Next steps
 
-1. **Engine wrapper** — headless Python control of KiCad's router: select a
-   net, start a route, push points into the pathfinder, commit resulting
-   tracks, run DRC. Round-trips a `.kicad_pcb` file.
-2. **RL environment** — Gym-style env over the wrapper, reward = potential
-   shaping on DRC violations / wirelength / via count, synthetic board
-   generator for training data.
-3. **Baseline agents** — PPO/GRPO from scratch on synthetic boards; compare
-   against Freerouting and grid-based RL baselines.
-4. **Novel agent** — once the above is validated, propose and implement a
-   SOTA routing approach beyond the paper's baselines.
+See [`ROADMAP.md`](ROADMAP.md) for the full plan (near-term plumbing,
+candidate directions for the "novel SOTA agent," and the operational
+gotchas that cost real time to discover — read those before re-deriving
+them).
