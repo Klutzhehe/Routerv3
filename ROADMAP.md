@@ -84,11 +84,27 @@ markdown explains what it does and why; the notebook fails loudly with
 These are prerequisites for the "novel agent" work regardless of which
 direction gets picked below — do these first.
 
-1. **Headless DRC.** Lower risk than routing was — KiCad already has a
-   full headless DRC regression suite to mirror
-   (`qa/tests/pcbnew/drc/test_drc_copper_conn.cpp` etc., pattern:
-   `KI_TEST::LoadBoard` + `BOARD_DESIGN_SETTINGS::m_DRCSeverities` +
-   `DRC_ENGINE`). Add `RunDRC()`/`GetDRCViolations()` to `PNS_BRIDGE`.
+1. **Headless DRC — code written, not yet Colab-verified.** Added
+   `PNS_BRIDGE::RunDRC()` (`pcbworld/engine/cpp/pns_bridge.{h,cpp}`,
+   bound as `PNSBridge.run_drc()` in `bindings.cpp`): constructs a
+   `DRC_ENGINE` against the loaded board's own `BOARD_DESIGN_SETTINGS`,
+   installs a violation-handler callback, `InitEngine()` with no rules
+   file (KiCad's built-in defaults), `RunTests()`. Mirrors
+   `qa/tests/pcbnew/drc/test_drc_copper_conn.cpp`'s harness pattern.
+   Also added `pcbnew_kiface_objects` to the link line in
+   `pcbworld/engine/cpp/CMakeLists.txt` — `drc/*.cpp` lives there, not in
+   `pcbcommon`, and routing alone never needed it. **This is genuinely
+   untested** (no compiler has seen this code yet) — `notebooks/00_setup.ipynb`
+   step 6 runs `b.run_drc()` on the toy board right after step 5's routing;
+   expect the first Colab run to surface either link errors (most likely
+   from `pcbnew_kiface_objects`, same "iterate from real linker output"
+   process documented in `docs/engine_access.md`) or a `DRC_ENGINE` runtime
+   issue (e.g. missing default rules because no `PROJECT`/`SETTINGS_MANAGER`
+   was ever loaded — we only ever construct a bare `BOARD` via
+   `PCB_IO_KICAD_SEXPR`). If it compiles and runs, next step is deliberately
+   introducing a real violation (e.g. a too-tight clearance) on the toy
+   board to confirm `RunDRC()` actually catches it, not just that it runs
+   clean.
 2. **`reset()` + multi-net routing.** Only proven on exactly one net on a
    toy board so far. `PNS_BRIDGE_IFACE::RemoveItem` already exists;
    `reset()` needs to walk the board's tracks/vias and remove them while

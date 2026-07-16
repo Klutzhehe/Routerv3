@@ -17,6 +17,13 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
         .def_readonly( "kind", &PNS_BRIDGE::Candidate::kind )
         .def_readonly( "net", &PNS_BRIDGE::Candidate::net );
 
+    py::class_<PNS_BRIDGE::DRCViolation>( m, "DRCViolation" )
+        .def_readonly( "error_code", &PNS_BRIDGE::DRCViolation::errorCode )
+        .def_readonly( "message", &PNS_BRIDGE::DRCViolation::message )
+        .def_readonly( "severity", &PNS_BRIDGE::DRCViolation::severity )
+        .def_readonly( "x", &PNS_BRIDGE::DRCViolation::x )
+        .def_readonly( "y", &PNS_BRIDGE::DRCViolation::y );
+
     py::class_<PNS_BRIDGE>( m, "PNSBridge" )
         .def( py::init<>() )
         .def( "load_board", &PNS_BRIDGE::LoadBoard, py::arg( "path" ) )
@@ -32,6 +39,7 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
               py::arg( "force_finish" ) = false, py::arg( "force_commit" ) = false )
         .def( "commit_routing", &PNS_BRIDGE::CommitRouting )
         .def( "stop_routing", &PNS_BRIDGE::StopRouting )
+        .def( "run_drc", &PNS_BRIDGE::RunDRC )
         .def( "set_mode", &PNS_BRIDGE::SetMode )
         .def( "set_track_width", &PNS_BRIDGE::SetTrackWidth )
         .def( "set_via_diameter", &PNS_BRIDGE::SetViaDiameter )

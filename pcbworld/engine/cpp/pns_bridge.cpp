@@ -12,6 +12,11 @@
 
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 
+#include <drc/drc_engine.h>
+#include <drc/drc_item.h>
+#include <rc_item.h>
+#include <report_severity.h>
+
 #include <router/pns_arc.h>
 #include <router/pns_item.h>
 #include <router/pns_itemset.h>
@@ -427,6 +432,53 @@ bool PNS_BRIDGE::SwitchLayer( int aLayer )
         return false;
 
     return m_router->SwitchLayer( aLayer );
+}
+
+std::vector<PNS_BRIDGE::DRCViolation> PNS_BRIDGE::RunDRC()
+{
+    std::vector<DRCViolation> out;
+
+    if( !m_board )
+        return out;
+
+    // Routing since LoadBoard()/CommitRouting() changes net connectivity;
+    // several DRC tests (unconnected items, shorts) read it directly.
+    m_board->BuildConnectivity();
+
+    BOARD_DESIGN_SETTINGS& designSettings = m_board->GetDesignSettings();
+
+    DRC_ENGINE engine( m_board.get(), &designSettings );
+
+    engine.SetViolationHandler(
+        [&]( const std::shared_ptr<DRC_ITEM>& aItem, VECTOR2I aPos, int /* aLayer */,
+             DRC_CONSTRAINT* /* aConstraint */ )
+        {
+            DRCViolation v;
+            v.errorCode = aItem->GetErrorCode();
+            v.message = aItem->GetErrorMessage().ToStdString();
+            v.x = aPos.x;
+            v.y = aPos.y;
+
+            switch( designSettings.GetSeverity( v.errorCode ) )
+            {
+            case RPT_SEVERITY_ERROR:     v.severity = "error";     break;
+            case RPT_SEVERITY_WARNING:   v.severity = "warning";   break;
+            case RPT_SEVERITY_EXCLUSION: v.severity = "exclusion"; break;
+            default:                     v.severity = "ignore";    break;
+            }
+
+            out.push_back( v );
+        } );
+
+    // Empty wxFileName -- no external rules file, so InitEngine() falls
+    // back to KiCad's built-in default rule set (same as a board with no
+    // custom DRC rules configured in the GUI).
+    engine.InitEngine( wxFileName() );
+    engine.RunTests( EDA_UNITS::MM, true, false );
+
+    engine.ClearViolationHandler();
+
+    return out;
 }
 
 }  // namespace pcbworld

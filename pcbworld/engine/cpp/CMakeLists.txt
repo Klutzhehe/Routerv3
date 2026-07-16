@@ -46,7 +46,16 @@ target_include_directories( pcbworld_pns_bridge PRIVATE
 # pcbcommon's plugin registry references every non-native board-format
 # importer/exporter's vtable (PCB_IO_IPC2581 etc.), so they all have to be
 # linked in even though we only construct PCB_IO_KICAD_SEXPR ourselves.
+#
+# pcbnew_kiface_objects added for DRC_ENGINE/DRC_ITEM (pcbnew/drc/*.cpp are
+# compiled into pcbnew's own object library, not pcbcommon) -- routing alone
+# never needed it (PNS::ROUTER lives in pnsrouter), so it wasn't linked
+# until RunDRC() needed symbols from there. Untested: expect this to be the
+# first place new missing-symbol errors surface, same as the routing bridge
+# did originally (see docs/engine_access.md) -- iterate from real linker
+# output, don't guess further ahead of it.
 target_link_libraries( pcbworld_pns_bridge PRIVATE
+    pcbnew_kiface_objects
     pnsrouter
     pcbcommon
     connectivity

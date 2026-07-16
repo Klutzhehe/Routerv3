@@ -91,6 +91,24 @@ public:
     void CommitRouting();
     void StopRouting();
 
+    struct DRCViolation
+    {
+        int errorCode;            // DRCE_* (drc_rule.h) -- stable numeric id
+        std::string message;      // human-readable, from DRC_ITEM/RC_ITEM
+        std::string severity;     // "error" | "warning" | "exclusion" | "ignore"
+        int x, y;                 // marker position
+    };
+
+    // Runs KiCad's real DRC_ENGINE against the currently loaded board, using
+    // whatever BOARD_DESIGN_SETTINGS came in with the loaded .kicad_pcb file
+    // and KiCad's built-in default rule set (no external rules file passed
+    // to InitEngine). Mirrors the harness pattern KiCad's own headless DRC
+    // regression tests use (qa/tests/pcbnew/drc/test_drc_copper_conn.cpp
+    // etc.): construct a DRC_ENGINE, install a violation-handler callback,
+    // InitEngine(), RunTests(). No dialog/GUI involved -- DRC_ENGINE itself
+    // has no GUI dependency, same as PNS::ROUTER.
+    std::vector<DRCViolation> RunDRC();
+
     void SetMode( int aMode );          // PNS::ROUTER_MODE
     void SetTrackWidth( int aWidthNm );
     void SetViaDiameter( int aDiameterNm );
