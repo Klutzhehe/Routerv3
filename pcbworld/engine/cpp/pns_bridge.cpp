@@ -3,15 +3,22 @@
 #include <board.h>
 #include <board_connected_item.h>
 #include <board_item_container.h>
+#include <board_design_settings.h>
+#include <project/net_settings.h>
+#include <netinfo.h>
 #include <pad.h>
+#include <padstack.h>
 #include <pcb_track.h>
 
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 
+#include <router/pns_arc.h>
 #include <router/pns_item.h>
 #include <router/pns_itemset.h>
 #include <router/pns_node.h>
+#include <router/pns_segment.h>
 #include <router/pns_solid.h>
+#include <router/pns_via.h>
 
 namespace pcbworld
 {
@@ -27,6 +34,138 @@ namespace pcbworld
 // (BOARD::BuildConnectivity()) after a route is committed.
 // ---------------------------------------------------------------------
 
+// Ported from PNS_KICAD_IFACE::createBoardItem (pns_kicad_iface.cpp) --
+// not inherited, see pns_bridge.h for why. Drops the m_fpOffsets bookkeeping
+// (SOLID_T/pad case): that's only for component dragging, which we never do.
+BOARD_CONNECTED_ITEM* PNS_BRIDGE_IFACE::createBoardItem( PNS::ITEM* aItem )
+{
+    BOARD_CONNECTED_ITEM* newBoardItem = nullptr;
+    NETINFO_ITEM* net = static_cast<NETINFO_ITEM*>( aItem->Net() );
+
+    if( !net )
+        net = NETINFO_LIST::OrphanedItem();
+
+    switch( aItem->Kind() )
+    {
+    case PNS::ITEM::ARC_T:
+    {
+        PNS::ARC* arc = static_cast<PNS::ARC*>( aItem );
+        PCB_ARC*  new_arc = new PCB_ARC( GetBoard(), static_cast<const SHAPE_ARC*>( arc->Shape( -1 ) ) );
+        new_arc->SetWidth( arc->Width() );
+        new_arc->SetLayer( GetBoardLayerFromPNSLayer( arc->Layers().Start() ) );
+        new_arc->SetNet( net );
+        newBoardItem = new_arc;
+        break;
+    }
+
+    case PNS::ITEM::SEGMENT_T:
+    {
+        PNS::SEGMENT* seg = static_cast<PNS::SEGMENT*>( aItem );
+        PCB_TRACK*    track = new PCB_TRACK( GetBoard() );
+        const SEG&    s = seg->Seg();
+        track->SetStart( VECTOR2I( s.A.x, s.A.y ) );
+        track->SetEnd( VECTOR2I( s.B.x, s.B.y ) );
+        track->SetWidth( seg->Width() );
+        track->SetLayer( GetBoardLayerFromPNSLayer( seg->Layers().Start() ) );
+        track->SetNet( net );
+        newBoardItem = track;
+        break;
+    }
+
+    case PNS::ITEM::VIA_T:
+    {
+        PCB_VIA*  via_board = new PCB_VIA( GetBoard() );
+        PNS::VIA* via = static_cast<PNS::VIA*>( aItem );
+        via_board->SetPosition( VECTOR2I( via->Pos().x, via->Pos().y ) );
+        via_board->SetWidth( PADSTACK::ALL_LAYERS, via->Diameter( 0 ) );
+        via_board->SetDrill( via->Drill() );
+        via_board->SetNet( net );
+        via_board->SetViaType( via->ViaType() ); // MUST be before SetLayerPair()
+        via_board->SetIsFree( via->IsFree() );
+        via_board->SetLayerPair( GetBoardLayerFromPNSLayer( via->Layers().Start() ),
+                                 GetBoardLayerFromPNSLayer( via->Layers().End() ) );
+        newBoardItem = via_board;
+        break;
+    }
+
+    case PNS::ITEM::SOLID_T:
+        // Pads already exist on the board; routing never creates one.
+        return nullptr;
+
+    default:
+        return nullptr;
+    }
+
+    if( net->GetNetCode() <= 0 )
+    {
+        NETINFO_ITEM* newNetInfo = newBoardItem->GetNet();
+        newNetInfo->SetParent( GetBoard() );
+        newNetInfo->SetNetClass( GetBoard()->GetDesignSettings().m_NetSettings->GetDefaultNetclass() );
+    }
+
+    if( aItem->IsLocked() )
+        newBoardItem->SetLocked( true );
+
+    return newBoardItem;
+}
+
+// Ported from PNS_KICAD_IFACE::modifyBoardItem -- drops the m_commit->Modify()
+// calls (undo bookkeeping we don't need) and the SOLID_T/pad-drag case.
+void PNS_BRIDGE_IFACE::modifyBoardItem( PNS::ITEM* aItem )
+{
+    BOARD_ITEM* board_item = aItem->Parent();
+
+    switch( aItem->Kind() )
+    {
+    case PNS::ITEM::ARC_T:
+    {
+        PNS::ARC*        arc = static_cast<PNS::ARC*>( aItem );
+        PCB_ARC*         arc_board = static_cast<PCB_ARC*>( board_item );
+        const SHAPE_ARC* arc_shape = static_cast<const SHAPE_ARC*>( arc->Shape( -1 ) );
+
+        arc_board->SetStart( VECTOR2I( arc_shape->GetP0() ) );
+        arc_board->SetEnd( VECTOR2I( arc_shape->GetP1() ) );
+        arc_board->SetMid( VECTOR2I( arc_shape->GetArcMid() ) );
+        arc_board->SetWidth( arc->Width() );
+        break;
+    }
+
+    case PNS::ITEM::SEGMENT_T:
+    {
+        PNS::SEGMENT* seg = static_cast<PNS::SEGMENT*>( aItem );
+        PCB_TRACK*    track = static_cast<PCB_TRACK*>( board_item );
+        const SEG&    s = seg->Seg();
+
+        track->SetStart( VECTOR2I( s.A.x, s.A.y ) );
+        track->SetEnd( VECTOR2I( s.B.x, s.B.y ) );
+        track->SetWidth( seg->Width() );
+        break;
+    }
+
+    case PNS::ITEM::VIA_T:
+    {
+        PCB_VIA*  via_board = static_cast<PCB_VIA*>( board_item );
+        PNS::VIA* via = static_cast<PNS::VIA*>( aItem );
+
+        via_board->SetPosition( VECTOR2I( via->Pos().x, via->Pos().y ) );
+        via_board->SetWidth( PADSTACK::ALL_LAYERS, via->Diameter( 0 ) );
+        via_board->SetDrill( via->Drill() );
+        via_board->SetNet( static_cast<NETINFO_ITEM*>( via->Net() ) );
+        via_board->SetViaType( via->ViaType() ); // MUST be before SetLayerPair()
+        via_board->SetIsFree( via->IsFree() );
+        via_board->SetLayerPair( GetBoardLayerFromPNSLayer( via->Layers().Start() ),
+                                 GetBoardLayerFromPNSLayer( via->Layers().End() ) );
+        break;
+    }
+
+    case PNS::ITEM::SOLID_T:
+        break;  // pad drag -- not driven by routing, nothing to do
+
+    default:
+        break;
+    }
+}
+
 void PNS_BRIDGE_IFACE::AddItem( PNS::ITEM* aItem )
 {
     BOARD_CONNECTED_ITEM* boardItem = createBoardItem( aItem );
@@ -41,11 +180,8 @@ void PNS_BRIDGE_IFACE::AddItem( PNS::ITEM* aItem )
 
 void PNS_BRIDGE_IFACE::UpdateItem( PNS::ITEM* aItem )
 {
-    // modifyBoardItem() mutates the live BOARD_ITEM's geometry in place
-    // (SetStart/SetEnd/SetWidth/...) via setters that don't require a
-    // COMMIT to take effect -- COMMIT::Modify() only exists for undo
-    // bookkeeping, which we don't need. See pns_kicad_iface.cpp
-    // modifyBoardItem() for what this covers per PNS::ITEM kind.
+    // Mutates the live BOARD_ITEM's geometry in place via setters that
+    // don't require a COMMIT to take effect.
     modifyBoardItem( aItem );
 }
 

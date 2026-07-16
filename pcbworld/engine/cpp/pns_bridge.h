@@ -7,10 +7,22 @@
 //   - The one piece that differs from any existing KiCad code path: turning
 //     routed PNS items back into real BOARD_ITEMs without a BOARD_COMMIT
 //     (which needs a PCB_TOOL_BASE/TOOL_MANAGER we don't have headlessly).
-//     PNS_BRIDGE_IFACE below reimplements just the Add/Remove/Update subset
-//     of what BOARD_COMMIT::Push does (pcbnew/board_commit.cpp), calling
-//     BOARD::Add()/BOARD::Remove() directly. This part is new and unverified
-//     until it compiles and links against a real KiCad build.
+//
+// PNS_BRIDGE_IFACE derives from PNS_KICAD_IFACE_BASE, *not* the real
+// PNS_KICAD_IFACE -- deliberately. PNS_KICAD_IFACE_BASE's Commit()/AddItem()
+// are harmless no-ops (pns_kicad_iface.h), but the real PNS_KICAD_IFACE
+// (used by the GUI) implements them via BOARD_COMMIT, and BOARD_COMMIT::Push
+// (pcbnew/board_commit.cpp) looks up ZONE_FILLER_TOOL/PCB_SELECTION_TOOL
+// through TOOL_MANAGER -- GUI-only classes with no headless equivalent.
+// Since createBoardItem()/modifyBoardItem() (the PNS::ITEM -> BOARD_ITEM
+// conversion we actually need) are only defined on the real PNS_KICAD_IFACE,
+// and object-file-granularity linking means pulling in *any* symbol from
+// that class's translation unit pulls in all of it (including the BOARD_COMMIT
+// call), we reimplement those two conversions ourselves below instead of
+// inheriting them -- ported directly from pns_kicad_iface.cpp's
+// createBoardItem()/modifyBoardItem(), minus the drag/footprint-offset
+// bookkeeping (m_fpOffsets/m_itemGroups) which only matters for component
+// dragging, a tool interaction we never drive.
 #pragma once
 
 #include <memory>
@@ -21,13 +33,12 @@
 #include <router/pns_router.h>
 
 class BOARD;
+class BOARD_CONNECTED_ITEM;
 
 namespace pcbworld
 {
 
-// Reimplements the board-mutation subset of PNS_KICAD_IFACE::Commit()
-// without going through BOARD_COMMIT (which requires a live GUI tool).
-class PNS_BRIDGE_IFACE : public PNS_KICAD_IFACE
+class PNS_BRIDGE_IFACE : public PNS_KICAD_IFACE_BASE
 {
 public:
     PNS_BRIDGE_IFACE() = default;
@@ -38,10 +49,10 @@ public:
     void RemoveItem( PNS::ITEM* aItem ) override;
     void Commit() override;
 
-    // PNS_KICAD_IFACE::GetUnits() dereferences a host tool we don't have.
-    EDA_UNITS GetUnits() const override { return EDA_UNITS::MM; }
-
 private:
+    BOARD_CONNECTED_ITEM* createBoardItem( PNS::ITEM* aItem );
+    void modifyBoardItem( PNS::ITEM* aItem );
+
     std::vector<BOARD_ITEM*> m_pendingAdds;
     std::vector<BOARD_ITEM*> m_pendingRemoves;
 };
