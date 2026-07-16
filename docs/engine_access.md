@@ -105,16 +105,47 @@ we're avoiding). Confirmed via `nm` on the actual built objects that
 symbols, and that nothing else in `pcbcommon` needs it — it's pulled in
 purely by `pns_kicad_iface.cpp.o` needing to be linked as a whole.
 
-Fix: `pcbworld/engine/cpp/gui_tool_stubs.cpp` provides minimal standalone
-definitions of `ZONE_FILLER_TOOL`/`PCB_SELECTION_TOOL` — not inheriting from
-their real base classes, just matching the exact method signatures
-(`IsZoneFillAction`, `DirtyZone`, `RebuildSelection`) that `router_tool.cpp`/
-`board_commit.cpp` reference. This is safe specifically because the
-referencing code is provably unreachable — we never construct or use a
-`TOOL_MANAGER` anywhere, so `BOARD_COMMIT::Push()`'s tool lookups never
-actually execute. Linking is name-based (the linker matches mangled symbol
-names, not semantic type compatibility), so the stub satisfies it regardless
-of not matching the real classes' inheritance.
+First fix attempt: a narrow, hand-rolled stub (`gui_tool_stubs.cpp`, since
+removed) providing minimal standalone `ZONE_FILLER_TOOL`/`PCB_SELECTION_TOOL`
+definitions — not inheriting from their real base classes, just matching the
+exact method signatures referenced. Two follow-on problems surfaced:
+
+1. **LTO silently stripped it.** KiCad's Release config enables
+   `INTERPROCEDURAL_OPTIMIZATION` project-wide. LTO's dead-code analysis is
+   scoped to *this target's own source files* — it can't see that a
+   separately pre-built static library member (`board_commit.cpp.o`,
+   inside `pcbcommon.a`) still needs these symbols, so it "correctly" (from
+   its limited view) stripped them. Build and link both reported success;
+   the symbols were simply gone from the final `.so`, only surfacing as an
+   `ImportError` at import time. Fixed by disabling
+   `INTERPROCEDURAL_OPTIMIZATION` for this one target
+   (`pcbworld/engine/cpp/CMakeLists.txt`) — negligible cost given the
+   target is a handful of small files.
+
+2. **More missing symbols kept surfacing one at a time**
+   (`GFootprintTable`, etc.) — each individually traceable, but slow to
+   discover via trial and error. Turns out KiCad already solved this exact
+   problem: `qa/qa_utils/mocks.cpp` is what makes `qa_pns_regressions`/
+   `pns_debug_tool` (`qa/tools/pns/`) link successfully as real executables
+   against the same `pnsrouter + pcbcommon + connectivity + gal + common`
+   set we use — a *stronger* check than ours, since executables require
+   every symbol resolved at link time, not just at import. Adopted an
+   adapted copy as `pcbworld/engine/cpp/kicad_headless_mocks.cpp` instead
+   of continuing to discover the same missing pieces individually. Dropped
+   the dialog (`DIALOG_FIND`/`DIALOG_FILTER_SELECTION`) and board-stackup
+   color-list stubs from the original — those are needed by
+   `qa_pns_regressions`'s *own* additional source files
+   (`pcb_test_frame.cpp`, `stackup_predefined_prms.cpp`), which we don't
+   compile, not by `pnsrouter`/`pcbcommon`/`connectivity` themselves.
+
+All of this is safe for the same reason KiCad's own QA tooling is safe:
+none of this GUI-tool-framework code (`PCB_SELECTION_TOOL`,
+`ZONE_FILLER_TOOL`, `PCB_TOOL_BASE`, dialogs) is ever actually invoked by
+anything the bridge does — we never construct a `TOOL_MANAGER`, so nothing
+ever calls into it. It exists purely to satisfy the linker. Linking is
+name-based (the linker matches mangled symbol names, not semantic type
+compatibility), so a mock with different internals than the real class is
+fine as long as the signatures match.
 
 ## Build plan
 

@@ -12,17 +12,16 @@ find_package( pybind11 CONFIG REQUIRED )
 pybind11_add_module( pcbworld_pns_bridge
     pns_bridge.cpp
     bindings.cpp
-    gui_tool_stubs.cpp
+    kicad_headless_mocks.cpp
 )
 
 # KiCad's Release config enables LTO project-wide, which silently stripped
-# gui_tool_stubs.cpp's symbols the first time (LTO's dead-code analysis only
-# sees this target's own 3 files, with no visibility into the separately
-# pre-built pcbcommon.a member that actually needs them -- see the comment
-# in gui_tool_stubs.cpp). __attribute__((used)) there should already fix
-# it; disabling LTO for this tiny target too removes the whole risk class
-# rather than depending on a single mechanism, and costs nothing measurable
-# given the target is 3 small files.
+# an earlier, narrower version of kicad_headless_mocks.cpp's symbols (LTO's
+# dead-code analysis only sees this target's own files, with no visibility
+# into the separately pre-built pcbcommon.a/pnsrouter.a members that
+# actually need them -- see the comment at the top of that file).
+# Disabling LTO for this tiny target removes that whole risk class; cost is
+# unmeasurable given the target is a handful of small files.
 set_target_properties( pcbworld_pns_bridge PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE )
 
 target_include_directories( pcbworld_pns_bridge PRIVATE
