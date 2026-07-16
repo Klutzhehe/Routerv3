@@ -149,6 +149,25 @@ mock it we compile the real file directly as an extra source in
 `pcbworld/engine/cpp/CMakeLists.txt` — the same thing
 `qa/tools/pns/CMakeLists.txt` does for the same reason.
 
+Next: `Kiface()` (`include/kiface_base.h:134`) — KiCad's global "which DSO
+am I" accessor, one instance defined per real KIFACE (`pcbnew.cpp`,
+`eeschema.cpp`, etc). KiCad has its own headless answer for this too
+(`qa/mocks/kicad/common_mocks.cpp`), but it goes through a mock-object
+framework (`turtlemocks`, via `qa_utils/wx_utils/unit_test_utils.h`) that
+would be a new dependency for just 3 methods. `KIFACE_BASE` only has 3 pure
+virtuals (`OnKifaceStart`, `CreateKiWindow`, `IfaceOrAddress`), so
+`kicad_headless_mocks.cpp` implements a minimal direct subclass instead of
+pulling in the mock framework.
+
+`Pgm()` (`include/pgm_base.h:453`, same "one global accessor per
+substrate piece" pattern) is a plausible next candidate — `PGM_BASE` is
+referenced as a parameter type in `KIFACE_BASE::OnKifaceStart` and is a
+much bigger class (KiCad's own mock stubs ~15 methods). Deliberately not
+pre-emptively stubbed: no confirmed evidence yet that anything we actually
+link calls it, and guessing wrong on a class that size risks costing more
+than waiting for real evidence via the same `nm`-based tracing used
+throughout this doc.
+
 All of this is safe for the same reason KiCad's own QA tooling is safe:
 none of this GUI-tool-framework code (`PCB_SELECTION_TOOL`,
 `ZONE_FILLER_TOOL`, `PCB_TOOL_BASE`, dialogs) is ever actually invoked by

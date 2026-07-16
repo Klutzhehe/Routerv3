@@ -30,6 +30,7 @@
 #include <board.h>
 #include <fp_lib_table.h>
 #include <footprint.h>
+#include <kiface_base.h>
 #include <router/router_tool.h>
 #include <tools/pcb_actions.h>
 #include <tools/pcb_selection_tool.h>
@@ -37,6 +38,31 @@
 #include <zone_filler.h>
 
 FP_LIB_TABLE GFootprintTable;
+
+
+// Kiface() (include/kiface_base.h:134) is KiCad's global "which DSO/module
+// am I" accessor -- every real KIFACE (pcbnew.cpp, eeschema.cpp, ...)
+// defines its own instance. qa/mocks/kicad/common_mocks.cpp is KiCad's own
+// answer for headless tooling, but it goes through a mock-object framework
+// (turtlemocks, via qa_utils/wx_utils/unit_test_utils.h) we don't otherwise
+// depend on -- KIFACE_BASE only has 3 pure virtual methods
+// (include/kiface_base.h), so a minimal direct subclass here avoids pulling
+// in that whole framework for 3 no-op methods.
+class HEADLESS_KIFACE : public KIFACE_BASE
+{
+public:
+    HEADLESS_KIFACE() : KIFACE_BASE( "pcbworld_bridge", KIWAY::FACE_PCB ) {}
+
+    bool OnKifaceStart( PGM_BASE*, int, KIWAY* ) override { return true; }
+    wxWindow* CreateKiWindow( wxWindow*, int, KIWAY*, int ) override { return nullptr; }
+    void* IfaceOrAddress( int ) override { return nullptr; }
+};
+
+KIFACE_BASE& Kiface()
+{
+    static HEADLESS_KIFACE kiface;
+    return kiface;
+}
 
 
 void ROUTER_TOOL::NeighboringSegmentFilter( const VECTOR2I&, GENERAL_COLLECTOR&, PCB_SELECTION_TOOL* )
