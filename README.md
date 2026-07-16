@@ -11,16 +11,24 @@ the engine wrapper, and routes a toy board end to end).
 ## Project layout
 
 ```
-pcbworld/
-  engine/     # Headless wrapper around KiCad's routing/DRC engine
-  env/        # Gym-style RL environment built on the engine wrapper
-  agents/     # RL (PPO/GRPO) and LLM routing agents
-  data/       # Synthetic + real board generation (D1/D2/D3-style datasets)
-notebooks/    # Colab notebooks (setup, wrapper demo, training, eval)
-scripts/      # CLI entry points
-tests/        # Unit + integration tests
-docs/         # Design notes, findings on KiCad API surface
+pcbworld/       # Headless PNS::ROUTER bridge + (future) RL env/agents -- compile-from-source path
+  engine/       # Headless wrapper around KiCad's routing/DRC engine
+  env/          # Gym-style RL environment built on the engine wrapper
+  agents/       # RL (PPO/GRPO) and LLM routing agents
+  data/         # Synthetic + real board generation (D1/D2/D3-style datasets)
+kicad_plugin/   # LLM Board Advisor -- KiCad Action Plugin, no compiling required
+notebooks/      # Colab notebooks (setup, wrapper demo, training, eval)
+scripts/        # CLI entry points
+tests/          # Unit + integration tests
+docs/           # Design notes, findings on KiCad API surface
 ```
+
+Two parallel tracks: [`kicad_plugin/`](kicad_plugin/) is a working-today LLM
+advisor Action Plugin (reads board state, asks an LLM, reports back) using
+KiCad's standard scripting API -- no build required, but it can't drive the
+interactive router (that API isn't exposed there). [`pcbworld/`](pcbworld/)
+is the heavier path to real routing: compiling a bridge to KiCad's actual
+`PNS::ROUTER` for an eventual RL routing agent.
 
 ## Status
 
