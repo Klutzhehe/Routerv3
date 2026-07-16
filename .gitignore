@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+*.kicad_pcb-bak
+*.lck
+.DS_Store
+outputs/
+checkpoints/
+wandb/
