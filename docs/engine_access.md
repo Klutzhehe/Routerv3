@@ -79,14 +79,42 @@ constructed in `SetHostTool(PCB_TOOL_BASE*)`
 a `TOOL_BASE`/`TOOL_MANAGER`/`EDA_DRAW_FRAME` — GUI-tool machinery we don't
 have headlessly.
 
-**Plan:** subclass `PNS_KICAD_IFACE` ourselves, keep its (protected)
-`createBoardItem`/`modifyBoardItem` conversion logic, but override `Commit()`
-to skip `BOARD_COMMIT` entirely and call `BOARD::Add()` / `BOARD::Remove()`
-directly on the created items. `BOARD::Add`/`Remove` are plain public methods
-with no GUI dependency — `BOARD_COMMIT` only exists for undo/redo grouping,
-which we don't need in a training loop. This is new code we're writing (not
-copied from KiCad), flagged in `pcbworld/engine/cpp/pns_bridge.cpp` as the
-one part that needs verification once it actually compiles and links.
+**What we actually built:** subclass `PNS_KICAD_IFACE_BASE` (not the real
+`PNS_KICAD_IFACE` — see below for why), reimplementing `createBoardItem`/
+`modifyBoardItem` ourselves (ported from `pns_kicad_iface.cpp`, minus the
+drag/footprint-offset bookkeeping) and calling `BOARD::Add()`/`BOARD::Remove()`
+directly instead of `BOARD_COMMIT`. `BOARD::Add`/`Remove` are plain public
+methods with no GUI dependency — `BOARD_COMMIT` only exists for undo/redo
+grouping, which we don't need in a training loop.
+
+**Why not just subclass the real `PNS_KICAD_IFACE`:** tried that first, hit
+a real linker problem. `createBoardItem`/`modifyBoardItem` only exist on
+`PNS_KICAD_IFACE`, and it and `PNS_KICAD_IFACE_BASE` are both implemented in
+the *same* `pns_kicad_iface.cpp` — one compiled object file. Static linking
+is all-or-nothing per object file (no per-function granularity, and KiCad's
+build doesn't set `-ffunction-sections`, so `--gc-sections` can't help
+either). So needing anything from that file — even just the harmless base
+class's `SyncWorld()` — pulls in `PNS_KICAD_IFACE::Commit()`'s dead code
+too, which calls `BOARD_COMMIT::Push()` (`pcbnew/board_commit.cpp`, part of
+the `pcbcommon` library we must link), which looks up `ZONE_FILLER_TOOL`
+and `PCB_SELECTION_TOOL` through `TOOL_MANAGER` — real GUI-only tool
+classes implemented in `pcbnew/tools/*.cpp` (part of `pcbnew_kiface_objects`,
+the full GUI object library, which needs a live wx app and is exactly what
+we're avoiding). Confirmed via `nm` on the actual built objects that
+`board_commit.cpp.o` is the *only* source of the undefined typeinfo
+symbols, and that nothing else in `pcbcommon` needs it — it's pulled in
+purely by `pns_kicad_iface.cpp.o` needing to be linked as a whole.
+
+Fix: `pcbworld/engine/cpp/gui_tool_stubs.cpp` provides minimal standalone
+definitions of `ZONE_FILLER_TOOL`/`PCB_SELECTION_TOOL` — not inheriting from
+their real base classes, just matching the exact method signatures
+(`IsZoneFillAction`, `DirtyZone`, `RebuildSelection`) that `router_tool.cpp`/
+`board_commit.cpp` reference. This is safe specifically because the
+referencing code is provably unreachable — we never construct or use a
+`TOOL_MANAGER` anywhere, so `BOARD_COMMIT::Push()`'s tool lookups never
+actually execute. Linking is name-based (the linker matches mangled symbol
+names, not semantic type compatibility), so the stub satisfies it regardless
+of not matching the real classes' inheritance.
 
 ## Build plan
 

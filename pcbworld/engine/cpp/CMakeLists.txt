@@ -12,6 +12,7 @@ find_package( pybind11 CONFIG REQUIRED )
 pybind11_add_module( pcbworld_pns_bridge
     pns_bridge.cpp
     bindings.cpp
+    gui_tool_stubs.cpp
 )
 
 target_include_directories( pcbworld_pns_bridge PRIVATE
