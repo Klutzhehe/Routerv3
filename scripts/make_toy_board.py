@@ -43,7 +43,14 @@ def make_toy_board(path: str) -> None:
         pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
         pad.SetShape(pcbnew.PAD_SHAPE_CIRCLE)
         pad.SetSize(pcbnew.VECTOR2I(pcbnew.FromMM(1.5), pcbnew.FromMM(1.5)))
-        pad.SetLayerSet(pcbnew.LSET([pcbnew.F_Cu]))
+        # LSET's constructors take std::initializer_list/std::vector<PCB_LAYER_ID>
+        # (SWIG doesn't auto-convert a plain Python list to either here) or
+        # explicitly `= delete`s the single-int form (include/lset.h) to
+        # prevent enum/bitmask mixups. Build via the empty ctor + the
+        # inherited BASE_SET::set(pos) bit-setter instead.
+        layers = pcbnew.LSET()
+        layers.set(pcbnew.F_Cu)
+        pad.SetLayerSet(layers)
         pad.SetPosition(pos)
         pad.SetNet(net)
         fp.Add(pad)
