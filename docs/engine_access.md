@@ -177,6 +177,32 @@ name-based (the linker matches mangled symbol names, not semantic type
 compatibility), so a mock with different internals than the real class is
 fine as long as the signatures match.
 
+`Pgm()` never actually surfaced as a missing symbol — the bridge imported
+cleanly after the `Kiface()` fix, so that speculative concern turned out
+to be unnecessary.
+
+## Runtime crash: stale candidate ids (not a linker issue)
+
+Once the bridge imported successfully, the first real routing attempt
+crashed the whole Colab process (no Python traceback — a C++-level fault).
+Root cause was in our own code, not KiCad's: `PNS_BRIDGE::QueryHoverItems`
+cleared its candidate list on *every* call and returned ids as plain
+indices into it. Querying near pad A, then querying again near pad B,
+silently invalidated pad A's id (id `0` now pointed at pad B's item) — so
+`start_route(pad_a.x, pad_a.y, pad_a.id, ...)` handed the router pad A's
+*coordinates* together with pad B's *item pointer*, a mismatch KiCad's
+routing geometry code isn't expecting and evidently doesn't handle
+gracefully. Traced by reading `PNS_PCBNEW_RULE_RESOLVER::Clearance()`/
+`QueryConstraint()` first (both properly null-guard a missing `DRC_ENGINE`,
+ruling that out) before finding the actual bug in `pns_bridge.cpp`.
+
+Fixed by making candidate ids stable and persistent: `PNS_BRIDGE` now keeps
+an append-only `m_candidateItems` vector plus a
+`std::unordered_map<PNS::ITEM*, long long> m_candidateIds` for
+deduplication, cleared only in `LoadBoard()` (a genuinely new PNS world),
+not on every query. An id from an earlier query stays valid no matter how
+many subsequent queries happen in between.
+
 ## Build plan
 
 Link the same targets KiCad's own headless PNS/DRC unit tests link against

@@ -27,6 +27,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <router/pns_kicad_iface.h>
@@ -76,7 +77,7 @@ public:
     // ROUTER::QueryHoverItems (pcbnew/router/pns_tool_base.cpp:143).
     struct Candidate
     {
-        long long id;   // opaque handle, valid until the next router call
+        long long id;   // stable handle, valid until the next LoadBoard()
         int x, y;
         std::string kind;   // "pad" | "segment" | "via" | "arc"
         std::string net;
@@ -103,9 +104,17 @@ private:
     std::unique_ptr<PNS_BRIDGE_IFACE> m_iface;
     std::unique_ptr<PNS::ROUTER> m_router;
 
-    // PNS::ITEM pointers handed to Python as opaque ids; valid only within
-    // the node they were queried from (router world is rebuilt on SyncWorld).
-    mutable std::vector<PNS::ITEM*> m_lastCandidates;
+    // PNS::ITEM pointers handed to Python as opaque, stable ids. Previously
+    // this was cleared on every QueryHoverItems() call, which silently
+    // invalidated ids from an earlier call the moment a second query ran --
+    // e.g. querying near pad A then pad B, then trying to use pad A's id,
+    // would resolve to pad B's item while still using pad A's coordinates.
+    // That mismatch (an item pointer far from the given "start here" point)
+    // crashed the router. Now append-only and deduplicated by item pointer,
+    // so an id stays valid across any number of queries; only LoadBoard()
+    // (a brand new PNS world) invalidates them.
+    mutable std::vector<PNS::ITEM*> m_candidateItems;
+    mutable std::unordered_map<PNS::ITEM*, long long> m_candidateIds;
 };
 
 }  // namespace pcbworld

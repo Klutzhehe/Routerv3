@@ -251,6 +251,9 @@ bool PNS_BRIDGE::LoadBoard( const std::string& aPath )
     m_router->ClearWorld();
     m_router->SyncWorld();
 
+    m_candidateItems.clear();
+    m_candidateIds.clear();
+
     return true;
 }
 
@@ -296,17 +299,27 @@ std::vector<PNS_BRIDGE::Candidate> PNS_BRIDGE::QueryHoverItems( int aX, int aY, 
 
     PNS::ITEM_SET hits = m_router->QueryHoverItems( VECTOR2I( aX, aY ), aSlopRadius );
 
-    m_lastCandidates.clear();
-
     for( PNS::ITEM* item : hits.CItems() )
     {
         if( aLayer >= 0 && !item->Layers().Overlaps( aLayer ) )
             continue;
 
-        m_lastCandidates.push_back( item );
+        long long id;
+        auto existing = m_candidateIds.find( item );
+
+        if( existing != m_candidateIds.end() )
+        {
+            id = existing->second;
+        }
+        else
+        {
+            id = static_cast<long long>( m_candidateItems.size() );
+            m_candidateItems.push_back( item );
+            m_candidateIds.emplace( item, id );
+        }
 
         Candidate c;
-        c.id = static_cast<long long>( m_lastCandidates.size() - 1 );
+        c.id = id;
         VECTOR2I pos = item->Anchor( 0 );
         c.x = pos.x;
         c.y = pos.y;
@@ -328,10 +341,10 @@ std::vector<PNS_BRIDGE::Candidate> PNS_BRIDGE::QueryHoverItems( int aX, int aY, 
 
 PNS::ITEM* PNS_BRIDGE::resolveItem( long long aItemId ) const
 {
-    if( aItemId < 0 || static_cast<size_t>( aItemId ) >= m_lastCandidates.size() )
+    if( aItemId < 0 || static_cast<size_t>( aItemId ) >= m_candidateItems.size() )
         return nullptr;
 
-    return m_lastCandidates[static_cast<size_t>( aItemId )];
+    return m_candidateItems[static_cast<size_t>( aItemId )];
 }
 
 bool PNS_BRIDGE::StartRoute( int aX, int aY, long long aItemId, int aLayer )
