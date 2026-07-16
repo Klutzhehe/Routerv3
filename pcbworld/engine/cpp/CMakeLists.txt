@@ -26,7 +26,10 @@ target_include_directories( pcbworld_pns_bridge PRIVATE
 
 # Same link set as KiCad's own headless PNS/DRC unit tests
 # (qa/tests/pcbnew/CMakeLists.txt) minus the Boost.Test / qa_utils pieces
-# we don't need.
+# we don't need, plus PCBNEW_IO_LIBRARIES (pcbnew/CMakeLists.txt:687) --
+# pcbcommon's plugin registry references every non-native board-format
+# importer/exporter's vtable (PCB_IO_IPC2581 etc.), so they all have to be
+# linked in even though we only construct PCB_IO_KICAD_SEXPR ourselves.
 target_link_libraries( pcbworld_pns_bridge PRIVATE
     pnsrouter
     pcbcommon
@@ -35,4 +38,5 @@ target_link_libraries( pcbworld_pns_bridge PRIVATE
     gal
     common
     scripting
+    ${PCBNEW_IO_LIBRARIES}
 )
