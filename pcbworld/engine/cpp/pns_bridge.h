@@ -136,12 +136,110 @@ public:
     // has no GUI dependency, same as PNS::ROUTER.
     std::vector<DRCViolation> RunDRC();
 
+    // Bulk geometry export -- the one call an agent/state-builder needs to
+    // rasterize the board into the spatial channels (copper, keepouts,
+    // courtyards, vias, edge-distance field) without a per-grid-cell
+    // QueryHoverItems() call, which would mean one router call per pixel.
+    // Everything here is read directly off the loaded BOARD, so it works
+    // whether or not a route is currently in progress.
+    struct TrackSegment
+    {
+        int x1, y1, x2, y2;
+        int width;
+        int layer;          // PCB_LAYER_ID
+        std::string net;
+        bool isArc;          // true: (x1,y1)-(x2,y2) is an arc's start/end
+                              // chord, not a straight segment -- exact arc
+                              // shape (mid point, radius) isn't exported;
+                              // callers rasterizing this need to treat arcs
+                              // as a coarse straight-line approximation, or
+                              // this struct needs a mid-point field added
+                              // later if that's not accurate enough.
+    };
+
+    struct ViaGeom
+    {
+        int x, y;
+        int diameter, drill;
+        int layerTop, layerBottom;
+        std::string net;
+    };
+
+    struct PadGeom
+    {
+        int x, y;
+        int sizeX, sizeY;   // pad footprint size, not shape-accurate (a
+                             // circle/oval/roundrect pad is exported as its
+                             // bounding box) -- fine for a rasterized
+                             // obstacle channel, not for exact DRC-grade
+                             // geometry (use RunDRC() for that).
+        int layerTop, layerBottom;
+        std::string net;
+        std::string padName;   // "<footprint reference>:<pad number>"
+    };
+
+    struct ZoneGeom
+    {
+        std::vector<std::pair<int, int>> outline;  // main outline only
+                                                     // (Outline(0)) -- holes
+                                                     // and additional
+                                                     // outlines in the same
+                                                     // zone are dropped.
+        int layer;
+        bool isKeepout;      // ZONE::GetIsRuleArea()
+        std::string net;     // empty for a pure keepout/rule-area zone
+    };
+
+    // Coarse per-footprint bounding box, standing in for a real courtyard
+    // polygon. FOOTPRINT's actual courtyard cache API
+    // (GetCourtyard(PCB_LAYER_ID)) is version-sensitive enough that getting
+    // it wrong silently produces an empty/stale polygon rather than a
+    // compile error -- a plain bounding box is worse-fidelity but can't be
+    // subtly wrong the same way. Revisit if the courtyard channel needs
+    // tighter-than-bbox fidelity.
+    struct FootprintBBox
+    {
+        int x1, y1, x2, y2;
+        std::string reference;
+    };
+
+    struct EdgeShape
+    {
+        std::string shapeType;   // "segment" | "rect" | "circle" | "arc" | "polygon"
+        int x1, y1, x2, y2;      // segment/rect: two endpoints/corners.
+                                 // circle: x1,y1 = center, x2,y2 = a point
+                                 // on the circumference (radius = distance).
+                                 // polygon: bounding box only -- exact
+                                 // outline points aren't exported, same
+                                 // simplification as ZoneGeom's holes.
+        int width;
+    };
+
+    struct BoardGeometry
+    {
+        std::vector<TrackSegment> tracks;
+        std::vector<ViaGeom> vias;
+        std::vector<PadGeom> pads;
+        std::vector<ZoneGeom> zones;
+        std::vector<FootprintBBox> courtyards;
+        std::vector<EdgeShape> boardEdge;   // Edge_Cuts layer shapes
+    };
+
+    BoardGeometry GetBoardGeometry() const;
+
     void SetMode( int aMode );          // PNS::ROUTER_MODE
     void SetTrackWidth( int aWidthNm );
     void SetViaDiameter( int aDiameterNm );
     void SetViaDrill( int aDrillNm );
+    void SetDiffPairGap( int aGapNm );
+    void SetDiffPairViaGap( int aGapNm );
+    void SetDiffPairWidth( int aWidthNm );
+    void SetTargetLength( long long aLengthNm );
+    void SetMeanderMaxAmplitude( int aAmpNm );
+    void SetMeanderSpacing( int aSpacingNm );
     void ToggleViaPlacement();
     bool SwitchLayer( int aLayer );
+
 
 private:
     PNS::ITEM* resolveItem( long long aItemId ) const;

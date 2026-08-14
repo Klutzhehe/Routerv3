@@ -65,6 +65,13 @@ target_include_directories( pcbworld_pns_bridge PRIVATE
 # first place new missing-symbol errors surface, same as the routing bridge
 # did originally (see docs/engine_access.md) -- iterate from real linker
 # output, don't guess further ahead of it.
+# Force linker to catch missing symbols at build time rather than lazy dlopen ImportError
+if( UNIX AND NOT APPLE )
+    target_link_options( pcbworld_pns_bridge PRIVATE
+        "-Wl,--no-undefined"
+    )
+endif()
+
 target_link_libraries( pcbworld_pns_bridge PRIVATE
     pcbnew_kiface_objects
     pnsrouter
@@ -74,12 +81,13 @@ target_link_libraries( pcbworld_pns_bridge PRIVATE
     gal
     common
     scripting
+    richio
     # pcbnew_kiface_objects includes exporters/export_idf.cpp, which needs
     # IDF_SEGMENT/IDF_POINT/etc from utils/idftools/ -- a separate static
     # library (utils/idftools/CMakeLists.txt: add_library(idf3 STATIC ...)),
-    # not part of pcbnew_kiface_objects itself. Confirmed by an
-    # ImportError at dlopen time (undefined symbol, lazy binding meant the
-    # linker didn't catch it), not a link-time failure.
+    # not part of pcbnew_kiface_objects itself.
     idf3
     ${PCBNEW_IO_LIBRARIES}
+    common
 )
+

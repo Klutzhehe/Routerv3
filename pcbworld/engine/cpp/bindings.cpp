@@ -53,8 +53,15 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
         .def( "set_track_width", &PNS_BRIDGE::SetTrackWidth )
         .def( "set_via_diameter", &PNS_BRIDGE::SetViaDiameter )
         .def( "set_via_drill", &PNS_BRIDGE::SetViaDrill )
+        .def( "set_diff_pair_gap", &PNS_BRIDGE::SetDiffPairGap, py::arg( "gap" ) )
+        .def( "set_diff_pair_via_gap", &PNS_BRIDGE::SetDiffPairViaGap, py::arg( "gap" ) )
+        .def( "set_diff_pair_width", &PNS_BRIDGE::SetDiffPairWidth, py::arg( "width" ) )
+        .def( "set_target_length", &PNS_BRIDGE::SetTargetLength, py::arg( "length" ) )
+        .def( "set_meander_max_amplitude", &PNS_BRIDGE::SetMeanderMaxAmplitude, py::arg( "max_amp" ) )
+        .def( "set_meander_spacing", &PNS_BRIDGE::SetMeanderSpacing, py::arg( "spacing" ) )
         .def( "toggle_via_placement", &PNS_BRIDGE::ToggleViaPlacement )
         .def( "switch_layer", &PNS_BRIDGE::SwitchLayer );
+
 
     // PNS::ROUTER_MODE (pcbnew/router/pns_router.h)
     m.attr( "MODE_ROUTE_SINGLE" ) = 1;

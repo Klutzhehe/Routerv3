@@ -9,7 +9,12 @@
 #include <netinfo.h>
 #include <pad.h>
 #include <padstack.h>
+#include <pcb_shape.h>
 #include <pcb_track.h>
+#include <zone.h>
+
+#include <geometry/shape_line_chain.h>
+#include <geometry/shape_poly_set.h>
 
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 
@@ -463,6 +468,153 @@ std::vector<PNS_BRIDGE::NetPad> PNS_BRIDGE::NetPads() const
     return out;
 }
 
+// Two-copper-layer simplification shared by pads and zones below: records
+// only whether F_Cu/B_Cu are present in a layer set, not every inner layer.
+// Correct for every board this codebase currently generates
+// (pcbworld/data/generate_board.py is 2-layer only) -- revisit if/when a
+// multi-inner-layer generator is added (see ROADMAP.md's generalization
+// tests, which explicitly call out "different layer counts").
+static void CopperLayerRange( const LSET& aLayers, int& aTop, int& aBottom )
+{
+    aTop = aLayers.Contains( F_Cu ) ? static_cast<int>( F_Cu ) : static_cast<int>( UNDEFINED_LAYER );
+    aBottom = aLayers.Contains( B_Cu ) ? static_cast<int>( B_Cu ) : aTop;
+}
+
+PNS_BRIDGE::BoardGeometry PNS_BRIDGE::GetBoardGeometry() const
+{
+    BoardGeometry geom;
+
+    if( !m_board )
+        return geom;
+
+    for( PCB_TRACK* track : m_board->Tracks() )
+    {
+        if( PCB_VIA* via = dynamic_cast<PCB_VIA*>( track ) )
+        {
+            ViaGeom v;
+            VECTOR2I pos = via->GetPosition();
+            v.x = pos.x;
+            v.y = pos.y;
+            v.diameter = via->GetWidth( PADSTACK::ALL_LAYERS );
+            v.drill = via->GetDrillValue();
+            v.layerTop = static_cast<int>( via->TopLayer() );
+            v.layerBottom = static_cast<int>( via->BottomLayer() );
+            v.net = via->GetNetname().ToStdString();
+            geom.vias.push_back( v );
+            continue;
+        }
+
+        TrackSegment seg;
+        VECTOR2I start = track->GetStart();
+        VECTOR2I end = track->GetEnd();
+        seg.x1 = start.x;
+        seg.y1 = start.y;
+        seg.x2 = end.x;
+        seg.y2 = end.y;
+        seg.width = track->GetWidth();
+        seg.layer = static_cast<int>( track->GetLayer() );
+        seg.net = track->GetNetname().ToStdString();
+        seg.isArc = dynamic_cast<PCB_ARC*>( track ) != nullptr;
+        geom.tracks.push_back( seg );
+    }
+
+    for( FOOTPRINT* fp : m_board->Footprints() )
+    {
+        for( PAD* pad : fp->Pads() )
+        {
+            PadGeom p;
+            VECTOR2I pos = pad->GetPosition();
+            VECTOR2I size = pad->GetSize( PADSTACK::ALL_LAYERS );
+            p.x = pos.x;
+            p.y = pos.y;
+            p.sizeX = size.x;
+            p.sizeY = size.y;
+            CopperLayerRange( pad->GetLayerSet(), p.layerTop, p.layerBottom );
+            p.net = pad->GetNetname().ToStdString();
+            p.padName = fp->GetReference().ToStdString() + ":" + pad->GetNumber().ToStdString();
+            geom.pads.push_back( p );
+        }
+
+        BOX2I bbox = fp->GetBoundingBox();
+        FootprintBBox b;
+        b.x1 = bbox.GetLeft();
+        b.y1 = bbox.GetTop();
+        b.x2 = bbox.GetRight();
+        b.y2 = bbox.GetBottom();
+        b.reference = fp->GetReference().ToStdString();
+        geom.courtyards.push_back( b );
+    }
+
+    for( ZONE* zone : m_board->Zones() )
+    {
+        if( zone->Outline() == nullptr || zone->Outline()->OutlineCount() == 0 )
+            continue;
+
+        ZoneGeom z;
+        const SHAPE_LINE_CHAIN& chain = zone->Outline()->Outline( 0 );
+
+        for( int i = 0; i < chain.PointCount(); ++i )
+        {
+            const VECTOR2I& pt = chain.CPoint( i );
+            z.outline.emplace_back( pt.x, pt.y );
+        }
+
+        int top, bottom;
+        CopperLayerRange( zone->GetLayerSet(), top, bottom );
+        z.layer = top >= 0 ? top : static_cast<int>( zone->GetFirstLayer() );
+        z.isKeepout = zone->GetIsRuleArea();
+        z.net = zone->GetNetname().ToStdString();
+        geom.zones.push_back( z );
+    }
+
+    for( BOARD_ITEM* item : m_board->Drawings() )
+    {
+        if( item->GetLayer() != Edge_Cuts )
+            continue;
+
+        PCB_SHAPE* shape = dynamic_cast<PCB_SHAPE*>( item );
+
+        if( !shape )
+            continue;
+
+        EdgeShape e;
+        e.width = shape->GetWidth();
+        VECTOR2I start = shape->GetStart();
+        VECTOR2I end = shape->GetEnd();
+        e.x1 = start.x;
+        e.y1 = start.y;
+        e.x2 = end.x;
+        e.y2 = end.y;
+
+        switch( shape->GetShape() )
+        {
+        case SHAPE_T::RECT:    e.shapeType = "rect";    break;
+        case SHAPE_T::CIRCLE:  e.shapeType = "circle";  break;
+        case SHAPE_T::ARC:     e.shapeType = "arc";     break;
+        case SHAPE_T::SEGMENT: e.shapeType = "segment"; break;
+        default:
+        {
+            // Polygon/bezier/etc: exact outline points aren't exported
+            // (same simplification as ZoneGeom dropping holes) -- fall
+            // back to the shape's own bounding box so the edge still
+            // constrains a rasterized board-boundary channel, just not
+            // exactly along a curved/irregular edge.
+            e.shapeType = "polygon";
+            BOX2I bbox = shape->GetBoundingBox();
+            e.x1 = bbox.GetLeft();
+            e.y1 = bbox.GetTop();
+            e.x2 = bbox.GetRight();
+            e.y2 = bbox.GetBottom();
+            break;
+        }
+        }
+
+        geom.boardEdge.push_back( e );
+    }
+
+    return geom;
+}
+
 void PNS_BRIDGE::SetMode( int aMode )
 {
     if( m_router )
@@ -487,7 +639,44 @@ void PNS_BRIDGE::SetViaDrill( int aDrillNm )
         m_router->Sizes().SetViaDrill( aDrillNm );
 }
 
+void PNS_BRIDGE::SetDiffPairGap( int aGapNm )
+{
+    if( m_router )
+        m_router->Sizes().SetDiffPairGap( aGapNm );
+}
+
+void PNS_BRIDGE::SetDiffPairViaGap( int aGapNm )
+{
+    if( m_router )
+        m_router->Sizes().SetDiffPairViaGap( aGapNm );
+}
+
+void PNS_BRIDGE::SetDiffPairWidth( int aWidthNm )
+{
+    if( m_router )
+        m_router->Sizes().SetDiffPairWidth( aWidthNm );
+}
+
+void PNS_BRIDGE::SetTargetLength( long long aLengthNm )
+{
+    if( m_router )
+        m_router->Sizes().SetTargetLength( aLengthNm );
+}
+
+void PNS_BRIDGE::SetMeanderMaxAmplitude( int aAmpNm )
+{
+    if( m_routingSettings )
+        m_routingSettings->SetMeanderMaxAmplitude( aAmpNm );
+}
+
+void PNS_BRIDGE::SetMeanderSpacing( int aSpacingNm )
+{
+    if( m_routingSettings )
+        m_routingSettings->SetMeanderSpacing( aSpacingNm );
+}
+
 void PNS_BRIDGE::ToggleViaPlacement()
+
 {
     if( m_router )
         m_router->ToggleViaPlacement();
