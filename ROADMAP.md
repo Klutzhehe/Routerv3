@@ -157,7 +157,35 @@ direction gets picked below — do these first.
    confirms finite losses/weights — real per-CPU-core multiprocessing
    (`docs/performance.md`) isn't implemented, single env only.
 
-Items 2-5 above are batched into one commit deliberately, so only **one**
+6. **Collision-response mode + a minimal single-net env — code written, not
+   yet Colab-verified.** `PNS_BRIDGE::SetCollisionMode()`
+   (`pcbworld/engine/cpp/pns_bridge.{h,cpp}`, bound as
+   `PNSBridge.set_collision_mode()`) exposes `PNS::ROUTING_SETTINGS`'s own
+   `PNS_MODE` (RM_MarkObstacles/RM_Shove/RM_Walkaround) -- previously
+   unbound, and defaulting (via `ROUTING_SETTINGS`'s own constructor) to
+   Shove, which means `push()` was letting PNS auto-move *other* traces to
+   accommodate the agent's segment instead of just reporting a collision.
+   `LoadBoard()` now sets `RM_MarkObstacles` explicitly so `push()` is a
+   pure geometry/DRC validator during RL training; Shove/Walkaround are
+   still available via `set_collision_mode()` for a classical-baseline
+   comparison run. Written against pns_routing_settings.h's remembered API
+   with no local KiCad checkout to confirm against -- same "expect
+   iteration from real Colab compiler output" caveat as everything else
+   new here; this is genuinely the first thing to check if the next Colab
+   build fails to link.
+
+   `pcbworld/env/simple_route_env.py` (`SimpleRouteEnv`) is a deliberately
+   smaller sibling of `PCBRouteEnv`: one net per episode, one layer, a pure
+   `(dx, dy)` action (no via/fix-threshold dims -- a net finishes
+   automatically once the head is within snap radius and `fix()` confirms
+   real connectivity), potential-based progress shaping instead of a raw
+   distance-traveled penalty. Kept as a separate file so `pcb_route_env.py`
+   stays available as-is. Verified locally against `tests/fake_bridge.py`
+   (`tests/test_simple_route_env.py`) -- Python control flow only, same
+   caveat as item 4's `PCBRouteEnv` tests. This is the env to run first in
+   Colab, before `PCBRouteEnv`'s multi-net complexity.
+
+Items 2-6 above are batched into one commit deliberately, so only **one**
 more Colab rebuild is needed to pick up all of it (per-item rebuilds were
 the slow part previously). Item 2 is the only piece touching the compiled
 bridge; items 3-5 are pure Python and need no recompile at all once item

@@ -276,6 +276,12 @@ bool PNS_BRIDGE::LoadBoard( const std::string& aPath )
     m_router->SetInterface( m_iface.get() );
 
     m_routingSettings = std::make_unique<PNS::ROUTING_SETTINGS>( nullptr, "" );
+    // Default to report-only collision mode, not ROUTING_SETTINGS's own
+    // (Shove) default -- see SetCollisionMode()'s doc comment in
+    // pns_bridge.h for why this matters for RL training. Callers wanting
+    // classical Shove/Walkaround behavior (e.g. a baseline comparison run)
+    // call set_collision_mode() after LoadBoard() to opt back in.
+    m_routingSettings->SetMode( PNS::RM_MarkObstacles );
     m_router->LoadSettings( m_routingSettings.get() );
 
     m_router->ClearWorld();
@@ -644,6 +650,12 @@ void PNS_BRIDGE::SetMode( int aMode )
 {
     if( m_router )
         m_router->SetMode( static_cast<PNS::ROUTER_MODE>( aMode ) );
+}
+
+void PNS_BRIDGE::SetCollisionMode( int aMode )
+{
+    if( m_routingSettings )
+        m_routingSettings->SetMode( static_cast<PNS::PNS_MODE>( aMode ) );
 }
 
 void PNS_BRIDGE::SetTrackWidth( int aWidthNm )

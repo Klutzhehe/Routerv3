@@ -229,6 +229,26 @@ public:
     BoardGeometry GetBoardGeometry() const;
 
     void SetMode( int aMode );          // PNS::ROUTER_MODE
+
+    // PNS::ROUTING_SETTINGS's own collision-response mode (PNS::PNS_MODE:
+    // RM_MarkObstacles / RM_Shove / RM_Walkaround, pns_routing_settings.h) --
+    // distinct from SetMode()'s PNS::ROUTER_MODE above, and NOT previously
+    // exposed to Python: LoadBoard() built m_routingSettings with whatever
+    // ROUTING_SETTINGS's own constructor defaults to, which for KiCad's
+    // interactive router is RM_Shove. Shove mode means Push() doesn't just
+    // report a collision -- PNS moves the *other* conflicting trace out of
+    // the way to make the agent's segment fit, i.e. it silently does a
+    // piece of the routing decision for the caller. For RL training this
+    // has to be RM_MarkObstacles (report-only, no auto-adjustment) so
+    // Push() is a pure geometry/DRC validator. LoadBoard() now defaults to
+    // RM_MarkObstacles; call this to opt back into Shove/Walkaround for a
+    // non-RL baseline run.
+    // UNVERIFIED: written against pns_routing_settings.h's remembered API
+    // (ROUTING_SETTINGS::SetMode(PNS_MODE), enum values RM_MarkObstacles=0/
+    // RM_Shove/RM_Walkaround) with no KiCad source checkout available
+    // locally to confirm against -- same "expect iteration from real Colab
+    // compiler output" caveat as everything else new in this file.
+    void SetCollisionMode( int aMode );  // PNS::PNS_MODE
     void SetTrackWidth( int aWidthNm );
     void SetViaDiameter( int aDiameterNm );
     void SetViaDrill( int aDrillNm );

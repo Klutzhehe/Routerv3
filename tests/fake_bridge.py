@@ -48,6 +48,9 @@ class FakePNSBridge:
     def set_mode(self, mode):
         pass
 
+    def set_collision_mode(self, mode):
+        pass
+
     def set_track_width(self, w):
         pass
 
@@ -93,4 +96,7 @@ def install() -> None:
     module.MODE_TUNE_SINGLE = 3
     module.MODE_TUNE_DIFF_PAIR = 4
     module.MODE_TUNE_DIFF_PAIR_SKEW = 5
+    module.RM_MARK_OBSTACLES = 0
+    module.RM_SHOVE = 1
+    module.RM_WALKAROUND = 2
     sys.modules["pcbworld_pns_bridge"] = module

@@ -50,6 +50,7 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
         .def( "net_pads", &PNS_BRIDGE::NetPads )
         .def( "run_drc", &PNS_BRIDGE::RunDRC )
         .def( "set_mode", &PNS_BRIDGE::SetMode )
+        .def( "set_collision_mode", &PNS_BRIDGE::SetCollisionMode )
         .def( "set_track_width", &PNS_BRIDGE::SetTrackWidth )
         .def( "set_via_diameter", &PNS_BRIDGE::SetViaDiameter )
         .def( "set_via_drill", &PNS_BRIDGE::SetViaDrill )
@@ -69,4 +70,13 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
     m.attr( "MODE_TUNE_SINGLE" ) = 3;
     m.attr( "MODE_TUNE_DIFF_PAIR" ) = 4;
     m.attr( "MODE_TUNE_DIFF_PAIR_SKEW" ) = 5;
+
+    // PNS::PNS_MODE (pcbnew/router/pns_routing_settings.h) -- collision
+    // response mode, set via set_collision_mode(). LoadBoard() already
+    // defaults to RM_MARK_OBSTACLES; these constants are for code that
+    // wants to opt back into classical Shove/Walkaround (e.g. a baseline
+    // comparison run against the RL-trained agent).
+    m.attr( "RM_MARK_OBSTACLES" ) = 0;
+    m.attr( "RM_SHOVE" ) = 1;
+    m.attr( "RM_WALKAROUND" ) = 2;
 }
