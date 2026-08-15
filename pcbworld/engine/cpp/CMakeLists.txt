@@ -81,7 +81,6 @@ target_link_libraries( pcbworld_pns_bridge PRIVATE
     gal
     common
     scripting
-    richio
     # pcbnew_kiface_objects includes exporters/export_idf.cpp, which needs
     # IDF_SEGMENT/IDF_POINT/etc from utils/idftools/ -- a separate static
     # library (utils/idftools/CMakeLists.txt: add_library(idf3 STATIC ...)),
