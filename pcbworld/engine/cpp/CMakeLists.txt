@@ -86,6 +86,13 @@ target_link_libraries( pcbworld_pns_bridge PRIVATE
     # library (utils/idftools/CMakeLists.txt: add_library(idf3 STATIC ...)),
     # not part of pcbnew_kiface_objects itself.
     idf3
+    # Same story: pcbnew_kiface_objects includes dialogs/panel_setup_rules.cpp,
+    # which calls ConvertMarkdown2Html() -- implemented in
+    # thirdparty/markdown2html (add_library(markdown_lib STATIC ...)), not
+    # part of pcbnew_kiface_objects or any of the libs above. The real
+    # pcbnew_kiface target links it too (pcbnew/CMakeLists.txt's
+    # PCBNEW_KIFACE_LIBRARIES).
+    markdown_lib
     ${PCBNEW_IO_LIBRARIES}
     common
 )
