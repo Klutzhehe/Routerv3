@@ -25,6 +25,8 @@
 #include <router/pns_arc.h>
 #include <router/pns_item.h>
 #include <router/pns_itemset.h>
+#include <router/pns_meander.h>
+#include <router/pns_meander_placer_base.h>
 #include <router/pns_node.h>
 #include <router/pns_segment.h>
 #include <router/pns_solid.h>
@@ -32,6 +34,20 @@
 
 namespace pcbworld
 {
+
+namespace
+{
+// Casts m_router->Placer() to a MEANDER_PLACER_BASE if a tuning route is
+// currently active. Only meaningful after StartRouting() -- PNS::ROUTER
+// creates the placer then, there's no meander-capable placer beforehand.
+PNS::MEANDER_PLACER_BASE* asMeanderPlacer( PNS::ROUTER* aRouter )
+{
+    if( !aRouter || !aRouter->Placer() )
+        return nullptr;
+
+    return dynamic_cast<PNS::MEANDER_PLACER_BASE*>( aRouter->Placer() );
+}
+}  // namespace
 
 // ---------------------------------------------------------------------
 // PNS_BRIDGE_IFACE
@@ -366,7 +382,16 @@ bool PNS_BRIDGE::StartRoute( int aX, int aY, long long aItemId, int aLayer )
     if( !m_router )
         return false;
 
-    return m_router->StartRouting( VECTOR2I( aX, aY ), resolveItem( aItemId ), aLayer );
+    if( !m_router->StartRouting( VECTOR2I( aX, aY ), resolveItem( aItemId ), aLayer ) )
+        return false;
+
+    // Re-apply length-tuning config to the placer StartRouting() just
+    // created -- it didn't exist yet when SetTargetLength()/etc. were
+    // called (see m_meanderSettings' comment in pns_bridge.h).
+    if( PNS::MEANDER_PLACER_BASE* placer = asMeanderPlacer( m_router.get() ) )
+        placer->UpdateSettings( m_meanderSettings );
+
+    return true;
 }
 
 bool PNS_BRIDGE::Push( int aX, int aY, long long aItemId )
@@ -588,7 +613,7 @@ PNS_BRIDGE::BoardGeometry PNS_BRIDGE::GetBoardGeometry() const
 
         switch( shape->GetShape() )
         {
-        case SHAPE_T::RECT:    e.shapeType = "rect";    break;
+        case SHAPE_T::RECTANGLE: e.shapeType = "rect";    break;
         case SHAPE_T::CIRCLE:  e.shapeType = "circle";  break;
         case SHAPE_T::ARC:     e.shapeType = "arc";     break;
         case SHAPE_T::SEGMENT: e.shapeType = "segment"; break;
@@ -659,20 +684,26 @@ void PNS_BRIDGE::SetDiffPairWidth( int aWidthNm )
 
 void PNS_BRIDGE::SetTargetLength( long long aLengthNm )
 {
-    if( m_router )
-        m_router->Sizes().SetTargetLength( aLengthNm );
+    m_meanderSettings.SetTargetLength( aLengthNm );
+
+    if( PNS::MEANDER_PLACER_BASE* placer = asMeanderPlacer( m_router.get() ) )
+        placer->UpdateSettings( m_meanderSettings );
 }
 
 void PNS_BRIDGE::SetMeanderMaxAmplitude( int aAmpNm )
 {
-    if( m_routingSettings )
-        m_routingSettings->SetMeanderMaxAmplitude( aAmpNm );
+    m_meanderSettings.m_maxAmplitude = aAmpNm;
+
+    if( PNS::MEANDER_PLACER_BASE* placer = asMeanderPlacer( m_router.get() ) )
+        placer->UpdateSettings( m_meanderSettings );
 }
 
 void PNS_BRIDGE::SetMeanderSpacing( int aSpacingNm )
 {
-    if( m_routingSettings )
-        m_routingSettings->SetMeanderSpacing( aSpacingNm );
+    m_meanderSettings.m_spacing = aSpacingNm;
+
+    if( PNS::MEANDER_PLACER_BASE* placer = asMeanderPlacer( m_router.get() ) )
+        placer->UpdateSettings( m_meanderSettings );
 }
 
 void PNS_BRIDGE::ToggleViaPlacement()

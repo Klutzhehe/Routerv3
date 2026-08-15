@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <router/pns_kicad_iface.h>
+#include <router/pns_meander.h>
 #include <router/pns_router.h>
 #include <router/pns_routing_settings.h>
 
@@ -257,6 +258,16 @@ private:
     // nullptr-parent/empty-path construction qa/tools/pns/pns_log_player.cpp
     // uses.
     std::unique_ptr<PNS::ROUTING_SETTINGS> m_routingSettings;
+
+    // Target length / meander shape config, applied to the active
+    // PNS::MEANDER_PLACER_BASE when one exists (tuning modes only -- created
+    // by StartRouting(), not available beforehand) and re-applied every
+    // StartRoute() so settings configured before starting a tuning route
+    // (the normal call order: SetMode/SetTargetLength/... then StartRoute)
+    // actually take effect. PNS::ROUTER has no meander-settings slot of its
+    // own -- unlike Sizes(), which lives on ROUTER itself, meander config is
+    // owned per-placer (pns_meander_placer_base.h).
+    PNS::MEANDER_SETTINGS m_meanderSettings;
 
     // PNS::ITEM pointers handed to Python as opaque, stable ids. Previously
     // this was cleared on every QueryHoverItems() call, which silently
