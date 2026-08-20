@@ -50,6 +50,7 @@ class ScriptedBridge:
         self._start_xy = None
         self._last_xy = None
         self._pending = False
+        self.fix_calls: list[tuple] = []  # (x, y, item_id, force_finish, force_commit)
 
     def load_board(self, path):
         return True
@@ -89,6 +90,7 @@ class ScriptedBridge:
         return True
 
     def fix(self, x, y, item_id=-1, force_finish=False, force_commit=False):
+        self.fix_calls.append((x, y, item_id, force_finish, force_commit))
         # Unlike push(), fix() doesn't re-run `reject` -- it only ever gets
         # called on a point push() already accepted (see _route_one_net),
         # so re-validating it here would just be testing this double's own
@@ -117,12 +119,18 @@ class ScriptedBridge:
         return BoardGeometry(list(self._committed), [], [], [], [], [])
 
 
-def _install(nets, reject) -> None:
+def _install(nets, reject) -> ScriptedBridge:
+    """Installs a fake pcbworld_pns_bridge module and returns the single
+    ScriptedBridge instance it will hand back from PNSBridge() -- run()
+    only ever constructs one, so tests that need to inspect call history
+    (e.g. fix_calls) can hold onto this."""
+    bridge = ScriptedBridge(nets, reject)
     module = types.ModuleType("pcbworld_pns_bridge")
-    module.PNSBridge = lambda: ScriptedBridge(nets, reject)
+    module.PNSBridge = lambda: bridge
     module.MODE_ROUTE_SINGLE = 1
     module.RM_MARK_OBSTACLES = 0
     sys.modules["pcbworld_pns_bridge"] = module
+    return bridge
 
 
 @pytest.fixture(autouse=True)
@@ -137,6 +145,26 @@ def _two_pad_net(name: str, start=(0, 0), target=(10 * MM, 0)):
         NetPad(name, "J1:1", start[0], start[1], -1),
         NetPad(name, "J2:1", target[0], target[1], -1),
     ]
+
+
+def test_fix_is_called_with_force_finish_and_force_commit():
+    """Regression: an earlier version of the script called fix(x, y,
+    item_id, False, False), matching simple_route_env.py's convention. A
+    Colab run against the real bridge showed that every net where push()
+    reached the target still failed at this exact call -- 17/24 nets, every
+    one with accepted == requested waypoints, meaning push() succeeded and
+    only fix() rejected. pcb_route_env.py and diff_pair_route_env.py had
+    already fixed this (commit 7f746b6, 'use force_finish=True,
+    force_commit=True in fix() to snap to target pad'); this script had
+    just copied the older, unfixed convention."""
+    from scripts.measure_waypoint_fidelity import run
+
+    bridge = _install(_two_pad_net("net_0"), reject=lambda x, y: False)
+    run("board.kicad_pcb", num_nets=1, bridge_dir=None)
+    assert bridge.fix_calls, "fix() was never called"
+    for x, y, item_id, force_finish, force_commit in bridge.fix_calls:
+        assert force_finish is True, f"fix() called with force_finish={force_finish}"
+        assert force_commit is True, f"fix() called with force_commit={force_commit}"
 
 
 def test_direct_push_succeeds_when_nothing_rejects():

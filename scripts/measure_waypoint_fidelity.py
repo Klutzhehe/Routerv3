@@ -190,7 +190,14 @@ def _route_one_net(
 
     max_deviation_nm = None
     if reached:
-        fixed = bridge.fix(target_xy[0], target_xy[1], target_id, False, False)
+        # force_finish=True, force_commit=True: matches the Colab-verified
+        # convention in pcb_route_env.py / diff_pair_route_env.py (commit
+        # 7f746b6). Without them, a Colab run showed EVERY "failed" net had
+        # accepted == requested -- i.e. push() reached the target every
+        # time, and only this call rejected it -- so fix() apparently needs
+        # to be told to snap rather than doing an exact-match check on
+        # wherever push() last left the head.
+        fixed = bridge.fix(target_xy[0], target_xy[1], target_id, True, True)
         reached = bool(fixed)
         if reached:
             bridge.commit_routing()
