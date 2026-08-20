@@ -112,19 +112,51 @@ hardcoded constant. -inf gives NaN entropy; -1e9 is not representable in float16
 and crashes under autocast. See that function's docstring for the three
 constraints involved.
 
-### The metric to use
+### The metric to use depends on the trainer
 
-**ms/batch, not ms/board.** Env workers route concurrently, so one rollout round
-costs the env a single net-route (T_pns) regardless of worker count, while it
-costs the GPU one whole batched forward. Dividing by batch size flatters the model
-by exactly the factor the workers already provided. The bet holds iff
+Both of the obvious readings are right in their own regime, and the choice
+between them is a trainer design decision that has not been made yet:
 
-    ms/batch at batch=num_workers  <<  T_pns for ONE net
+| trainer | round structure | metric that binds |
+|---|---|---|
+| synchronous VectorEnv (the SB3/gymnasium default) | all W envs step, *then* one batched forward | **ms/batch** must be much less than T_pns |
+| pipelined / async (IMPALA-style) | envs step independently, GPU serves whatever is ready | **throughput** must beat the aggregate env rate |
 
-**T_pns has never been measured.** The "single-digit ms per net" figure that
-originally motivated this section was an estimate with nothing behind it. Measure
-it alongside the waypoint-fidelity test -- both need the bridge built, so they are
-one Colab run.
+Under a synchronous trainer, ms/board flatters the model by exactly the factor
+the workers already provided. Under a pipelined one, ms/board *is* the number,
+because the GPU is a shared server and only its throughput matters.
+
+Measured on a T4 (fp16, batch 128): **1306 net-decisions/sec**. Env supply is
+`W / T_pns`. So:
+
+    the GPU keeps up iff  T_pns  >  0.77 ms x W
+
+W=8 needs T_pns > 6 ms; W=16 needs > 12 ms; W=32 needs > 25 ms.
+
+**Decision: build the trainer pipelined.** It moves the requirement from
+"T_pns must exceed a whole batched forward" (~27 ms, implausible) to "T_pns must
+exceed 0.77 ms per worker" (plausible), and it costs nothing but trainer
+structure. Model-side optimization stops here until T_pns is known.
+
+### Measured, fp16 (T4)
+
+| batch | fp32 ms/batch | fp16 ms/batch | speedup | canvas % (fp16) |
+|---|---|---|---|---|
+| 8 | 14.97 | 16.75 | **0.89x** | 24% |
+| 32 | 43.42 | 26.70 | 1.63x | 60% |
+| 128 | 169.90 | 98.13 | 1.73x | 63% |
+
+fp16 *loses* at batch 8: the canvas encoder does drop (7.69 -> 4.06 ms) but the
+towers rise (7.28 -> 12.69 ms) on autocast's per-op cast overhead, which the
+attention path's many small tensors pay in full at a batch too small to be
+compute-bound. **Use --amp only at batch >= 32.**
+
+act()/evaluate_actions() log-prob drift is exactly 0.00e+00 under fp16 autocast,
+so rollouts and updates may share a precision without corrupting the PPO ratio.
+
+**T_pns is still unmeasured.** Every optimization above was made against a bar
+that was estimated, never observed. Measure it alongside the waypoint-fidelity
+test -- both need the bridge, so they are one Colab run.
 
 ### Deliberately not built
 

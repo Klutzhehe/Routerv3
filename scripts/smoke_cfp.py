@@ -5,22 +5,29 @@ pcbworld/agents/cfp/, so unlike everything under pcbworld/env/ it does not
 need pcbworld_pns_bridge built -- if this fails, the problem is the model,
 not the Colab build.
 
-The number to actually look at is **ms/batch**, not ms/board. Env workers
-route their nets concurrently, so one rollout round costs the env a single
-net-route (T_pns) no matter how many workers there are, while it costs the
-GPU one full batched forward. The comparison that decides whether the
-architecture's central bet holds (GPU time negligible next to the CPU-bound
-router -- docs/AI_ARCHITECTURE.md) is therefore:
+Which of the two reported numbers binds depends on how the trainer is built,
+and both readings are right in their own regime:
 
-    ms/batch at batch=num_workers   vs   T_pns for ONE net
+  * Synchronous VectorEnv (the gymnasium/SB3 default): all workers step, then
+    one batched forward. **ms/batch** must be much less than T_pns, the cost
+    of ONE net-route -- the workers routed concurrently, so dividing by batch
+    size flatters the model by exactly the factor they already gave you.
+  * Pipelined / async: workers step independently and the GPU serves whatever
+    is ready. The GPU is a shared server, so only **throughput** matters, and
+    ms/board is the honest number.
 
-ms/board is reported too, but dividing by the batch size flatters the model
-by exactly the factor the workers already gave you. Do not use it.
+docs/AI_ARCHITECTURE.md picks pipelined, which makes the requirement
+`T_pns > (ms/board) * num_workers` rather than `T_pns >> ms/batch`. Both are
+printed below; read the one matching the trainer you are building.
 
-T_pns has not been measured yet; measure it alongside the waypoint-fidelity
-test, since both need the bridge built.
+T_pns has not been measured yet -- every conclusion drawn from these numbers
+is provisional until it is. Measure it alongside the waypoint-fidelity test,
+since both need the bridge built.
 
     python scripts/smoke_cfp.py --device cuda --batch-size 32 --amp --profile
+
+Note that --amp is a batch->=32 tool: at batch 8 the autocast cast overhead on
+the attention path costs more than the canvas encoder saves.
 """
 
 from __future__ import annotations
@@ -144,12 +151,13 @@ def main() -> None:
         f"{' [fp16 autocast]' if args.amp else ''}"
     )
     print(
-        "  ^ this is the number that matters: one rollout round costs the env "
-        "ONE net-route\n    (T_pns) regardless of worker count, but costs the GPU this "
-        "whole batch."
+        f"  synchronous trainer : needs T_pns >> {per_batch_ms:.1f} ms "
+        f"(one net-route vs one whole batched forward)"
     )
-    print(f"  (ms/board = {per_board_ms:.3f}, reported only because it is easy to "
-          f"misread -- see the module docstring)")
+    print(
+        f"  pipelined trainer   : {1e3 / per_board_ms:.0f} net-decisions/s "
+        f"= {per_board_ms:.3f} ms/board; needs T_pns > {per_board_ms:.2f} ms x num_workers"
+    )
 
     if args.profile:
 
