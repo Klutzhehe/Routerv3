@@ -75,6 +75,12 @@ class LayerHopBridge:
     def set_track_width(self, w):
         pass
 
+    def set_via_diameter(self, d):
+        pass
+
+    def set_via_drill(self, d):
+        pass
+
     def net_pads(self):
         return list(self._nets)
 

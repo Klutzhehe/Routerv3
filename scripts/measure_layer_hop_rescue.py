@@ -34,6 +34,20 @@ same as measure_waypoint_fidelity.py):
      whether vias help. The route must return to the front layer before
      the final approach, same as any real via-detour around SMD pads.
 
+     A second Colab round after that fix still showed switch_layer()
+     itself rejected 15/15 times -- but now at the straight-line MIDPOINT,
+     open board space nowhere near any pad, which the SMD-pad explanation
+     cannot account for. The far more likely cause: VIA_DIAMETER_NM/
+     VIA_DRILL_NM were never configured. switch_layer() places a real via
+     internally (that's what a layer change during interactive routing
+     is), and pcb_route_env.py / diff_pair_route_env.py -- both Colab-
+     verified -- always call set_via_diameter()/set_via_drill() before
+     routing for exactly this reason; this script had no reason to before
+     it started calling switch_layer(). Without a valid via size, there is
+     no legal via geometry anywhere on the board, which is uniform and
+     position-independent -- consistent with the data. Now set from the
+     same values those two files already use (0.6mm / 0.3mm).
+
 UNVERIFIED API SURFACE -- READ BEFORE INTERPRETING A NULL RESULT: unlike
 push()/fix()/query_hover_items() (Colab-verified repeatedly, including by
 measure_waypoint_fidelity.py's own three runs), switch_layer() and
@@ -85,6 +99,21 @@ from measure_waypoint_fidelity import (  # noqa: E402
 )
 
 FRONT_LAYER = 0  # Colab-verified elsewhere (simple_route_env.py, pcb_route_env.py)
+
+# Colab-verified convention, pcb_route_env.py / diff_pair_route_env.py's own
+# defaults -- unlike this script, both of those call set_via_diameter() and
+# set_via_drill() before routing. This script originally didn't, since a
+# same-layer script never places a via and so never needed either setting.
+# switch_layer() places a real via internally though, and a Colab run
+# showed it rejected on all 15/15 nets uniformly at the very first hop --
+# at the straight-line MIDPOINT, nowhere near any pad, which the SMD-pad
+# explanation for the earlier single-hop bug cannot account for. Via
+# diameter/drill left unset (implicitly 0, or whatever ROUTING_SETTINGS's
+# own default is) is the far more likely cause of a rejection that doesn't
+# depend on position at all: there's no legal via geometry to place,
+# anywhere on the board.
+VIA_DIAMETER_NM = 600_000
+VIA_DRILL_NM = 300_000
 
 
 def _lerp(a: tuple[int, int], b: tuple[int, int], t: float) -> tuple[int, int]:
@@ -172,6 +201,8 @@ def run(board_path: str, num_nets: int, back_layer: int, bridge_dir: str | None)
     bridge.set_mode(bridge_module.MODE_ROUTE_SINGLE)
     bridge.set_collision_mode(bridge_module.RM_MARK_OBSTACLES)
     bridge.set_track_width(TRACK_WIDTH_NM)
+    bridge.set_via_diameter(VIA_DIAMETER_NM)
+    bridge.set_via_drill(VIA_DRILL_NM)
 
     pads = bridge.net_pads()
     available = sorted(
