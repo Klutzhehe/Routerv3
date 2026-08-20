@@ -7,36 +7,67 @@ must always run as its own process, never inline in a bridge-loaded
 interpreter. Run standalone or via subprocess, same as make_toy_board.py's
 own usage in notebooks/00_setup.ipynb.
 
-Deliberately simple relative to the PCBWorld paper's full D2 spec: each net
-here is a single pad-to-pad two-terminal net (matching make_toy_board.py's
-existing pattern) rather than the paper's arbitrary-fanout nets. Multi-pad
-nets are a plausible next step once the two-terminal case is routing
-reliably through the Gym env (pcbworld/env/) -- not attempted here to keep
-this generator's pcbnew API usage close to the already-verified toy board
-script.
+Deliberately simple relative to the PCBWorld paper's full D2 spec: every
+net is a two-terminal net (matching make_toy_board.py's existing pattern)
+rather than the paper's arbitrary-fanout nets. Multi-pad nets are a
+plausible next step once the two-terminal case is routing reliably through
+the Gym env (pcbworld/env/) -- not attempted here.
+
+Three net kinds, distinguished by name convention (there's no separate
+metadata channel -- callers recover grouping by parsing net names, same as
+everything else that consumes NetPads()/get_board_geometry()):
+  - Plain two-terminal nets:            "net_<i>"
+  - Differential pairs (positive/negative legs, routed via
+    PNS_BRIDGE::SetMode(MODE_ROUTE_DIFF_PAIR) -- see ROADMAP.md item 7):
+                                         "diffpair_<i>_P" / "diffpair_<i>_N"
+  - Length-matched groups (route via MODE_TUNE_SINGLE against the group's
+    longest member, or MODE_TUNE_DIFF_PAIR_SKEW if a group's members are
+    themselves diff pairs -- not currently combined with diff pairs here):
+                                         "lengthgrp_<g>_<member>"
 """
 
 import argparse
+import math
 import random
 
 import pcbnew
 
 
+def _perp_unit(dx: float, dy: float) -> tuple[float, float]:
+    """Unit vector perpendicular to (dx, dy); arbitrary if it's zero-length."""
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return (1.0, 0.0)
+    return (-dy / length, dx / length)
+
+
 def generate_synthetic_board(
     path: str,
     num_nets: int = 5,
+    num_diff_pairs: int = 0,
+    num_length_matched_groups: int = 0,
+    length_matched_group_size: int = 2,
     seed: int | None = None,
     board_size_mm: tuple[float, float] = (50.0, 50.0),
     pad_size_mm: float = 1.0,
+    diff_pair_pad_size_mm: float = 0.3,
+    diff_pair_pitch_mm: float = 1.0,
     min_spacing_mm: float = 3.0,
     margin_mm: float = 5.0,
 ) -> None:
-    """Writes a gridless 2-layer board with `num_nets` two-pad nets.
+    """Writes a gridless 2-layer board mixing plain, diff-pair, and
+    length-matched-group nets (see module docstring for the naming
+    convention each kind uses).
 
     "Gridless" here means pad positions are arbitrary floats (not snapped
     to any placement grid), matching the paper's D2-style boards -- unlike
     make_toy_board.py's two hand-picked positions, these are randomly
     sampled subject to a minimum pairwise spacing so pads don't overlap.
+    Diff-pair legs are the one exception: they're deliberately placed
+    closer than `min_spacing_mm` (at `diff_pair_pitch_mm`) to each other,
+    since that's what makes them routable as a coupled pair -- everything
+    else still respects `min_spacing_mm` against every pad placed so far,
+    diff-pair legs included.
     """
     rng = random.Random(seed)
 
@@ -67,35 +98,72 @@ def generate_synthetic_board(
 
     fp_index = 0
 
-    for net_idx in range(num_nets):
-        net_name = f"net_{net_idx}"
+    def add_pad(x_mm: float, y_mm: float, net, size_mm: float) -> None:
+        nonlocal fp_index
+        pos = pcbnew.VECTOR2I(pcbnew.FromMM(x_mm), pcbnew.FromMM(y_mm))
+
+        fp_index += 1
+        fp = pcbnew.FOOTPRINT(board)
+        fp.SetReference(f"J{fp_index}")
+        fp.SetPosition(pos)
+        board.Add(fp)
+
+        # See make_toy_board.py for the caveats on this pad-construction
+        # sequence (KiCad 9 PADSTACK move, LSET construction via
+        # base_seqVect) -- identical here, not re-derived.
+        pad = pcbnew.PAD(fp)
+        pad.SetNumber("1")
+        pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+        pad.SetShape(pcbnew.PAD_SHAPE_CIRCLE)
+        pad.SetSize(pcbnew.VECTOR2I(pcbnew.FromMM(size_mm), pcbnew.FromMM(size_mm)))
+        layer_vec = pcbnew.base_seqVect()
+        layer_vec.append(pcbnew.F_Cu)
+        pad.SetLayerSet(pcbnew.LSET(layer_vec))
+        pad.SetPosition(pos)
+        pad.SetNet(net)
+        fp.Add(pad)
+
+    def add_two_terminal_net(net_name: str) -> None:
         net = pcbnew.NETINFO_ITEM(board, net_name)
         board.Add(net)
-
-        for _pad_in_net in range(2):
+        for _ in range(2):
             x_mm, y_mm = sample_position()
-            pos = pcbnew.VECTOR2I(pcbnew.FromMM(x_mm), pcbnew.FromMM(y_mm))
+            add_pad(x_mm, y_mm, net, pad_size_mm)
 
-            fp_index += 1
-            fp = pcbnew.FOOTPRINT(board)
-            fp.SetReference(f"J{fp_index}")
-            fp.SetPosition(pos)
-            board.Add(fp)
+    for net_idx in range(num_nets):
+        add_two_terminal_net(f"net_{net_idx}")
 
-            # See make_toy_board.py for the caveats on this pad-construction
-            # sequence (KiCad 9 PADSTACK move, LSET construction via
-            # base_seqVect) -- identical here, not re-derived.
-            pad = pcbnew.PAD(fp)
-            pad.SetNumber("1")
-            pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
-            pad.SetShape(pcbnew.PAD_SHAPE_CIRCLE)
-            pad.SetSize(pcbnew.VECTOR2I(pcbnew.FromMM(pad_size_mm), pcbnew.FromMM(pad_size_mm)))
-            layer_vec = pcbnew.base_seqVect()
-            layer_vec.append(pcbnew.F_Cu)
-            pad.SetLayerSet(pcbnew.LSET(layer_vec))
-            pad.SetPosition(pos)
-            pad.SetNet(net)
-            fp.Add(pad)
+    diff_pair_half_pitch = diff_pair_pitch_mm / 2.0
+    for pair_idx in range(num_diff_pairs):
+        # Two base positions (the pair's two ends, e.g. driver/receiver),
+        # each split into a P/N leg offset perpendicular to the line
+        # between the ends -- so the two legs run parallel to each other,
+        # matching how a diff pair is actually routed.
+        base_a = sample_position()
+        base_b = sample_position()
+        ox, oy = _perp_unit(base_b[0] - base_a[0], base_b[1] - base_a[1])
+
+        pos_p_a = (base_a[0] + ox * diff_pair_half_pitch, base_a[1] + oy * diff_pair_half_pitch)
+        pos_n_a = (base_a[0] - ox * diff_pair_half_pitch, base_a[1] - oy * diff_pair_half_pitch)
+        pos_p_b = (base_b[0] + ox * diff_pair_half_pitch, base_b[1] + oy * diff_pair_half_pitch)
+        pos_n_b = (base_b[0] - ox * diff_pair_half_pitch, base_b[1] - oy * diff_pair_half_pitch)
+        # Register the actual leg positions (not just the base points) so
+        # later sample_position() calls -- for other nets, other pairs,
+        # length-matched groups -- keep min_spacing_mm away from them too.
+        placed.extend([pos_p_a, pos_n_a, pos_p_b, pos_n_b])
+
+        net_p = pcbnew.NETINFO_ITEM(board, f"diffpair_{pair_idx}_P")
+        net_n = pcbnew.NETINFO_ITEM(board, f"diffpair_{pair_idx}_N")
+        board.Add(net_p)
+        board.Add(net_n)
+        add_pad(*pos_p_a, net_p, diff_pair_pad_size_mm)
+        add_pad(*pos_n_a, net_n, diff_pair_pad_size_mm)
+        add_pad(*pos_p_b, net_p, diff_pair_pad_size_mm)
+        add_pad(*pos_n_b, net_n, diff_pair_pad_size_mm)
+
+    for group_idx in range(num_length_matched_groups):
+        for member_idx in range(length_matched_group_size):
+            add_two_terminal_net(f"lengthgrp_{group_idx}_{member_idx}")
 
     outline_start = pcbnew.VECTOR2I(pcbnew.FromMM(0), pcbnew.FromMM(0))
     outline_end = pcbnew.VECTOR2I(pcbnew.FromMM(width_mm), pcbnew.FromMM(height_mm))
@@ -115,6 +183,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", help="output .kicad_pcb path")
     parser.add_argument("--num-nets", type=int, default=5)
+    parser.add_argument("--num-diff-pairs", type=int, default=0)
+    parser.add_argument("--num-length-matched-groups", type=int, default=0)
+    parser.add_argument("--length-matched-group-size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--width-mm", type=float, default=50.0)
     parser.add_argument("--height-mm", type=float, default=50.0)
@@ -123,7 +194,15 @@ if __name__ == "__main__":
     generate_synthetic_board(
         args.path,
         num_nets=args.num_nets,
+        num_diff_pairs=args.num_diff_pairs,
+        num_length_matched_groups=args.num_length_matched_groups,
+        length_matched_group_size=args.length_matched_group_size,
         seed=args.seed,
         board_size_mm=(args.width_mm, args.height_mm),
     )
-    print(f"wrote {args.path} ({args.num_nets} nets)")
+    print(
+        f"wrote {args.path} ({args.num_nets} plain nets, "
+        f"{args.num_diff_pairs} diff pairs, "
+        f"{args.num_length_matched_groups} length-matched groups of "
+        f"{args.length_matched_group_size})"
+    )

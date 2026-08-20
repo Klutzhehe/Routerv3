@@ -22,6 +22,12 @@ from collections import namedtuple
 Candidate = namedtuple("Candidate", ["id", "x", "y", "kind", "net"])
 NetPad = namedtuple("NetPad", ["net", "pad_name", "x", "y", "layer"])
 DRCViolation = namedtuple("DRCViolation", ["error_code", "message", "severity", "x", "y"])
+TrackSegment = namedtuple(
+    "TrackSegment", ["x1", "y1", "x2", "y2", "width", "layer", "net", "is_arc"]
+)
+BoardGeometry = namedtuple(
+    "BoardGeometry", ["tracks", "vias", "pads", "zones", "courtyards", "board_edge"]
+)
 
 MM = 1_000_000
 
@@ -38,12 +44,27 @@ class FakePNSBridge:
         ]
         self.loaded = False
 
+        # Minimal routing-state tracking -- enough for get_board_geometry()
+        # to report something after commit_routing(), which
+        # DiffPairRouteEnv's length-tuning legs read back to find a
+        # reference net's length and a to-be-tuned net's existing straight
+        # segment. Still not real geometry: commit_routing() always records
+        # a single straight start->target segment, regardless of what mode
+        # was set or how many push() calls happened in between.
+        self._committed_tracks: list[TrackSegment] = []
+        self._candidate_net: dict[int, str] = {}
+        self._next_candidate_id = 0
+        self._active_net: str | None = None
+        self._route_start_xy: tuple[int, int] | None = None
+        self._route_target_xy: tuple[int, int] | None = None
+        self._pending_commit = False
+
     def load_board(self, path):
         self.loaded = True
         return True
 
     def reset(self):
-        pass
+        self._committed_tracks = []
 
     def set_mode(self, mode):
         pass
@@ -60,23 +81,79 @@ class FakePNSBridge:
     def set_via_drill(self, d):
         pass
 
+    def set_diff_pair_gap(self, gap):
+        pass
+
+    def set_diff_pair_via_gap(self, gap):
+        pass
+
+    def set_diff_pair_width(self, width):
+        pass
+
+    def set_target_length(self, length):
+        pass
+
+    def set_meander_max_amplitude(self, max_amp):
+        pass
+
+    def set_meander_spacing(self, spacing):
+        pass
+
     def net_pads(self):
         return list(self._nets)
 
     def query_hover_items(self, x, y, layer=-1, slop_radius=100000):
+        # Pads first (exact fixture positions, same as before), then
+        # already-committed fake tracks by proximity to their midpoint --
+        # the latter is what lets a tune leg's start_route() find the
+        # segment its direct leg just committed (real bridge: a
+        # query_hover_items at a track's midpoint resolves to that
+        # segment; see ROADMAP.md item 7's Colab-verified tune-mode test).
+        for p in self._nets:
+            if abs(p.x - x) <= slop_radius and abs(p.y - y) <= slop_radius:
+                cid = self._next_candidate_id
+                self._next_candidate_id += 1
+                self._candidate_net[cid] = p.net
+                return [Candidate(cid, x, y, "pad", p.net)]
+        for t in self._committed_tracks:
+            mid_x, mid_y = (t.x1 + t.x2) // 2, (t.y1 + t.y2) // 2
+            if abs(mid_x - x) <= slop_radius and abs(mid_y - y) <= slop_radius:
+                cid = self._next_candidate_id
+                self._next_candidate_id += 1
+                self._candidate_net[cid] = t.net
+                return [Candidate(cid, x, y, "segment", t.net)]
         return [Candidate(0, x, y, "pad", "")]
 
     def start_route(self, x, y, item_id, layer):
+        self._active_net = self._candidate_net.get(item_id)
+        self._route_start_xy = (x, y)
+        self._route_target_xy = None
+        self._pending_commit = False
         return True
 
     def push(self, x, y, item_id=-1):
         return True
 
     def fix(self, x, y, item_id=-1, force_finish=False, force_commit=False):
+        self._route_target_xy = (x, y)
+        self._pending_commit = True
         return True
 
     def commit_routing(self):
-        pass
+        if self._pending_commit and self._active_net and self._route_start_xy:
+            x1, y1 = self._route_start_xy
+            x2, y2 = self._route_target_xy or (x1, y1)
+            # Re-tuning a net replaces its previous fake segment rather
+            # than appending a second one, matching the real router's "one
+            # net, one committed route" invariant closely enough for this
+            # fake's purposes.
+            self._committed_tracks = [
+                t for t in self._committed_tracks if t.net != self._active_net
+            ]
+            self._committed_tracks.append(
+                TrackSegment(x1, y1, x2, y2, 250_000, 0, self._active_net, False)
+            )
+        self._pending_commit = False
 
     def stop_routing(self):
         pass
@@ -86,6 +163,16 @@ class FakePNSBridge:
 
     def run_drc(self):
         return [DRCViolation(1, "clearance too small", "error", 0, 0)]
+
+    def get_board_geometry(self):
+        return BoardGeometry(
+            tracks=list(self._committed_tracks),
+            vias=[],
+            pads=[],
+            zones=[],
+            courtyards=[],
+            board_edge=[],
+        )
 
 
 def install() -> None:
