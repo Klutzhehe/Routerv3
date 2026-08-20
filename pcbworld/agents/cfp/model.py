@@ -56,6 +56,7 @@ from pcbworld.agents.cfp.modules import (
     FiLM,
     NetSelfBlock,
     ResBlock,
+    mask_logit_value,
     masked_mean,
     orthogonal_init,
 )
@@ -70,13 +71,6 @@ from pcbworld.agents.cfp.spec import (
 # The canvas encoder halves resolution four times, so a 256x256 canvas
 # becomes the 16x16 token grid the fusion and the field head both work on.
 CANVAS_DOWNSAMPLE = 16
-
-# Fill value for illegal pointer actions. Deliberately -1e9 and not -inf or
-# torch.finfo.min: log_softmax subtracts the row max, and either of those
-# underflows to -inf there, which then makes the categorical's entropy term
-# 0 * -inf = NaN. -1e9 is small enough that exp() of it is exactly 0 in
-# float32 and large enough that the subtraction stays finite.
-MASK_LOGIT = -1e9
 
 
 @dataclasses.dataclass
@@ -119,7 +113,8 @@ class Encoded:
 
     net_h: torch.Tensor         # (B, N, D)  fused per-net embeddings
     canvas_map: torch.Tensor    # (B, D, G, G) fused canvas features
-    pointer_logits: torch.Tensor  # (B, NUM_ACTION_KINDS * N), illegal = -inf
+    pointer_logits: torch.Tensor  # (B, NUM_ACTION_KINDS * N); illegal actions
+                                #   filled with mask_logit_value(dtype)
     value: torch.Tensor         # (B,)
 
 
@@ -278,7 +273,9 @@ class CFPNet(nn.Module):
 
         logits = self.pointer_head(self.pointer_norm(net_h))  # (B, N, KINDS)
         logits = logits.permute(0, 2, 1).flatten(1)           # (B, KINDS*N)
-        logits = logits.masked_fill(~obs.action_mask.flatten(1), MASK_LOGIT)
+        logits = logits.masked_fill(
+            ~obs.action_mask.flatten(1), mask_logit_value(logits.dtype)
+        )
 
         pooled = torch.cat([masked_mean(net_h, obs.net_mask), canvas_map.mean(dim=(2, 3))], -1)
         value = self.value_head(pooled).squeeze(-1)

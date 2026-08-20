@@ -25,6 +25,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def mask_logit_value(dtype: torch.dtype) -> float:
+    """Fill value for masked-out logits, valid in `dtype`.
+
+    Three constraints, and it is easy to satisfy two while breaking the third:
+
+      1. Finite. -inf makes a categorical's entropy term 0 * -inf = NaN, and
+         with a masked action space that is most of every row.
+      2. exp()s to exactly 0, so a masked entry can never be sampled or
+         attended to.
+      3. Representable in `dtype` -- and still representable after softmax or
+         log_softmax subtracts the row max.
+
+    A hardcoded -1e9 satisfies 1 and 2 but fails 3 in float16, whose max is
+    65504: the moment the model runs under autocast, masked_fill raises
+    "value cannot be converted to type c10::Half without overflow".
+    torch.finfo(dtype).min satisfies 1 and 3 but underflows back to -inf once
+    the max is subtracted.
+
+    finfo.max / 4 satisfies all three for float16, bfloat16 and float32.
+    """
+    return -torch.finfo(dtype).max / 4
+
+
 def masked_softmax(logits: torch.Tensor, key_mask: torch.Tensor | None) -> torch.Tensor:
     """Softmax over the last dim, with rows that have no valid key made
     uniform-zero rather than NaN.
@@ -34,8 +57,7 @@ def masked_softmax(logits: torch.Tensor, key_mask: torch.Tensor | None) -> torch
     """
     if key_mask is None:
         return torch.softmax(logits, dim=-1)
-    neg_inf = torch.finfo(logits.dtype).min
-    logits = logits.masked_fill(~key_mask, neg_inf)
+    logits = logits.masked_fill(~key_mask, mask_logit_value(logits.dtype))
     weights = torch.softmax(logits, dim=-1)
     # A row whose keys were all masked softmaxes to uniform over garbage;
     # zero it so it contributes nothing downstream.

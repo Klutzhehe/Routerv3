@@ -122,6 +122,15 @@ def main() -> None:
             sync()
         return (time.perf_counter() - start) / iters
 
+    if args.amp and device.type == "cpu":
+        # CPU has no fp16 conv kernels; torch emulates them and a benchmark
+        # that takes seconds on a T4 runs for minutes here. The correctness
+        # of the autocast path is covered by tests instead.
+        raise SystemExit(
+            "--amp is GPU-only in practice: fp16 convolution is emulated on CPU and "
+            "the benchmark will appear to hang. Drop --amp, or use --device cuda."
+        )
+
     autocast = torch.autocast(device_type=device.type, dtype=torch.float16, enabled=args.amp)
 
     def one_act() -> None:

@@ -97,10 +97,20 @@ Remaining levers, in order of value:
 
 | lever | factor | cost |
 |---|---|---|
-| per-stage blocks `(0,0,1,2)` | 2.0x | done |
+| per-stage blocks `(0,0,1,2)` | 1.8x measured | done |
+| fp16 autocast (T4 tensor cores) | ~2-3x expected | done (`--amp`); GPU-only, CPU has no fp16 conv kernels |
 | canvas 256 -> 128 px | 4.0x | env-side; 0.39 mm/px on a 50 mm board. The A\* planner grid is independent, so this only coarsens *allocation* context |
-| fp16 autocast (T4 tensor cores) | ~2-3x | `--amp`, free |
 | `torch.compile` | ~1.2-1.5x | compile time |
+
+Measured after the per-stage change (T4, fp32): **14.97 / 43.42 / 169.90 ms/batch**
+at 8 / 32 / 128, canvas share down to 51-59%. That is 1.5-1.8x rather than the
+2.04x the FLOP count predicted, because the towers were untouched and are now the
+larger share -- Amdahl, not a regression.
+
+Masked logits use `mask_logit_value(dtype)` = `-finfo(dtype).max / 4`, not a
+hardcoded constant. -inf gives NaN entropy; -1e9 is not representable in float16
+and crashes under autocast. See that function's docstring for the three
+constraints involved.
 
 ### The metric to use
 

@@ -156,6 +156,33 @@ def test_illegal_actions_get_zero_probability(policy, obs):
     assert torch.allclose(probs.sum(-1), torch.ones(obs.batch_size), atol=1e-5)
 
 
+def test_mask_fill_value_is_valid_in_every_supported_dtype():
+    """Regression: a hardcoded -1e9 is not representable in float16, so the
+    model raised "value cannot be converted to type c10::Half without
+    overflow" the moment it ran under fp16 autocast."""
+    from pcbworld.agents.cfp.modules import mask_logit_value
+
+    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        value = mask_logit_value(dtype)
+        logits = torch.zeros(1, 4, dtype=dtype)
+        keep = torch.tensor([[True, False, False, False]])
+        filled = logits.masked_fill(~keep, value)   # used to raise for float16
+        log_probs = torch.log_softmax(filled, dim=-1)
+        assert torch.isfinite(log_probs).all(), f"{dtype} log_softmax went non-finite"
+        assert log_probs.exp()[0, 1].item() == 0.0, f"{dtype} masked entry has mass"
+
+
+def test_forward_runs_under_fp16_autocast(policy, obs):
+    """The GPU --amp path, reproduced on CPU. Autocast is what turns the
+    pointer logits into float16, which is where the overflow surfaced."""
+    with torch.autocast(device_type="cpu", dtype=torch.float16):
+        action = policy.act(obs)
+    assert torch.isfinite(action.log_prob).all()
+    assert torch.isfinite(action.score.cat_entropy).all()
+    valid = obs.action_mask.flatten(1)
+    assert valid.gather(1, action.action_index[:, None]).all()
+
+
 def test_sampling_never_returns_a_padded_or_illegal_slot(policy, obs):
     valid = obs.action_mask.flatten(1)
     for _ in range(20):
