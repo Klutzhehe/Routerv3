@@ -147,6 +147,39 @@ def _two_pad_net(name: str, start=(0, 0), target=(10 * MM, 0)):
     ]
 
 
+class _FakeCandidate:
+    def __init__(self, kind, id):
+        self.kind, self.id = kind, id
+
+
+def test_pick_pad_candidate_prefers_pad_kind_regardless_of_order():
+    """Regression: a Colab run against a 24-net board showed 16/24 nets
+    failing at fix() despite push() reaching the target every time. Real
+    query_hover_items() doesn't sort its hits, so on a board with many
+    already-committed tracks, candidates[0] can be an unrelated track
+    instead of the pad -- fix()ing against its id then correctly fails for
+    a reason that has nothing to do with the net actually being routed."""
+    from scripts.measure_waypoint_fidelity import _pick_pad_candidate
+
+    warnings: list[str] = []
+    candidates = [_FakeCandidate("segment", 5), _FakeCandidate("pad", 7), _FakeCandidate("segment", 9)]
+    picked = _pick_pad_candidate(candidates, "net_x/target", warnings)
+    assert picked.id == 7
+    assert warnings == []
+
+
+def test_pick_pad_candidate_falls_back_and_warns_when_no_pad_present():
+    from scripts.measure_waypoint_fidelity import _pick_pad_candidate
+
+    warnings: list[str] = []
+    candidates = [_FakeCandidate("segment", 3), _FakeCandidate("via", 4)]
+    picked = _pick_pad_candidate(candidates, "net_x/target", warnings)
+    assert picked.id == 3  # no pad available -- falls back to candidates[0]
+    assert len(warnings) == 1
+    assert "net_x/target" in warnings[0]
+    assert "segment" in warnings[0] and "via" in warnings[0]
+
+
 def test_fix_is_called_with_force_finish_and_force_commit():
     """Regression: an earlier version of the script called fix(x, y,
     item_id, False, False), matching simple_route_env.py's convention. A

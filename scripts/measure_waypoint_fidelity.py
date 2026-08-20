@@ -10,7 +10,8 @@ routinely ignores or reroutes around the requested waypoints, the agent's
 field has no causal effect on the outcome and nothing can learn. If push()
 is a faithful validator but rejects naive straight-line waypoints often, that
 is not fatal -- it just means the planner needs real replanning on
-rejection, which this script also measures (see `_detour_waypoints`).
+rejection, which this script also measures via a hand-authored perpendicular
+detour (see _perp_offset() and _route_one_net()'s third attempt).
 
 T_pns -- the wall-clock cost of one net-route -- has never been measured
 either, and docs/AI_ARCHITECTURE.md's whole throughput analysis
@@ -34,9 +35,13 @@ loaded (see docs/performance.md) -- generate the board with
 pcbworld/data/generate_board.py as a genuinely separate process first.
 
 Usage (after notebooks/00_setup.ipynb has built the bridge):
-    python3 pcbworld/data/generate_board.py board.kicad_pcb \\
-        --num-nets 24 --width-mm 30 --height-mm 30 --seed 0
+    python3 pcbworld/data/generate_board.py board.kicad_pcb --num-nets 24 --seed 0
     python3 scripts/measure_waypoint_fidelity.py board.kicad_pcb
+
+    Leave board size at generate_board.py's own default (50x50mm) unless you
+    have deliberately checked the net count against its min_spacing_mm=3.0 --
+    e.g. 24 nets (48 pads) on a 30x30mm board hits its packing limit and
+    raises RuntimeError before a board even gets written.
 """
 
 from __future__ import annotations
@@ -122,8 +127,33 @@ def _perp_offset(
     return int(mx + px * magnitude_nm * side), int(my + py * magnitude_nm * side)
 
 
+def _pick_pad_candidate(candidates: list, label: str, warnings: list[str]):
+    """query_hover_items() returns every item within slop_radius, in
+    whatever order the router's internal hit-test happens to produce -- NOT
+    sorted by kind or distance. On a mostly-empty board candidates[0] is
+    almost always the pad, which is why this bug hides on sparse fixtures
+    (the toy 1-net board, DiffPairRouteEnv's Colab test). On a board with
+    many already-committed nets, an unrelated track can legitimately pass
+    within slop_radius of a later net's pad -- KiCad's default clearance is
+    far tighter than SNAP_RADIUS_NM's 0.5mm -- and candidates[0] can be that
+    track instead of the pad. fix()ing against that item's id then fails
+    for a reason that has nothing to do with THIS net's route, and looks
+    identical to a real collision in the summary stats.
+
+    simple_route_env.py, pcb_route_env.py and diff_pair_route_env.py all
+    have the same `candidates[0]` pattern -- if this hypothesis is
+    confirmed here, it likely affects them too, not just this script.
+    """
+    pads = [c for c in candidates if c.kind == "pad"]
+    if pads:
+        return pads[0]
+    kinds = [c.kind for c in candidates]
+    warnings.append(f"{label}: no 'pad' among candidates, got {kinds} -- used candidates[0]")
+    return candidates[0]
+
+
 def _route_one_net(
-    bridge, module, pads: list, net: str
+    bridge, module, pads: list, net: str, warnings: list[str]
 ) -> NetResult:
     net_pads = [p for p in pads if p.net == net]
     assert len(net_pads) == 2, f"{net!r} has {len(net_pads)} pad(s), expected 2 (see generate_board.py)"
@@ -135,12 +165,13 @@ def _route_one_net(
 
     start_candidates = bridge.query_hover_items(*start_xy, layer=0, slop_radius=SNAP_RADIUS_NM)
     assert start_candidates, f"no candidate at {net!r}'s start pad"
-    assert bridge.start_route(start_xy[0], start_xy[1], start_candidates[0].id, 0), (
+    start_id = _pick_pad_candidate(start_candidates, f"{net}/start", warnings).id
+    assert bridge.start_route(start_xy[0], start_xy[1], start_id, 0), (
         f"start_route failed for {net!r}"
     )
     target_candidates = bridge.query_hover_items(*target_xy, layer=0, slop_radius=SNAP_RADIUS_NM)
     assert target_candidates, f"no candidate at {net!r}'s target pad"
-    target_id = target_candidates[0].id
+    target_id = _pick_pad_candidate(target_candidates, f"{net}/target", warnings).id
 
     def try_push_sequence(points: list[tuple[int, int]]) -> tuple[int, int | None]:
         """Pushes each point in order. Returns (accepted_count,
@@ -162,7 +193,7 @@ def _route_one_net(
         # push -- a straight line is still what an untrained/near-flat-field
         # CFP would emit, just chunked the way the real planner will chunk
         # it (5-20 waypoints; see docs/AI_ARCHITECTURE.md).
-        bridge.start_route(start_xy[0], start_xy[1], start_candidates[0].id, 0)
+        bridge.start_route(start_xy[0], start_xy[1], start_id, 0)
         waypoints = _straight_waypoints(start_xy, target_xy, 5) + [target_xy]
         requested = len(waypoints)
         accepted, rejected_at = try_push_sequence(waypoints)
@@ -176,7 +207,7 @@ def _route_one_net(
             # its only job is to answer "is a rescue *possible* at all", not
             # to be a good planner.
             for magnitude_mm, side in ((1, 1), (1, -1), (2, 1), (2, -1)):
-                bridge.start_route(start_xy[0], start_xy[1], start_candidates[0].id, 0)
+                bridge.start_route(start_xy[0], start_xy[1], start_id, 0)
                 detour_point = _perp_offset(start_xy, target_xy, int(magnitude_mm * MM), side)
                 waypoints = [detour_point, target_xy]
                 requested = len(waypoints)
@@ -261,15 +292,23 @@ def run(board_path: str, num_nets: int, bridge_dir: str | None) -> list[NetResul
     bridge.set_track_width(TRACK_WIDTH_NM)
 
     pads = bridge.net_pads()
-    available = sorted({p.net for p in pads if p.net and p.net.startswith("net_")})
+    # Numeric, not the lexicographic order plain sorted() would give
+    # ("net_10" < "net_2" as strings) -- routing order matters here (each
+    # net is routed against whatever earlier nets already committed), so it
+    # should match the net_<i> index a reader actually sees, not string order.
+    available = sorted(
+        {p.net for p in pads if p.net and p.net.startswith("net_")},
+        key=lambda name: int(name.split("_")[1]),
+    )
     assert available, "no plain 'net_*' nets found -- was the board generated with --num-nets > 0?"
     net_names = available[:num_nets]
 
     print(f"board: {board_path}")
-    print(f"routing {len(net_names)} of {len(available)} available plain nets "
+    print(f"routing {len(net_names)} of {len(available)} available plain nets, in order "
           f"(collision mode RM_MARK_OBSTACLES, track width {TRACK_WIDTH_NM / MM:.2f}mm)\n")
 
-    results = [_route_one_net(bridge, bridge_module, pads, net) for net in net_names]
+    warnings: list[str] = []
+    results = [_route_one_net(bridge, bridge_module, pads, net, warnings) for net in net_names]
 
     violations = bridge.run_drc()
 
@@ -302,6 +341,23 @@ def run(board_path: str, num_nets: int, bridge_dir: str | None) -> list[NetResul
               f"accepted\n       waypoint sequence should land exactly on the target it fix()ed to. "
               f"A\n       nonzero number here means push()/fix() altered geometry beyond what "
               f"was\n       requested -- the actual fidelity risk this script exists to catch.")
+    print(f"\nCANDIDATE RESOLUTION")
+    print(f"  query_hover_items() calls where no 'pad' was among the hits: {len(warnings)}")
+    if warnings:
+        print(f"    -> a fix() failure on one of these nets may not be a real collision at "
+              f"all: it was\n       handed some OTHER item's id (an unrelated already-committed "
+              f"track, most likely) and\n       correctly refused to finish there. See "
+              f"_pick_pad_candidate()'s docstring.")
+        for w in warnings[:10]:
+            print(f"    {w}")
+        if len(warnings) > 10:
+            print(f"    ... and {len(warnings) - 10} more")
+    else:
+        print(f"    -> every start/target query resolved cleanly to a pad. If nets still "
+              f"failed,\n       that failure is NOT explained by candidate-id confusion -- "
+              f"push()/fix() are\n       rejecting for some other reason (real DRC/clearance, "
+              f"most likely).")
+
     print(f"\nDRC violations after commit  : {len(violations)}")
     for v in violations[:10]:
         print(f"    [{v.severity}] {v.message} @ ({v.x / MM:.2f}, {v.y / MM:.2f})")
