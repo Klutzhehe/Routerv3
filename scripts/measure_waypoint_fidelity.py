@@ -92,7 +92,7 @@ def _load_bridge(bridge_dir: str | None):
 class NetResult:
     net: str
     reached_target: bool
-    strategy: str  # "direct" | "polyline" | "detour" | "failed"
+    strategy: str  # "direct" | "polyline" | "detour(<mm>mm,<side>)" | "failed"
     waypoints_requested: int
     waypoints_accepted: int
     first_rejection_frac: float | None  # fraction along the path of the first
@@ -181,76 +181,79 @@ def _route_one_net(
                 return i, i
         return len(points), None
 
-    # Attempt 1: direct, one push straight to the target.
-    accepted, rejected_at = try_push_sequence([target_xy])
-    strategy = "direct"
-    requested = 1
+    # Attempts, in order: one big hop, a 5-point straight polyline (what an
+    # untrained/near-flat-field CFP emits, chunked the way the real planner
+    # will chunk it -- 5-20 waypoints, see docs/AI_ARCHITECTURE.md), then
+    # four hand-authored perpendicular detours at increasing offsets (a
+    # stand-in for what a trained field would produce; not exhaustive, its
+    # only job is "is a rescue possible at all", not "is this a good plan").
+    #
+    # Retries on EITHER a push() rejection OR a fix() rejection -- not just
+    # push(). A Colab run showed push() accepting all 72/72 net-attempts
+    # across three runs while fix() rejected ~67% of them even with
+    # force_finish/force_commit=True, which an earlier version of this loop
+    # never retried past: it only escalated to polyline/detour when push()
+    # itself failed, so with push() apparently never rejecting a single big
+    # hop, the whole retry ladder was dead code -- polyline and detour had
+    # never once run against the real bridge. This also directly tests
+    # something the old structure couldn't: whether fix() accepts a route
+    # built from several incremental push()es (matching how a real
+    # waypoint-follower will actually drive the router) more often than one
+    # push() straight to the target, for the SAME net.
+    attempts: list[tuple[str, list[tuple[int, int]]]] = [
+        ("direct", [target_xy]),
+        ("polyline", _straight_waypoints(start_xy, target_xy, 5) + [target_xy]),
+    ]
+    for magnitude_mm, side in ((1, 1), (1, -1), (2, 1), (2, -1)):
+        detour_point = _perp_offset(start_xy, target_xy, int(magnitude_mm * MM), side)
+        attempts.append((f"detour({magnitude_mm}mm,{'+' if side > 0 else '-'})", [detour_point, target_xy]))
 
-    if rejected_at is None:
-        reached = True
-    else:
-        # Attempt 2: decompose into a 5-point polyline instead of one long
-        # push -- a straight line is still what an untrained/near-flat-field
-        # CFP would emit, just chunked the way the real planner will chunk
-        # it (5-20 waypoints; see docs/AI_ARCHITECTURE.md).
-        bridge.start_route(start_xy[0], start_xy[1], start_id, 0)
-        waypoints = _straight_waypoints(start_xy, target_xy, 5) + [target_xy]
+    strategy = "failed"
+    reached = False
+    accepted = requested = 0
+    rejected_at: int | None = None
+
+    for attempt_name, waypoints in attempts:
+        assert bridge.start_route(start_xy[0], start_xy[1], start_id, 0), (
+            f"start_route (re-)failed for {net!r} on attempt {attempt_name!r}"
+        )
         requested = len(waypoints)
         accepted, rejected_at = try_push_sequence(waypoints)
-        strategy = "polyline"
-        reached = rejected_at is None
 
-        if not reached:
-            # Attempt 3: one manually-authored detour around whatever the
-            # polyline hit, at increasing offsets -- a stand-in for what a
-            # trained cost field would produce. Not exhaustive (no A* here);
-            # its only job is to answer "is a rescue *possible* at all", not
-            # to be a good planner.
-            for magnitude_mm, side in ((1, 1), (1, -1), (2, 1), (2, -1)):
-                bridge.start_route(start_xy[0], start_xy[1], start_id, 0)
-                detour_point = _perp_offset(start_xy, target_xy, int(magnitude_mm * MM), side)
-                waypoints = [detour_point, target_xy]
-                requested = len(waypoints)
-                accepted, rejected_at = try_push_sequence(waypoints)
-                if rejected_at is None:
-                    strategy = "detour"
-                    reached = True
-                    break
-            else:
-                strategy = "failed"
+        if rejected_at is not None:
+            bridge.stop_routing()
+            continue
+
+        # force_finish=True, force_commit=True: matches the Colab-verified
+        # convention in pcb_route_env.py / diff_pair_route_env.py (commit
+        # 7f746b6) -- an earlier version of this script called fix() with
+        # (False, False) and every "failed" net had accepted==requested
+        # (push() always reached the target; only this call rejected it).
+        fixed = bridge.fix(target_xy[0], target_xy[1], target_id, True, True)
+        if fixed:
+            strategy = attempt_name
+            reached = True
+            break
+        bridge.stop_routing()
 
     max_deviation_nm = None
     if reached:
-        # force_finish=True, force_commit=True: matches the Colab-verified
-        # convention in pcb_route_env.py / diff_pair_route_env.py (commit
-        # 7f746b6). Without them, a Colab run showed EVERY "failed" net had
-        # accepted == requested -- i.e. push() reached the target every
-        # time, and only this call rejected it -- so fix() apparently needs
-        # to be told to snap rather than doing an exact-match check on
-        # wherever push() last left the head.
-        fixed = bridge.fix(target_xy[0], target_xy[1], target_id, True, True)
-        reached = bool(fixed)
-        if reached:
-            bridge.commit_routing()
-            geometry = bridge.get_board_geometry()
-            net_tracks = [t for t in geometry.tracks if t.net == net]
-            assert net_tracks, (
-                f"{net!r}: fix()/commit_routing() reported success but "
-                f"get_board_geometry() has no track for it -- the router "
-                f"and the geometry readback disagree"
-            )
-            # The endpoint that matters: does the committed track actually
-            # reach the target pad, not just wherever push() last left the
-            # head. Perpendicular deviation is 0 by construction under
-            # RM_MARK_OBSTACLES (push() is a pure validator, see
-            # simple_route_env.py's docstring) -- this checks the one thing
-            # that construction does NOT guarantee, closure.
-            end_dist = min(
-                (t.x2 - target_xy[0]) ** 2 + (t.y2 - target_xy[1]) ** 2 for t in net_tracks
-            ) ** 0.5
-            max_deviation_nm = end_dist
-        else:
-            bridge.stop_routing()
+        bridge.commit_routing()
+        geometry = bridge.get_board_geometry()
+        net_tracks = [t for t in geometry.tracks if t.net == net]
+        assert net_tracks, (
+            f"{net!r}: fix()/commit_routing() reported success but "
+            f"get_board_geometry() has no track for it -- the router "
+            f"and the geometry readback disagree"
+        )
+        # The endpoint that matters: does the committed track actually
+        # reach the target pad, not just wherever push() last left the
+        # head. This is the one thing RM_MARK_OBSTACLES's push()-as-
+        # validator design does NOT guarantee by construction -- closure.
+        end_dist = min(
+            (t.x2 - target_xy[0]) ** 2 + (t.y2 - target_xy[1]) ** 2 for t in net_tracks
+        ) ** 0.5
+        max_deviation_nm = end_dist
     else:
         bridge.stop_routing()
 
@@ -317,14 +320,16 @@ def run(board_path: str, num_nets: int, bridge_dir: str | None) -> list[NetResul
     for r in results:
         dev = "n/a" if r.max_deviation_nm is None else f"{r.max_deviation_nm / MM:.4f}"
         print(
-            f"{r.net:<10} {str(r.reached_target):<8} {r.strategy:<9} "
+            f"{r.net:<10} {str(r.reached_target):<8} {r.strategy:<16} "
             f"{r.waypoints_accepted}/{r.waypoints_requested:<11} {dev:<12} "
             f"{r.elapsed_s * 1e3:.2f}"
         )
 
     reached = [r for r in results if r.reached_target]
     direct = [r for r in results if r.strategy == "direct" and r.reached_target]
-    rescued = [r for r in results if r.strategy in ("polyline", "detour") and r.reached_target]
+    polyline_rescued = [r for r in results if r.strategy == "polyline" and r.reached_target]
+    detour_rescued = [r for r in results if r.strategy.startswith("detour") and r.reached_target]
+    rescued = polyline_rescued + detour_rescued
     failed = [r for r in results if not r.reached_target]
     times_ms = [r.elapsed_s * 1e3 for r in results]
     devs_mm = [r.max_deviation_nm / MM for r in reached if r.max_deviation_nm is not None]

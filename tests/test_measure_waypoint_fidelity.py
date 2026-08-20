@@ -42,9 +42,10 @@ class ScriptedBridge:
     (good enough here -- this test checks *which strategy the script picks
     and how far it gets*, not committed-track shape)."""
 
-    def __init__(self, nets, reject) -> None:
+    def __init__(self, nets, reject, fix_reject=None) -> None:
         self._nets = nets
         self._reject = reject
+        self._fix_reject = fix_reject or (lambda x, y: False)
         self._committed: list[TrackSegment] = []
         self._active_net: str | None = None
         self._start_xy = None
@@ -91,10 +92,8 @@ class ScriptedBridge:
 
     def fix(self, x, y, item_id=-1, force_finish=False, force_commit=False):
         self.fix_calls.append((x, y, item_id, force_finish, force_commit))
-        # Unlike push(), fix() doesn't re-run `reject` -- it only ever gets
-        # called on a point push() already accepted (see _route_one_net),
-        # so re-validating it here would just be testing this double's own
-        # bookkeeping rather than the script's control flow.
+        if self._fix_reject(x, y):
+            return False
         self._last_xy = (x, y)
         self._pending = True
         return True
@@ -119,12 +118,12 @@ class ScriptedBridge:
         return BoardGeometry(list(self._committed), [], [], [], [], [])
 
 
-def _install(nets, reject) -> ScriptedBridge:
+def _install(nets, reject, fix_reject=None) -> ScriptedBridge:
     """Installs a fake pcbworld_pns_bridge module and returns the single
     ScriptedBridge instance it will hand back from PNSBridge() -- run()
     only ever constructs one, so tests that need to inspect call history
     (e.g. fix_calls) can hold onto this."""
-    bridge = ScriptedBridge(nets, reject)
+    bridge = ScriptedBridge(nets, reject, fix_reject)
     module = types.ModuleType("pcbworld_pns_bridge")
     module.PNSBridge = lambda: bridge
     module.MODE_ROUTE_SINGLE = 1
@@ -178,6 +177,33 @@ def test_pick_pad_candidate_falls_back_and_warns_when_no_pad_present():
     assert len(warnings) == 1
     assert "net_x/target" in warnings[0]
     assert "segment" in warnings[0] and "via" in warnings[0]
+
+
+def test_retries_polyline_when_direct_push_succeeds_but_direct_fix_fails():
+    """Regression for the structural gap found from real Colab data: three
+    Colab runs showed push() accepting 72/72 attempts while fix() rejected
+    ~67% of them, even with force_finish/force_commit=True. An earlier
+    version of this retry loop only escalated past 'direct' when push()
+    itself rejected -- since push() apparently never rejects a single big
+    hop, 'reached=True' was set right after push() succeeded and fix()'s
+    rejection was never retried, so polyline/detour had literally never run
+    against the real bridge across all three runs. push() always succeeds
+    here; fix() rejects on its first call only, forcing the script to prove
+    it now retries a fix() rejection by moving to 'polyline', not just a
+    push() rejection."""
+    from scripts.measure_waypoint_fidelity import run
+
+    calls = {"n": 0}
+
+    def fix_reject_first_only(x, y):
+        calls["n"] += 1
+        return calls["n"] == 1
+
+    _install(_two_pad_net("net_0"), reject=lambda x, y: False, fix_reject=fix_reject_first_only)
+    results = run("board.kicad_pcb", num_nets=1, bridge_dir=None)
+    assert results[0].strategy == "polyline", results[0].strategy
+    assert results[0].reached_target
+    assert calls["n"] == 2, "expected exactly 2 fix() calls: direct (rejected), polyline (accepted)"
 
 
 def test_fix_is_called_with_force_finish_and_force_commit():
@@ -252,7 +278,7 @@ def test_detour_rescues_a_net_the_polyline_cannot_reach():
 
     _install(_two_pad_net("net_0"), reject=reject_first_few)
     results = run("board.kicad_pcb", num_nets=1, bridge_dir=None)
-    assert results[0].strategy == "detour"
+    assert results[0].strategy.startswith("detour"), results[0].strategy
     assert results[0].reached_target
     assert calls["n"] > REJECT_THROUGH_CALL, (
         "the detour branch never issued a push() past the rejection threshold -- "
