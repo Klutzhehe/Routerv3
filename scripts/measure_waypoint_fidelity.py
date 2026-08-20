@@ -281,7 +281,12 @@ def _percentile(values: list[float], p: float) -> float:
     return s[f] + (s[c] - s[f]) * (k - f)
 
 
-def run(board_path: str, num_nets: int, bridge_dir: str | None) -> list[NetResult]:
+def run(
+    board_path: str,
+    num_nets: int,
+    bridge_dir: str | None,
+    save_image: str | None = None,
+) -> list[NetResult]:
     bridge_module = _load_bridge(bridge_dir)
     bridge = bridge_module.PNSBridge()
 
@@ -314,6 +319,29 @@ def run(board_path: str, num_nets: int, bridge_dir: str | None) -> list[NetResul
     results = [_route_one_net(bridge, bridge_module, pads, net, warnings) for net in net_names]
 
     violations = bridge.run_drc()
+
+    if save_image:
+        # Deferred import -- pcbworld.viz has no pcbnew/bridge dependency of
+        # its own (matplotlib only), so this only costs anything for callers
+        # who actually want an image. Reads the SAME bridge instance's live
+        # state (get_board_geometry() + net_pads()), not a reload -- this
+        # process's board never touches disk, and matplotlib doesn't
+        # conflict with pcbworld_pns_bridge the way system pcbnew would
+        # (see docs/performance.md), so no second process is needed.
+        import matplotlib
+
+        matplotlib.use("Agg")  # headless -- this script has no display
+        from pcbworld.viz import render_board
+
+        geometry = bridge.get_board_geometry()
+        ax = render_board(
+            geometry,
+            net_pads=pads,
+            title=f"{board_path}: {sum(1 for r in results if r.reached_target)}/"
+            f"{len(results)} nets routed",
+        )
+        ax.figure.savefig(save_image, dpi=150, bbox_inches="tight")
+        print(f"\nsaved board image: {save_image}")
 
     print(f"{'net':<10} {'reached':<8} {'strategy':<9} {'accepted/req':<13} "
           f"{'end_dev(mm)':<12} {'time(ms)':<9}")
@@ -395,5 +423,11 @@ if __name__ == "__main__":
         help="parent of kicad-src/ if pcbworld_pns_bridge isn't already importable "
         "(defaults to the Colab/notebook WORKDIR conventions)",
     )
+    parser.add_argument(
+        "--save-image",
+        default=None,
+        help="PNG path to save a rendered view of the final board state to "
+        "(requires matplotlib; not installed by default outside Colab)",
+    )
     args = parser.parse_args()
-    run(args.board_path, args.num_nets, args.bridge_dir)
+    run(args.board_path, args.num_nets, args.bridge_dir, args.save_image)

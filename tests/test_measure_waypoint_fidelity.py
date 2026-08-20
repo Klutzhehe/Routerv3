@@ -306,3 +306,34 @@ def test_only_plain_nets_are_selected_and_num_nets_caps_the_count():
     results = run("board.kicad_pcb", num_nets=1, bridge_dir=None)
     assert len(results) == 1
     assert results[0].net == "net_0"  # diffpair_* excluded, net_1 capped out
+
+
+def test_save_image_writes_a_nonempty_png(tmp_path):
+    """--save-image is optional and reads the SAME bridge instance's live
+    get_board_geometry()/net_pads() -- ScriptedBridge's fixture (via
+    fake_bridge-style commit_routing()) is enough to prove the wiring
+    works; pcbworld.viz.render_board's own rendering correctness is
+    tests/test_render_board.py's job, not this file's."""
+    from scripts.measure_waypoint_fidelity import run
+
+    _install(_two_pad_net("net_0"), reject=lambda x, y: False)
+    out = tmp_path / "board.png"
+    run("board.kicad_pcb", num_nets=1, bridge_dir=None, save_image=str(out))
+    assert out.exists()
+    assert out.stat().st_size > 0
+
+
+def test_save_image_omitted_by_default_does_not_touch_matplotlib():
+    """matplotlib is an optional dependency (see requirements.txt) -- a
+    caller who never passes --save-image should never pay for the import,
+    and this project has run entirely without matplotlib installed for
+    most of its history."""
+    import sys
+
+    from scripts.measure_waypoint_fidelity import run
+
+    had_matplotlib = "matplotlib" in sys.modules
+    _install(_two_pad_net("net_0"), reject=lambda x, y: False)
+    run("board.kicad_pcb", num_nets=1, bridge_dir=None)
+    if not had_matplotlib:
+        assert "matplotlib" not in sys.modules
