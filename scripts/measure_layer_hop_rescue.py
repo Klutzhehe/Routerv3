@@ -18,10 +18,21 @@ Two phases against the same board (density accumulates realistically,
 same as measure_waypoint_fidelity.py):
   1. Route every net same-layer via _route_one_net() (imported directly --
      no reason to re-derive already-verified plumbing).
-  2. For whichever nets failed phase 1, try ONE via/layer-hop: push to the
-     straight-line midpoint, switch to the back layer, push to the target,
-     fix(). Two insertion methods are tried per net (see below) since it
-     isn't certain which is right.
+  2. For whichever nets failed phase 1, try a two-hop via detour: push to
+     the straight-line midpoint (front layer), hop to the back layer, push
+     to 90% of the way to target (back layer), hop BACK to the front
+     layer, push to the target, fix(). Two insertion methods are tried per
+     net (see below) since it isn't certain which is right.
+
+     Two hops, not one -- a first version of this script tried a single
+     hop and landed the final push+fix() directly on the back layer, which
+     switch_layer() rejected 17/17 times on the real bridge. In hindsight
+     that's fully explained by generate_board.py's pads being
+     PAD_ATTRIB_SMD with a LayerSet containing only F_Cu (see add_pad()):
+     there is no copper on the back layer at these pads for a route to
+     land on, so nothing could ever have finished there regardless of
+     whether vias help. The route must return to the front layer before
+     the final approach, same as any real via-detour around SMD pads.
 
 UNVERIFIED API SURFACE -- READ BEFORE INTERPRETING A NULL RESULT: unlike
 push()/fix()/query_hover_items() (Colab-verified repeatedly, including by
@@ -76,8 +87,24 @@ from measure_waypoint_fidelity import (  # noqa: E402
 FRONT_LAYER = 0  # Colab-verified elsewhere (simple_route_env.py, pcb_route_env.py)
 
 
-def _midpoint(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int]:
-    return (a[0] + b[0]) // 2, (a[1] + b[1]) // 2
+def _lerp(a: tuple[int, int], b: tuple[int, int], t: float) -> tuple[int, int]:
+    return int(a[0] + (b[0] - a[0]) * t), int(a[1] + (b[1] - a[1]) * t)
+
+
+def _hop(bridge, method: str, layer: int) -> tuple[bool, str]:
+    """One layer change, via whichever method. switch_layer() reports
+    success/failure directly; toggle_via_placement() is void in
+    bindings.cpp (PNS_BRIDGE::ToggleViaPlacement returns nothing), so
+    there's nothing to check there -- its failure mode, if any, can only
+    show up at the next push()/fix()."""
+    if method == "switch_layer":
+        if not bridge.switch_layer(layer):
+            return False, f"switch_layer({layer}) rejected"
+        return True, "ok"
+    if method == "toggle_via_placement":
+        bridge.toggle_via_placement()
+        return True, "ok"
+    raise ValueError(f"unknown method {method!r}")
 
 
 def _try_layer_hop(
@@ -89,28 +116,45 @@ def _try_layer_hop(
     back_layer: int,
     method: str,
 ) -> tuple[bool, str]:
-    """One rescue attempt: push to the midpoint, change layer via `method`,
-    push to the target, fix(). Returns (succeeded, reason)."""
+    """One rescue attempt: out to the back layer partway along the route,
+    then back to the front layer before the final approach. Returns
+    (succeeded, reason).
+
+    Two hops, not one: generate_board.py's pads are PAD_ATTRIB_SMD with a
+    LayerSet containing only F_Cu (see add_pad()) -- there is no copper for
+    the back layer to land on at these pads at all. A first version of this
+    function switched layer once and tried to fix() directly on the back
+    layer, and switch_layer() itself was rejected 17/17 times on the real
+    bridge -- in hindsight exactly consistent with "there's no pad here to
+    route to", not "vias don't help". The route has to come back to
+    FRONT_LAYER before it can legally terminate at the pad.
+    """
     if not bridge.start_route(start_xy[0], start_xy[1], start_id, 0):
         return False, "start_route failed"
 
-    mid = _midpoint(start_xy, target_xy)
+    mid = _lerp(start_xy, target_xy, 0.5)
     if not bridge.push(mid[0], mid[1], -1):
         bridge.stop_routing()
         return False, "push(midpoint) rejected"
 
-    if method == "switch_layer":
-        if not bridge.switch_layer(back_layer):
-            bridge.stop_routing()
-            return False, "switch_layer() rejected"
-    elif method == "toggle_via_placement":
-        bridge.toggle_via_placement()  # no return value to check (void in bindings.cpp)
-    else:
-        raise ValueError(f"unknown method {method!r}")
+    ok, why = _hop(bridge, method, back_layer)
+    if not ok:
+        bridge.stop_routing()
+        return False, why
+
+    near_target = _lerp(start_xy, target_xy, 0.9)
+    if not bridge.push(near_target[0], near_target[1], -1):
+        bridge.stop_routing()
+        return False, "push(near-target on back layer) rejected"
+
+    ok, why = _hop(bridge, method, FRONT_LAYER)
+    if not ok:
+        bridge.stop_routing()
+        return False, f"return-hop: {why}"
 
     if not bridge.push(target_xy[0], target_xy[1], -1):
         bridge.stop_routing()
-        return False, f"push(target) after {method} rejected"
+        return False, "push(target) after returning to front layer rejected"
 
     if not bridge.fix(target_xy[0], target_xy[1], target_id, True, True):
         bridge.stop_routing()

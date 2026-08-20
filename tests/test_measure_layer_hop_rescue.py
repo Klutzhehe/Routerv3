@@ -38,17 +38,22 @@ class LayerHopBridge:
     modeling push() as rejectable here would let a test "rescue" a net by
     accident at the wrong step and not notice.
 
-    fix_reject(x, y) gates fix() while on layer 0. fix() also succeeds
-    unconditionally once switched to exactly `rescue_layer` --
-    toggle_via_placement() deliberately does nothing here, so a test can
-    tell which of the two insertion methods the script under test actually
-    used to rescue a net."""
+    Models generate_board.py's SMD-only pads: fix() can only ever succeed
+    while back on layer 0 (there's nothing to land on elsewhere), so
+    `rescue_layer` alone being the current layer at fix()-time is never
+    sufficient -- fix_reject(x, y) still gates layer-0 fix() calls UNLESS
+    this attempt visited `rescue_layer` at some point first (tracked by
+    _visited_rescue_layer, reset at the start of every start_route()). This
+    is what proves the script's two-hop design (out to the back layer, then
+    back to front before the final approach) actually works, not just a
+    single one-way switch."""
 
     def __init__(self, nets, fix_reject, rescue_layer) -> None:
         self._nets = nets
         self._fix_reject = fix_reject
         self._rescue_layer = rescue_layer
         self._layer = 0
+        self._visited_rescue_layer = False
         self._committed: list[TrackSegment] = []
         self._active_net: str | None = None
         self._start_xy = None
@@ -84,6 +89,7 @@ class LayerHopBridge:
         self._start_xy = (x, y)
         self._last_xy = (x, y)
         self._layer = 0  # every fresh route starts on the front layer
+        self._visited_rescue_layer = False
         self._pending = False
         return True
 
@@ -93,16 +99,20 @@ class LayerHopBridge:
 
     def switch_layer(self, layer):
         self._layer = layer
+        if layer == self._rescue_layer:
+            self._visited_rescue_layer = True
         return True
 
     def toggle_via_placement(self):
-        pass  # deliberately a no-op -- see class docstring
+        # No layer bookkeeping here on purpose -- this fake's job is to let
+        # a test tell switch_layer apart from toggle_via_placement (see
+        # class docstring), not to guess toggle's real on/off semantics.
+        pass
 
     def fix(self, x, y, item_id=-1, force_finish=False, force_commit=False):
-        if self._layer == 0:
-            if self._fix_reject(x, y):
-                return False
-        elif self._layer != self._rescue_layer:
+        if self._layer != 0:
+            return False  # generate_board.py's pads have no copper here
+        if self._fix_reject(x, y) and not self._visited_rescue_layer:
             return False
         self._last_xy = (x, y)
         self._pending = True
@@ -151,11 +161,29 @@ def _clean():
     sys.modules.pop("measure_waypoint_fidelity", None)
 
 
+def test_fix_never_succeeds_while_still_on_the_back_layer():
+    """Direct unit test of the fake's fidelity to the real constraint that
+    motivated the two-hop rewrite: generate_board.py's pads are SMD with a
+    LayerSet containing only F_Cu, so there is no copper for a route to
+    land on anywhere but layer 0. fix() must fail here regardless of
+    fix_reject or _visited_rescue_layer whenever _layer != 0 -- if a rescue
+    attempt lands on this net's target while never having returned to the
+    front layer, that's a script bug, not something this double should
+    quietly allow to pass."""
+    bridge = LayerHopBridge(_two_pad_net("net_0"), fix_reject=lambda x, y: False, rescue_layer=31)
+    bridge.start_route(0, 0, 0, 0)
+    bridge.switch_layer(31)
+    assert not bridge.fix(10 * MM, 0, 0, True, True), "fix() succeeded while still on the back layer"
+
+
 def test_layer_hop_rescues_a_net_the_front_layer_cannot():
     """push() always succeeds (see LayerHopBridge's docstring on why); fix()
     rejects on layer 0 for every point, forcing phase 1 to fail this net via
-    every one of its 6 same-layer attempts. Phase 2's switch_layer(31) then
-    puts fix() on the one layer this double treats as reachable."""
+    every one of its 6 same-layer attempts. Phase 2's two-hop sequence
+    (switch to 31, push, switch back to 0, push, fix) marks the route as
+    having visited the rescue layer, which is what lets the RETURN to
+    layer 0 succeed at fix() -- proving the round-trip, not just a
+    one-way switch."""
     _clean()
     _install(_two_pad_net("net_0"), fix_reject=lambda x, y: True, rescue_layer=31)
     from measure_layer_hop_rescue import run
