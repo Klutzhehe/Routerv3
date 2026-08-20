@@ -70,11 +70,51 @@ sampling is autoregressive within a step: pick the net, then draw that net's fie
 An unconditioned field would be a single global map and could not express "route
 *this* net around the region those three diff pairs need."
 
-**13.1 M parameters** at the default config. The binding constraint is env
-throughput, not model capacity — PNS is CPU-bound and unbatched, so realistic
-throughput is ~10⁴ net-routings/sec across many workers. Any change that doesn't
-push GPU time above env time is free; anything that does has to earn it. A
-300 M-param transformer trained on 10⁷ samples would be strictly worse than this.
+**14.0 M parameters** at the default config. The binding constraint is env
+throughput, not model capacity. Any change that doesn't push GPU time above env
+time is free; anything that does has to earn it. A 300 M-param transformer
+trained on 10⁷ samples would be strictly worse than this.
+
+### Measured cost (Tesla T4, fp32, first pass)
+
+| batch | ms/batch | ms/board |
+|---|---|---|
+| 8 | 22.1 | 2.76 |
+| 32 | 77.3 | 2.41 |
+| 128 | 303.9 | 2.38 |
+
+Flat in ms/board from batch 8 upward => compute-saturated, not latency-bound.
+Attribution: the canvas encoder was **71% of a forward pass**, 8.3 GFLOPs/board,
+of which stage 0 (@128x128) and stage 1 (@64x64) were **68%** -- dense 3x3 convs
+over a mostly-empty binary raster. The transformer towers are nearly free.
+
+Fix applied: `canvas_blocks_per_stage` became per-stage and defaults to
+`(0, 0, 1, 2)`, moving residual capacity to 32x32 and 16x16 where a block costs
+16-64x less. **2.04x fewer FLOPs, and parameter count rises** 13.1M -> 14.0M --
+a relocation, not a cut.
+
+Remaining levers, in order of value:
+
+| lever | factor | cost |
+|---|---|---|
+| per-stage blocks `(0,0,1,2)` | 2.0x | done |
+| canvas 256 -> 128 px | 4.0x | env-side; 0.39 mm/px on a 50 mm board. The A\* planner grid is independent, so this only coarsens *allocation* context |
+| fp16 autocast (T4 tensor cores) | ~2-3x | `--amp`, free |
+| `torch.compile` | ~1.2-1.5x | compile time |
+
+### The metric to use
+
+**ms/batch, not ms/board.** Env workers route concurrently, so one rollout round
+costs the env a single net-route (T_pns) regardless of worker count, while it
+costs the GPU one whole batched forward. Dividing by batch size flatters the model
+by exactly the factor the workers already provided. The bet holds iff
+
+    ms/batch at batch=num_workers  <<  T_pns for ONE net
+
+**T_pns has never been measured.** The "single-digit ms per net" figure that
+originally motivated this section was an estimate with nothing behind it. Measure
+it alongside the waypoint-fidelity test -- both need the bridge built, so they are
+one Colab run.
 
 ### Deliberately not built
 
@@ -112,8 +152,8 @@ terminal: + large bonus for 100% routed and DRC-clean
 
 | # | Piece | Status |
 |---|---|---|
-| 0 | **Waypoint-fidelity test** | **gates everything — see below** |
-| 1 | `pcbworld/agents/cfp/` — spec, model, policy | **done**, 19 tests green |
+| 0 | **Waypoint-fidelity test** + measure T_pns | **gates everything — see below** |
+| 1 | `pcbworld/agents/cfp/` — spec, model, policy | **done**, 22 tests green, T4-verified |
 | 2 | Board rasterizer (KiCad board → `CFPObservation`) | not started, Python |
 | 3 | Coarse field → A\* → waypoints planner | not started, Python, ~200 lines |
 | 4 | Waypoint follower (waypoints → `push()` sequence) | not started, thin |

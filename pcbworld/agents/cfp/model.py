@@ -86,7 +86,15 @@ class CFPConfig:
     net_layers: int = 6           # relational self-attention blocks, pre-fusion
     fusion_rounds: int = 2
     canvas_base_channels: int = 64
-    canvas_blocks_per_stage: int = 1
+    # Residual capacity per canvas stage, coarsest-last. Deliberately zero
+    # in the two high-resolution stages: measured on a T4, the canvas
+    # encoder was 71% of a forward pass and 8.3 GFLOPs/board, of which
+    # stage0 (@128x128) and stage1 (@64x64) alone were 68% -- dense 3x3
+    # convs over a mostly-empty binary raster. Moving that capacity down to
+    # 32x32 and 16x16, where a residual block costs 16-64x less per
+    # parameter, halves the FLOPs and *adds* parameters. An int is accepted
+    # and broadcast to every stage, which is what the old scalar field did.
+    canvas_blocks_per_stage: tuple[int, ...] | int = (0, 0, 1, 2)
     num_copper_layers: int = 2    # matches generate_board.py's 2-layer boards
     field_size: int = 16          # emitted field resolution, per plane
     initial_field_log_std: float = -0.5
@@ -94,6 +102,15 @@ class CFPConfig:
     @property
     def num_field_planes(self) -> int:
         return self.num_copper_layers + 1  # + the reserve plane
+
+    def stage_blocks(self, num_stages: int) -> tuple[int, ...]:
+        if isinstance(self.canvas_blocks_per_stage, int):
+            return (self.canvas_blocks_per_stage,) * num_stages
+        assert len(self.canvas_blocks_per_stage) == num_stages, (
+            f"canvas_blocks_per_stage has {len(self.canvas_blocks_per_stage)} entries, "
+            f"the encoder has {num_stages} stages"
+        )
+        return tuple(self.canvas_blocks_per_stage)
 
 
 @dataclasses.dataclass
@@ -107,16 +124,26 @@ class Encoded:
 
 
 class CanvasEncoder(nn.Module):
-    """Strided conv tower, 256x256 -> 16x16, GroupNorm throughout."""
+    """Strided conv tower, 256x256 -> 16x16, GroupNorm throughout.
 
-    def __init__(self, in_channels: int, base: int, dim: int, blocks_per_stage: int) -> None:
+    Four stages, each halving resolution. Residual blocks are placed per
+    stage rather than uniformly -- see CFPConfig.canvas_blocks_per_stage for
+    the measurement that motivated it.
+    """
+
+    NUM_STAGES = 4
+
+    def __init__(
+        self, in_channels: int, base: int, dim: int, blocks_per_stage: tuple[int, ...]
+    ) -> None:
         super().__init__()
         widths = [base, base * 2, base * 3, dim]
+        assert len(widths) == self.NUM_STAGES == len(blocks_per_stage)
         layers: list[nn.Module] = []
         prev = in_channels
-        for width in widths:
+        for width, num_blocks in zip(widths, blocks_per_stage):
             layers.append(nn.Conv2d(prev, width, 3, stride=2, padding=1))
-            layers.extend(ResBlock(width) for _ in range(blocks_per_stage))
+            layers.extend(ResBlock(width) for _ in range(num_blocks))
             prev = width
         layers.append(nn.GroupNorm(8, dim))
         layers.append(nn.SiLU())
@@ -134,7 +161,10 @@ class CFPNet(nn.Module):
         d = c.dim
 
         self.canvas_encoder = CanvasEncoder(
-            NUM_CANVAS_CHANNELS, c.canvas_base_channels, d, c.canvas_blocks_per_stage
+            NUM_CANVAS_CHANNELS,
+            c.canvas_base_channels,
+            d,
+            c.stage_blocks(CanvasEncoder.NUM_STAGES),
         )
         self.net_embed = nn.Sequential(nn.Linear(NUM_NET_FEATURES, d), nn.GELU(), nn.Linear(d, d))
         self.net_blocks = nn.ModuleList(

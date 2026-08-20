@@ -5,13 +5,22 @@ pcbworld/agents/cfp/, so unlike everything under pcbworld/env/ it does not
 need pcbworld_pns_bridge built -- if this fails, the problem is the model,
 not the Colab build.
 
-The number to actually look at is the reported per-forward time versus the
-router's per-net cost. The CFP design bets that GPU time stays far below
-env time (docs/AI_ARCHITECTURE.md); if a forward pass is not comfortably
-under a millisecond per board on the batch sizes you plan to train with,
-that bet is wrong and the config needs shrinking before any training run.
+The number to actually look at is **ms/batch**, not ms/board. Env workers
+route their nets concurrently, so one rollout round costs the env a single
+net-route (T_pns) no matter how many workers there are, while it costs the
+GPU one full batched forward. The comparison that decides whether the
+architecture's central bet holds (GPU time negligible next to the CPU-bound
+router -- docs/AI_ARCHITECTURE.md) is therefore:
 
-    python scripts/smoke_cfp.py --device cuda --batch-size 32
+    ms/batch at batch=num_workers   vs   T_pns for ONE net
+
+ms/board is reported too, but dividing by the batch size flatters the model
+by exactly the factor the workers already gave you. Do not use it.
+
+T_pns has not been measured yet; measure it alongside the waypoint-fidelity
+test, since both need the bridge built.
+
+    python scripts/smoke_cfp.py --device cuda --batch-size 32 --amp --profile
 """
 
 from __future__ import annotations
@@ -39,6 +48,17 @@ def main() -> None:
     parser.add_argument("--canvas-size", type=int, default=256)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--dim", type=int, default=CFPConfig().dim)
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="run act() under fp16 autocast; on a T4 the conv-heavy canvas "
+        "encoder is the bottleneck and tensor cores are worth ~2-3x there",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="report the canvas-encoder / everything-else time split",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -87,26 +107,55 @@ def main() -> None:
 
     # Throughput. Timed under no_grad since rollout collection is the part
     # that has to keep up with the env workers.
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    with torch.no_grad():
-        for _ in range(3):  # warmup
-            policy.act(obs)
+    def sync() -> None:
         if device.type == "cuda":
             torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(args.iters):
-            policy.act(obs)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
 
-    per_batch_ms = 1e3 * elapsed / args.iters
+    def bench(fn, iters: int) -> float:
+        with torch.no_grad():
+            for _ in range(3):  # warmup, and lets cudnn pick its algorithms
+                fn()
+            sync()
+            start = time.perf_counter()
+            for _ in range(iters):
+                fn()
+            sync()
+        return (time.perf_counter() - start) / iters
+
+    autocast = torch.autocast(device_type=device.type, dtype=torch.float16, enabled=args.amp)
+
+    def one_act() -> None:
+        with autocast:
+            policy.act(obs)
+
+    per_batch_ms = 1e3 * bench(one_act, args.iters)
     per_board_ms = per_batch_ms / args.batch_size
     print(
-        f"\nact() throughput: {per_batch_ms:.2f} ms/batch of {args.batch_size} "
-        f"= {per_board_ms:.3f} ms/board ({1e3 / per_board_ms:.0f} boards/s)"
+        f"\nact() latency: {per_batch_ms:.2f} ms/batch of {args.batch_size}"
+        f"{' [fp16 autocast]' if args.amp else ''}"
     )
+    print(
+        "  ^ this is the number that matters: one rollout round costs the env "
+        "ONE net-route\n    (T_pns) regardless of worker count, but costs the GPU this "
+        "whole batch."
+    )
+    print(f"  (ms/board = {per_board_ms:.3f}, reported only because it is easy to "
+          f"misread -- see the module docstring)")
+
+    if args.profile:
+
+        def one_canvas() -> None:
+            with autocast:
+                policy.net.canvas_encoder(obs.canvas)
+
+        canvas_ms = 1e3 * bench(one_canvas, args.iters)
+        print(
+            f"\nprofile: canvas_encoder {canvas_ms:.2f} ms "
+            f"({100 * canvas_ms / per_batch_ms:.0f}% of act()), "
+            f"towers + heads {per_batch_ms - canvas_ms:.2f} ms"
+        )
+        print(f"         blocks per canvas stage = {policy.config.stage_blocks(4)}")
+
     print("\nOK")
 
 

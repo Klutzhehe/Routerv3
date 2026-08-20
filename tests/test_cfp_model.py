@@ -116,6 +116,30 @@ def test_field_is_conditioned_on_the_selected_net(policy, obs):
     assert not torch.allclose(mean_a, mean_b)
 
 
+def test_stage_blocks_accepts_an_int_or_a_per_stage_tuple():
+    assert CFPConfig(canvas_blocks_per_stage=1).stage_blocks(4) == (1, 1, 1, 1)
+    assert CFPConfig(canvas_blocks_per_stage=(0, 0, 1, 2)).stage_blocks(4) == (0, 0, 1, 2)
+    with pytest.raises(AssertionError):
+        CFPConfig(canvas_blocks_per_stage=(1, 1)).stage_blocks(4)
+
+
+def test_default_puts_residual_capacity_at_low_resolution():
+    """Measured: the canvas encoder was 71% of a forward pass, and its two
+    highest-resolution stages were 68% of that. Capacity belongs where a
+    residual block is cheap, so the default must stay front-light."""
+    blocks = CFPConfig().stage_blocks(4)
+    assert blocks[0] == 0 and blocks[1] == 0, f"{blocks} spends FLOPs at high resolution"
+    assert sum(blocks[2:]) >= 2, f"{blocks} has no residual depth anywhere"
+
+
+def test_moving_capacity_downward_costs_flops_but_not_parameters():
+    from pcbworld.agents.cfp.model import CFPNet
+
+    uniform = CFPNet(CFPConfig(canvas_blocks_per_stage=(1, 1, 1, 1))).num_parameters()
+    tapered = CFPNet(CFPConfig()).num_parameters()
+    assert tapered > uniform, "the default should not be a capacity cut, only a relocation"
+
+
 def test_field_has_a_reserve_plane_per_layer_config():
     assert CFPConfig(num_copper_layers=2).num_field_planes == 3
     assert CFPConfig(num_copper_layers=4).num_field_planes == 5
