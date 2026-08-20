@@ -176,7 +176,7 @@ class PCBRouteEnv(gym.Env):
 
         if action[2] > 0:
             if self.bridge.fix(
-                self._target_xy[0], self._target_xy[1], self._target_item_id, False, False
+                self._target_xy[0], self._target_xy[1], self._target_item_id, True, True
             ):
                 net_finished = True
                 reward += weights.net_finished
