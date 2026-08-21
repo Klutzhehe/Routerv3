@@ -23,11 +23,19 @@ Unverified going in -- stated plainly, not assumed away:
     docs/AI_ARCHITECTURE.md's "T_pns still unmeasured" note is about the
     router side; this is the model side of the same open question.
 
-Deliberately small on this first run: few nets (pass a board generated
-with --num-nets 3, not 6+), small step budgets, think starts False and
-only escalates after an error (see RoutingAgent's own latency lever) --
-a failure here should be cheap to see and iterate on, not expensive to
-wait out.
+Two real Colab runs so far. Run 1 found and fixed two harness bugs (a
+display-rounding edge case in the step-size check, and a collision
+warning that never escalated thinking) -- see commit 7302f2d. Run 2, with
+those fixed, routed 2/3 nets; the third (net_0) reasoned correctly through
+a real collision -- check_drc(), attempted rip_up(), abandoned when
+refused exactly per router.md's guidance -- then ran out of its 15-step
+budget mid-recovery with the head still ~20mm from target. That budget
+(15/60) was never meant as a real operating constraint, only to keep the
+first couple of diagnostic runs cheap; it now matches RoutingAgent's own
+30/300 default. Still recommend starting with a small board (--num-nets 3)
+until a few more runs establish whether 4B/Q4 is reliable enough to scale
+up, or whether a capability ceiling (not a budget/harness issue) shows up
+instead.
 
 Colab setup (before running this script):
     !pip install -q unsloth transformers accelerate bitsandbytes
@@ -142,8 +150,15 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", default=None, help="Directory for PNG renders + transcript.json")
     parser.add_argument("--model", default="Qwen/Qwen3-4B", help="HF model id (Qwen3 family)")
     parser.add_argument("--no-4bit", action="store_true", help="Load in fp16 instead of 4-bit (needs more VRAM)")
-    parser.add_argument("--max-steps-per-net", type=int, default=15, help="Small on purpose for a first run")
-    parser.add_argument("--max-total-steps", type=int, default=60, help="Small on purpose for a first run")
+    parser.add_argument(
+        "--max-steps-per-net", type=int, default=30,
+        help="Matches RoutingAgent's own default. First two live runs used 15 -- "
+        "confirmed too tight for a real recovery: run 2's net_0 spent 9 steps "
+        "reaching a real different-net collision, correctly diagnosed it "
+        "(check_drc, attempted rip_up, abandoned when refused), then ran out of "
+        "budget mid-detour with only 6 steps left to restart and re-route ~26mm.",
+    )
+    parser.add_argument("--max-total-steps", type=int, default=200, help="Matches RoutingAgent's own default scaled for a small board")
     parser.add_argument("--bridge-dir", default=None, help="Optional path to bridge library directory")
     args = parser.parse_args()
     run(

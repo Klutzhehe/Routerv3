@@ -78,6 +78,15 @@ def extract_reasoning(text: str) -> tuple[str | None, str]:
     return None, text.strip()
 
 
+# Matches "21.823 + 8.0" / "29.5 - 3" style unevaluated arithmetic inside a
+# JSON value -- number, operator, number. Deliberately loose (a JSON key
+# that happens to contain digits and a hyphen could false-positive) since
+# a false positive here just adds an irrelevant-but-harmless hint to an
+# already-malformed-JSON error; the cost of missing a real occurrence is
+# higher than the cost of an occasional unnecessary hint.
+_ARITHMETIC_IN_JSON_PATTERN = re.compile(r"\d+(?:\.\d+)?\s*[+\-*/]\s*\d+(?:\.\d+)?")
+
+
 def parse_tool_call_arguments(raw_args: str | dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
     """Safely parses tool call arguments.
 
@@ -116,7 +125,26 @@ def parse_tool_call_arguments(raw_args: str | dict[str, Any]) -> tuple[dict[str,
         except Exception:
             pass
 
-        return None, f"Malformed JSON arguments: {err} in text: {raw_str!r}"
+        hint = ""
+        if _ARITHMETIC_IN_JSON_PATTERN.search(raw_str):
+            # Measured live (Qwen3-4B, two Colab runs): the model wrote an
+            # unevaluated expression as a JSON value -- {"x_mm": 21.823 +
+            # 8.0} -- and made the BYTE-IDENTICAL mistake again 8 turns
+            # later in the same net's turn, with its own earlier correction
+            # still sitting in context. A generic parse-error message
+            # apparently isn't a strong enough correction signal on its own
+            # for a model this size to reliably generalize from; restating
+            # the fix explicitly, every single time this exact pattern
+            # recurs, costs nothing and doesn't depend on the model
+            # remembering a correction from many turns back.
+            hint = (
+                " HINT: JSON values must be plain numbers, not expressions -- "
+                "you wrote something like 'a + b'. Compute the result "
+                "yourself first, then pass only the final number, e.g. "
+                '{"x_mm": 29.823} not {"x_mm": 21.823 + 8.0}.'
+            )
+
+        return None, f"Malformed JSON arguments: {err} in text: {raw_str!r}{hint}"
 
 
 class ScriptedBackend:
