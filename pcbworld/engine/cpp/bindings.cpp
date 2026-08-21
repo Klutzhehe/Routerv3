@@ -89,6 +89,39 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
         .def_readonly( "courtyards", &PNS_BRIDGE::BoardGeometry::courtyards )
         .def_readonly( "board_edge", &PNS_BRIDGE::BoardGeometry::boardEdge );
 
+    py::class_<PNS_BRIDGE::HeadSegment>( m, "HeadSegment" )
+        .def_readonly( "x1", &PNS_BRIDGE::HeadSegment::x1 )
+        .def_readonly( "y1", &PNS_BRIDGE::HeadSegment::y1 )
+        .def_readonly( "x2", &PNS_BRIDGE::HeadSegment::x2 )
+        .def_readonly( "y2", &PNS_BRIDGE::HeadSegment::y2 )
+        .def_readonly( "width", &PNS_BRIDGE::HeadSegment::width )
+        .def_readonly( "layer", &PNS_BRIDGE::HeadSegment::layer );
+
+    py::class_<PNS_BRIDGE::HeadVia>( m, "HeadVia" )
+        .def_readonly( "x", &PNS_BRIDGE::HeadVia::x )
+        .def_readonly( "y", &PNS_BRIDGE::HeadVia::y )
+        .def_readonly( "layer_top", &PNS_BRIDGE::HeadVia::layerTop )
+        .def_readonly( "layer_bottom", &PNS_BRIDGE::HeadVia::layerBottom );
+
+    py::class_<PNS_BRIDGE::HeadGeometry>( m, "HeadGeometry" )
+        .def_readonly( "active", &PNS_BRIDGE::HeadGeometry::active )
+        .def_readonly( "segments", &PNS_BRIDGE::HeadGeometry::segments )
+        .def_readonly( "vias", &PNS_BRIDGE::HeadGeometry::vias )
+        .def_readonly( "end_x", &PNS_BRIDGE::HeadGeometry::endX )
+        .def_readonly( "end_y", &PNS_BRIDGE::HeadGeometry::endY )
+        .def_readonly( "layer", &PNS_BRIDGE::HeadGeometry::layer )
+        .def_readonly( "length", &PNS_BRIDGE::HeadGeometry::length );
+
+    py::class_<PNS_BRIDGE::DesignRules>( m, "DesignRules" )
+        .def_readonly( "track_width", &PNS_BRIDGE::DesignRules::trackWidth )
+        .def_readonly( "via_diameter", &PNS_BRIDGE::DesignRules::viaDiameter )
+        .def_readonly( "via_drill", &PNS_BRIDGE::DesignRules::viaDrill )
+        .def_readonly( "clearance", &PNS_BRIDGE::DesignRules::clearance )
+        .def_readonly( "min_track_width", &PNS_BRIDGE::DesignRules::minTrackWidth )
+        .def_readonly( "min_via_diameter", &PNS_BRIDGE::DesignRules::minViaDiameter )
+        .def_readonly( "min_via_drill", &PNS_BRIDGE::DesignRules::minViaDrill )
+        .def_readonly( "min_hole_to_hole", &PNS_BRIDGE::DesignRules::minHoleToHole );
+
     py::class_<PNS_BRIDGE>( m, "PNSBridge" )
         .def( py::init<>() )
         .def( "load_board", &PNS_BRIDGE::LoadBoard, py::arg( "path" ) )
@@ -108,6 +141,10 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
         .def( "net_pads", &PNS_BRIDGE::NetPads )
         .def( "run_drc", &PNS_BRIDGE::RunDRC )
         .def( "get_board_geometry", &PNS_BRIDGE::GetBoardGeometry )
+        .def( "get_head_geometry", &PNS_BRIDGE::GetHeadGeometry )
+        .def( "head_collides", &PNS_BRIDGE::HeadCollides )
+        .def( "get_design_rules", &PNS_BRIDGE::GetDesignRules )
+        .def( "rip_up", &PNS_BRIDGE::RipUp, py::arg( "net" ) )
         .def( "set_mode", &PNS_BRIDGE::SetMode )
         .def( "set_collision_mode", &PNS_BRIDGE::SetCollisionMode )
         .def( "set_track_width", &PNS_BRIDGE::SetTrackWidth )

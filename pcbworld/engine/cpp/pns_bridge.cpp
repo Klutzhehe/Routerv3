@@ -25,6 +25,8 @@
 #include <router/pns_arc.h>
 #include <router/pns_item.h>
 #include <router/pns_itemset.h>
+#include <router/pns_line.h>
+#include <router/pns_placement_algo.h>
 #include <router/pns_meander.h>
 #include <router/pns_meander_placer_base.h>
 #include <router/pns_node.h>
@@ -474,6 +476,48 @@ void PNS_BRIDGE::Reset()
     m_candidateIds.clear();
 }
 
+int PNS_BRIDGE::RipUp( const std::string& aNet )
+{
+    if( !m_board || !m_router )
+        return 0;
+
+    // Same ordering as Reset(): drop PNS's world model BEFORE deleting the
+    // BOARD_ITEMs it references, so nothing in the router can transiently
+    // point at freed memory.
+    m_router->ClearWorld();
+
+    // Snapshot before removing -- BOARD::Remove() mutates the container
+    // BOARD::Tracks() is a view over (see Reset()).
+    std::vector<BOARD_ITEM*> toRemove;
+
+    for( PCB_TRACK* track : m_board->Tracks() )
+    {
+        if( track->GetNetname().ToStdString() == aNet )
+            toRemove.push_back( track );
+    }
+
+    for( BOARD_ITEM* item : toRemove )
+    {
+        // delete, not just Remove() -- BOARD::Remove() hands ownership
+        // back to the caller without freeing. Reset() has the same note;
+        // rip-up is expected to run far more often than reset (it is a
+        // per-decision agent action), so leaking here would be worse.
+        m_board->Remove( item, REMOVE_MODE::BULK );
+        delete item;
+    }
+
+    m_board->BuildConnectivity();
+    m_router->SyncWorld();
+
+    // The world was rebuilt, so every PNS::ITEM* handed out as a candidate
+    // id is now dangling. Callers must re-query -- see this method's
+    // declaration comment, and ROADMAP.md constraint 5.
+    m_candidateItems.clear();
+    m_candidateIds.clear();
+
+    return static_cast<int>( toRemove.size() );
+}
+
 std::vector<PNS_BRIDGE::NetPad> PNS_BRIDGE::NetPads() const
 {
     std::vector<NetPad> out;
@@ -784,6 +828,142 @@ std::vector<PNS_BRIDGE::DRCViolation> PNS_BRIDGE::RunDRC()
     engine.ClearViolationHandler();
 
     return out;
+}
+
+
+PNS_BRIDGE::HeadGeometry PNS_BRIDGE::GetHeadGeometry() const
+{
+    HeadGeometry head;
+    head.active = false;
+    head.endX = 0;
+    head.endY = 0;
+    head.layer = -1;
+    head.length = 0.0;
+
+    if( !m_router || !m_router->Placer() )
+        return head;
+
+    PNS::PLACEMENT_ALGO* placer = m_router->Placer();
+    head.active = true;
+
+    VECTOR2I end = placer->CurrentEnd();
+    head.endX = end.x;
+    head.endY = end.y;
+    head.layer = placer->CurrentLayer();
+
+    // Copied, not bound by reference: Traces() returns `const ITEM_SET` by
+    // value in some KiCad revisions and by const ref in others. Taking a
+    // copy compiles against both, and lets us use the non-const Items()
+    // accessor, which is the one that definitely exists.
+    PNS::ITEM_SET traces = placer->Traces();
+
+    for( PNS::ITEM* item : traces.Items() )
+    {
+        if( !item )
+            continue;
+
+        if( PNS::LINE* line = dynamic_cast<PNS::LINE*>( item ) )
+        {
+            const SHAPE_LINE_CHAIN& chain = line->CLine();
+            int width = line->Width();
+            int layer = line->Layer();
+
+            for( int i = 0; i < chain.SegmentCount(); ++i )
+            {
+                const SEG seg = chain.CSegment( i );
+
+                HeadSegment hs;
+                hs.x1 = seg.A.x;
+                hs.y1 = seg.A.y;
+                hs.x2 = seg.B.x;
+                hs.y2 = seg.B.y;
+                hs.width = width;
+                hs.layer = layer;
+                head.segments.push_back( hs );
+
+                head.length += ( seg.B - seg.A ).EuclideanNorm();
+            }
+        }
+        else if( PNS::VIA* via = dynamic_cast<PNS::VIA*>( item ) )
+        {
+            VECTOR2I pos = via->Pos();
+
+            HeadVia hv;
+            hv.x = pos.x;
+            hv.y = pos.y;
+            hv.layerTop = via->Layers().Start();
+            hv.layerBottom = via->Layers().End();
+            head.vias.push_back( hv );
+        }
+    }
+
+    return head;
+}
+
+bool PNS_BRIDGE::HeadCollides() const
+{
+    if( !m_router || !m_router->Placer() )
+        return false;
+
+    PNS::PLACEMENT_ALGO* placer = m_router->Placer();
+
+    // The placer's own working node, not m_router->GetWorld(): the head is
+    // placed against a branch of the world that already accounts for this
+    // route's in-progress items, so asking the base world would report the
+    // head colliding with itself.
+    PNS::NODE* node = placer->CurrentNode( true );
+
+    if( !node )
+        return false;
+
+    PNS::ITEM_SET traces = placer->Traces();
+
+    for( PNS::ITEM* item : traces.Items() )
+    {
+        if( item && node->CheckColliding( item ) )
+            return true;
+    }
+
+    return false;
+}
+
+PNS_BRIDGE::DesignRules PNS_BRIDGE::GetDesignRules() const
+{
+    DesignRules rules;
+    rules.trackWidth = 0;
+    rules.viaDiameter = 0;
+    rules.viaDrill = 0;
+    rules.clearance = 0;
+    rules.minTrackWidth = 0;
+    rules.minViaDiameter = 0;
+    rules.minViaDrill = 0;
+    rules.minHoleToHole = 0;
+
+    if( !m_board )
+        return rules;
+
+    const BOARD_DESIGN_SETTINGS& bds = m_board->GetDesignSettings();
+
+    // Same accessor chain already proven in this file's net-creation path.
+    if( bds.m_NetSettings )
+    {
+        std::shared_ptr<NETCLASS> defaults = bds.m_NetSettings->GetDefaultNetclass();
+
+        if( defaults )
+        {
+            rules.trackWidth = defaults->GetTrackWidth();
+            rules.viaDiameter = defaults->GetViaDiameter();
+            rules.viaDrill = defaults->GetViaDrill();
+            rules.clearance = defaults->GetClearance();
+        }
+    }
+
+    rules.minTrackWidth = bds.m_TrackMinWidth;
+    rules.minViaDiameter = bds.m_ViasMinSize;
+    rules.minViaDrill = bds.m_MinThroughDrill;
+    rules.minHoleToHole = bds.m_HoleToHoleMin;
+
+    return rules;
 }
 
 }  // namespace pcbworld

@@ -102,6 +102,36 @@ public:
     // placement."
     void Reset();
 
+    // Reset() for a single net: removes only the copper belonging to
+    // aNet, leaving every other routed net intact. The action an agent
+    // needs when a later net cannot reach its pad because an earlier
+    // net's copper is sitting on it -- which is not hypothetical here.
+    // scripts/measure_layer_hop_rescue.py's data shows every failing net
+    // failing IDENTICALLY across all six same-layer approaches (straight
+    // line, 5-point polyline, four perpendicular detours), i.e. the
+    // contention is at the target pad itself, and no detour can route
+    // around that because every attempt still ends at the same (x, y).
+    // Tearing out the offending net can.
+    //
+    // Returns the number of BOARD_ITEMs removed (0 if aNet is unknown or
+    // was never routed) so a caller can tell "ripped up nothing" from
+    // "ripped up something" without a second GetBoardGeometry() call.
+    //
+    // Two caveats, both inherited from Reset()'s mechanism:
+    //  - Invalidates every QueryHoverItems() candidate id, because it
+    //    rebuilds the PNS world (ClearWorld/SyncWorld). ROADMAP.md's
+    //    constraint 5 says ids are stable "within a loaded board" and
+    //    only LoadBoard() invalidates them -- this widens that. Re-query
+    //    after any RipUp().
+    //  - Costs a full world resync, not an incremental node edit. Fine
+    //    per-rip-up-action (which is a deliberate, occasional macro
+    //    move); do not call it in a per-push inner loop.
+    //
+    // Do not call while a route is in progress -- StopRouting() first.
+    // The active placer holds a NODE branched off the world this
+    // invalidates.
+    int RipUp( const std::string& aNet );
+
     struct NetPad
     {
         std::string net;
@@ -227,6 +257,135 @@ public:
     };
 
     BoardGeometry GetBoardGeometry() const;
+
+    // -- In-progress head state ------------------------------------------
+    //
+    // Everything above reads *committed* board items. Nothing exposed the
+    // route currently being placed: the "head" PNS carries between
+    // StartRoute() and Fix(). That gap is the reason RL reward shaping has
+    // no per-step signal to work with. Push() is ROUTER::Move(), and its
+    // bool was measured accepting 72/72 net-attempts across three Colab
+    // runs (scripts/measure_waypoint_fidelity.py) while Fix() then
+    // rejected ~67% of those same routes -- so a leg is ~10 steps carrying
+    // one terminal bit, with no credit assignment across the waypoints
+    // that produced it. Nothing learns from that.
+    //
+    // Reading the head back after each Push() gives the env the two things
+    // it actually needs per step: where the router put the head versus
+    // where it was asked to (deviation), and whether that head is legal
+    // (collision). Both are dense, both are free of a DRC run.
+    //
+    // NOTE (deliberate asymmetry, matching this file's convention for new
+    // C++): GetHeadGeometry() is built from accessors this codebase has
+    // effectively already exercised -- Placer() is used by
+    // asMeanderPlacer() above, and LINE::CLine()/Width()/Layer() are the
+    // same shape-reading pattern GetBoardGeometry() uses on BOARD items.
+    // HeadCollides() is the riskier of the two: NODE::CheckColliding()'s
+    // exact signature and return type (OPT_OBSTACLE vs bool) are written
+    // from the remembered API, not confirmed against a checkout. If the
+    // Colab build fails, expect it to fail there -- and note that deleting
+    // HeadCollides() plus its binding leaves GetHeadGeometry(), which is
+    // the load-bearing half, still standing.
+    struct HeadSegment
+    {
+        int x1, y1, x2, y2;
+        int width;
+        int layer;   // PCB_LAYER_ID
+    };
+
+    struct HeadVia
+    {
+        int x, y;
+        int layerTop, layerBottom;
+        // No diameter/drill: PNS::VIA's padstack-aware accessors are
+        // exactly the kind of version-sensitive surface that costs a
+        // Colab round to get wrong (compare PCB_VIA::GetWidth(
+        // PADSTACK::ALL_LAYERS ) in GetBoardGeometry()), and an RL env
+        // needs to know a via EXISTS and where -- not how wide it is,
+        // which it configured itself via SetViaDiameter().
+    };
+
+    struct HeadGeometry
+    {
+        bool active;                        // false if no route in progress
+        std::vector<HeadSegment> segments;  // the in-progress polyline
+        std::vector<HeadVia> vias;
+        int endX, endY;                     // placer's own CurrentEnd()
+        int layer;                          // placer's CurrentLayer()
+        double length;                      // summed segment length, nm
+    };
+
+    // Snapshot of the route being placed right now. Safe to call with no
+    // route in progress -- returns active=false rather than failing, so an
+    // env can call it unconditionally after every Push().
+    HeadGeometry GetHeadGeometry() const;
+
+    // Does the current head collide with anything in the placer's world?
+    //
+    // This is the per-step legality signal RM_MarkObstacles was supposed
+    // to provide through Push()'s return value and measurably does not.
+    // Asks the placer's own NODE directly instead of trusting Move()'s
+    // bool.
+    //
+    // Returns false when no route is in progress. A false from THAT case
+    // and a false meaning "head is clean" are deliberately not
+    // distinguished: callers should gate on GetHeadGeometry().active,
+    // which they need anyway.
+    bool HeadCollides() const;
+
+    // -- Design rules ------------------------------------------------------
+    //
+    // The board's own sizing rules, so a caller stops guessing them.
+    //
+    // Every env and script in this repo currently hardcodes
+    // via_diameter=600000 / via_drill=300000 (pcb_route_env.py,
+    // diff_pair_route_env.py, measure_layer_hop_rescue.py) and nothing has
+    // ever checked those against the loaded board. They are not connected:
+    // SetViaDiameter() writes ROUTER::Sizes(), which is what PNS validates
+    // a via against, while RunDRC() judges the committed result against
+    // BOARD_DESIGN_SETTINGS, which came from the .kicad_pcb file. And
+    // pcbworld/data/generate_board.py sets no design rules at all, so its
+    // boards carry whatever a bare pcbnew.BOARD() defaults to.
+    //
+    // Two failure modes follow, and both have already cost real Colab
+    // rounds or are waiting to:
+    //  - Sizes() legal, BOARD_DESIGN_SETTINGS stricter -> PNS happily
+    //    places the via, RunDRC() then reports a violation the agent gets
+    //    penalized for and cannot see the cause of.
+    //  - Via size never configured, or below the board's minimum -> no
+    //    legal via geometry exists anywhere, so SwitchLayer() fails
+    //    uniformly, at every position, for reasons that look positional
+    //    but are not. That is precisely the 15/15 rejection
+    //    scripts/measure_layer_hop_rescue.py chased across two rounds
+    //    (commits 381e1a7, dc9164e).
+    //
+    // An RL agent placing vias must have them legal by construction, not
+    // by a constant that happens to match. Read this at env reset() and
+    // feed it straight into SetTrackWidth/SetViaDiameter/SetViaDrill.
+    //
+    // UNVERIFIED, in the usual place: the default-netclass path
+    // (GetDesignSettings().m_NetSettings->GetDefaultNetclass()) is already
+    // used and Colab-proven at pns_bridge.cpp's makeNetInfo path, so
+    // trackWidth/viaDiameter/viaDrill/clearance are low risk. The
+    // BOARD_DESIGN_SETTINGS minimums below are raw public member names
+    // (m_TrackMinWidth, m_ViasMinSize, m_MinThroughDrill, m_HoleToHoleMin,
+    // m_MinClearance) written from the remembered KiCad 9 API. If the
+    // build fails here, they are why -- and dropping the four min* fields
+    // leaves the netclass half, which is the half envs actually need to
+    // configure from, still working.
+    struct DesignRules
+    {
+        int trackWidth;      // default netclass
+        int viaDiameter;
+        int viaDrill;
+        int clearance;
+        int minTrackWidth;   // board-wide hard minimums
+        int minViaDiameter;
+        int minViaDrill;
+        int minHoleToHole;
+    };
+
+    DesignRules GetDesignRules() const;
 
     void SetMode( int aMode );          // PNS::ROUTER_MODE
 
