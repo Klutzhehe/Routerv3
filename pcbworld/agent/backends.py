@@ -204,13 +204,23 @@ class QwenBackend:
         model_name: str = "Qwen/Qwen3-4B",
         load_in_4bit: bool = True,
         device: str = "cuda",
-        max_new_tokens: int = 1024,
+        max_new_tokens: int = 512,
+        max_new_tokens_thinking: int = 2048,
         temperature: float = 0.2,
     ) -> None:
         self.model_name = model_name
         self.load_in_4bit = load_in_4bit
         self.device = device
+        # Two budgets, not one -- a `think=True` call has to fit a whole
+        # <think>...</think> trace (500-2000 tokens on its own, per
+        # docs/AI_ARCHITECTURE.md's own estimate for this model class)
+        # AND the tool call that follows it. A single fixed budget sized
+        # for the common no_think case truncates the rarer thinking case
+        # mid-thought, before any tool call is ever emitted -- the loop
+        # would see zero tool_calls and burn a step for nothing, on
+        # exactly the turns (post-error) where progress matters most.
         self.max_new_tokens = max_new_tokens
+        self.max_new_tokens_thinking = max_new_tokens_thinking
         self.temperature = temperature
         self.model = None
         self.tokenizer = None
@@ -330,7 +340,7 @@ class QwenBackend:
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=self.max_new_tokens,
+                max_new_tokens=self.max_new_tokens_thinking if think else self.max_new_tokens,
                 temperature=self.temperature if self.temperature > 0 else None,
                 do_sample=self.temperature > 0,
                 pad_token_id=self.tokenizer.eos_token_id,
