@@ -41,6 +41,18 @@ def _net_color(net: str) -> tuple[float, float, float]:
     return colorsys.hsv_to_rgb(hue, 0.65, 0.85)
 
 
+def _expand_bounds(bounds: list[float] | None, x: float, y: float) -> list[float]:
+    """Grows [min_x, max_x, min_y, max_y] to include (x, y). bounds=None on
+    the first call starts it at that single point."""
+    if bounds is None:
+        return [x, x, y, y]
+    bounds[0] = min(bounds[0], x)
+    bounds[1] = max(bounds[1], x)
+    bounds[2] = min(bounds[2], y)
+    bounds[3] = max(bounds[3], y)
+    return bounds
+
+
 def _draw_edge(ax, edge, mm: float) -> None:
     x1, y1, x2, y2 = edge.x1 / mm, edge.y1 / mm, edge.x2 / mm, edge.y2 / mm
     shape = getattr(edge, "shape_type", "segment")
@@ -89,8 +101,26 @@ def render_board(
     if ax is None:
         _, ax = plt.subplots(figsize=(8, 8))
 
+    # Explicit bounding box, not matplotlib's autoscale. ax.plot() (used for
+    # tracks below) autoscales the view automatically; ax.add_patch() (used
+    # for board edges, vias, and pads) does NOT -- a real matplotlib
+    # behavior, not a version quirk. A board state with real pads but zero
+    # committed tracks and no board_edge shape (any not-yet-routed net,
+    # first thing after LoadBoard(), or a net that got abandoned before
+    # ever committing) previously rendered as a blank (0,1)x(0,1) plot even
+    # though the pads were genuinely present in the data -- confirmed by
+    # reproducing it locally with a synthetic BoardGeometry (real pads,
+    # empty tracks/vias/board_edge) before this fix, from a live Colab run
+    # whose first net's PNG showed exactly this. Tracking bounds explicitly
+    # across every primitive, patches included, and setting xlim/ylim from
+    # it directly sidesteps the whole add_patch-doesn't-autoscale issue
+    # rather than depending on matplotlib's autoscale picking it up.
+    bounds: list[float] | None = None
+
     for edge in geometry.board_edge:
         _draw_edge(ax, edge, mm)
+        bounds = _expand_bounds(bounds, edge.x1 / mm, edge.y1 / mm)
+        bounds = _expand_bounds(bounds, edge.x2 / mm, edge.y2 / mm)
 
     seen_nets: set[str] = set()
     for t in geometry.tracks:
@@ -103,12 +133,17 @@ def render_board(
             linewidth=max(0.5, t.width / mm * 2),  # visually readable, not to scale
             solid_capstyle="round",
         )
+        bounds = _expand_bounds(bounds, t.x1 / mm, t.y1 / mm)
+        bounds = _expand_bounds(bounds, t.x2 / mm, t.y2 / mm)
 
     for v in geometry.vias:
         color = _net_color(v.net)
         seen_nets.add(v.net)
         ax.add_patch(Circle((v.x / mm, v.y / mm), v.diameter / mm / 2, color=color, alpha=0.85))
         ax.add_patch(Circle((v.x / mm, v.y / mm), v.drill / mm / 2, color="white"))
+        r = v.diameter / mm / 2
+        bounds = _expand_bounds(bounds, v.x / mm - r, v.y / mm - r)
+        bounds = _expand_bounds(bounds, v.x / mm + r, v.y / mm + r)
 
     pad_source = list(geometry.pads) if geometry.pads else list(net_pads or [])
     for p in pad_source:
@@ -124,6 +159,18 @@ def render_board(
                 color=color,
             )
         )
+        bounds = _expand_bounds(bounds, p.x / mm - size_x / 2, p.y / mm - size_y / 2)
+        bounds = _expand_bounds(bounds, p.x / mm + size_x / 2, p.y / mm + size_y / 2)
+
+    if bounds is not None:
+        min_x, max_x, min_y, max_y = bounds
+        # A margin proportional to the span, with an absolute floor so a
+        # single point (one pad, nothing else) doesn't collapse to a
+        # zero-size view.
+        margin_x = max((max_x - min_x) * 0.05, 1.0)
+        margin_y = max((max_y - min_y) * 0.05, 1.0)
+        ax.set_xlim(min_x - margin_x, max_x + margin_x)
+        ax.set_ylim(min_y - margin_y, max_y + margin_y)
 
     ax.set_aspect("equal")
     ax.invert_yaxis()  # KiCad's Y grows downward; matplotlib's grows upward

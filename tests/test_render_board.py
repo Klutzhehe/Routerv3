@@ -98,6 +98,47 @@ def test_pads_field_and_net_pads_fallback_both_render():
     assert len(ax2.patches) == 1
 
 
+def test_pads_with_no_tracks_or_edge_still_set_real_axis_bounds():
+    """Regression test for a real bug: ax.add_patch() (used for pads, vias,
+    and board edges) does not auto-scale matplotlib's view the way
+    ax.plot() (used for tracks) does. A board with real pads but zero
+    committed tracks and no board_edge shape -- any not-yet-routed net, or
+    a net abandoned before ever committing -- previously rendered as a
+    blank (0,1)x(0,1) plot even though the pads were genuinely present.
+    Caught from a live Colab run whose first-net PNG (routing attempted,
+    never committed, then abandoned) showed exactly this; reproduced
+    locally with this same shape of data before being fixed."""
+    geometry = BoardGeometry(
+        [], [], [
+            PadGeom(20_000_000, 15_000_000, 500_000, 500_000, 0, 1, "net_0", "J1:1"),
+            PadGeom(38_000_000, 35_000_000, 500_000, 500_000, 0, 1, "net_0", "J2:1"),
+        ],
+        [], [], [],
+    )
+    ax = render_board(geometry)
+
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+
+    # The bug's exact signature: matplotlib's degenerate default view.
+    assert xlim != (0.0, 1.0)
+    assert sorted(ylim) != [0.0, 1.0]
+
+    # Real bounds actually covering both pads (20mm and 38mm on x).
+    assert min(xlim) < 20.0
+    assert max(xlim) > 38.0
+
+
+def test_single_pad_does_not_collapse_to_a_zero_size_view():
+    geometry = BoardGeometry(
+        [], [], [PadGeom(10_000_000, 10_000_000, 500_000, 500_000, 0, 1, "net_0", "J1:1")],
+        [], [], [],
+    )
+    ax = render_board(geometry)
+    xlim = ax.get_xlim()
+    assert max(xlim) - min(xlim) > 0.5  # not a degenerate/zero-width view
+
+
 def test_net_color_is_deterministic_and_distinguishes_nets():
     assert _net_color("net_0") == _net_color("net_0")
     assert _net_color("net_0") != _net_color("net_1")
