@@ -221,7 +221,102 @@ session. **Still open** from the original verification list:
   over time"), as opposed to just "doesn't crash". This is genuinely
   untested against the real bridge.
 
-## The "novel SOTA agent" — design decided, not yet built
+## Pivot: LLM routing agent, replacing the RL direction
+
+**The RL direction below (CFP, `pcbworld/agents/cfp/`, the waypoint-RL env)
+is abandoned, not just deprioritized.** Reason: debuggability, not
+performance. A scalar reward cannot be read the way a tool-call transcript
+can -- when a policy fails silently, there was no way to see *why* short of
+staring at a reward curve. `pcbworld/agents/cfp/` and the waypoint-RL env
+are parked on the `parked/waypoint-rl-env` branch, not deleted, in case pure
+RL is revisited later. The rest of this section below (the "novel SOTA
+agent" design) is superseded by the same reasoning and is being left in
+place as history, not as a live plan.
+
+**Current direction:** an LLM (Qwen3 small tier, local, quantized -- see
+`pcbworld/agent/backends.py`) drives the router directly through a
+validated tool surface (`pcbworld/agent/tools.py`'s `RouterTools`),
+sequenced by `pcbworld/agent/loop.py`'s `RoutingAgent` over a
+caller-supplied net priority order (no learned ordering -- that is a human
+or LLM-strategy decision, not the loop's job). The tool layer's whole
+design is answering one problem directly: `push()` is `ROUTER::Move()`, and
+`scripts/measure_waypoint_fidelity.py` measured it accepting 72/72
+net-attempts across three Colab runs while `fix()` then rejected ~67% of
+those same routes -- silent success, not loud failure, is the failure mode
+that matters here. Every tool validates before touching the bridge and
+reads the router's actual state back afterward (deviation, collision)
+rather than trusting a bare return value.
+
+**New C++ bindings this depends on -- Colab-verified 2026** (build:
+KiCad 9.0.9, `pcbworld_bridge` target, clean compile/link, no warnings
+beyond a benign LTO serial-compilation notice):
+
+```
+=== 1. Loading Board: board.kicad_pcb ===
+  [PASS] Board loaded successfully
+=== 2. Testing get_design_rules() ===
+  Track Width      : 0.2000 mm (200000 nm)
+  Via Diameter     : 0.6000 mm (600000 nm)
+  Via Drill        : 0.3000 mm (300000 nm)
+  Clearance        : 0.2000 mm (200000 nm)
+  Min Track Width  : 0.0000 mm (0 nm)
+  Min Via Diameter : 0.5000 mm (500000 nm)
+  Min Via Drill    : 0.3000 mm (300000 nm)
+  Min Hole-to-Hole : 0.2500 mm (250000 nm)
+=== 3. Idle head: active=False, collides=False (both expected) ===
+=== 4. start_route(net_4) -> active=True, layer=0 ===
+  push() to (39.40, 42.70) -> True
+  head after push: end=(39.3993, 42.6990), layer=0, length=2.6585mm,
+    2 segments, collides=False
+=== 5. fix()+commit_routing(): 2 tracks committed for net_4 ===
+=== 6. rip_up('net_4'): removed 2 items; get_board_geometry() confirms
+  0 tracks remain for net_4 (live readback, not just the return value) ===
+ALL 4 NEW BINDINGS VERIFIED SUCCESSFULLY AGAINST LIVE BRIDGE
+```
+
+Two things worth reading precisely out of that, not overclaiming:
+
+- **`get_head_geometry()` deviation was ~0.7 microns** on this run (a
+  single unobstructed push on a sparse 6-net board) -- essentially exact.
+  That is the *easy* case; it does not yet show what deviation looks like
+  under contention, which is what the tool layer's warning path exists for.
+  A single push produced **2 head segments**, not 1 -- worth knowing when
+  reading `HeadGeometry.segments` elsewhere, though `RouterTools` only
+  reads `end_x`/`end_y`, not segment count, so this didn't affect anything
+  downstream.
+- **`min_track_width` reports 0.0000mm on a `generate_board.py` board.**
+  Confirms directly what was previously only inferred: these synthetic
+  boards carry no real track-width design-rule floor at all --
+  `generate_board.py` sets no design rules, so `BOARD_DESIGN_SETTINGS`'s
+  track-width minimum is whatever a bare board leaves it at, apparently
+  zero. The via minimums (`0.5mm` diameter / `0.3mm` drill) *do* have real
+  values, which is what makes `RouterTools.place_via()`/`switch_to_layer()`'s
+  design-rule guard meaningful in practice, not just in theory. Also: the
+  `600_000`/`300_000` nm via constants hardcoded across
+  `pcb_route_env.py`/`diff_pair_route_env.py`/`measure_layer_hop_rescue.py`
+  happen to sit exactly at this board's default-netclass via size and above
+  its minimum -- so on THIS board they were never illegal. That does not
+  resolve whether an illegal via size caused the historical
+  `switch_layer()` rejections (381e1a7, dc9164e); it just means this
+  particular run doesn't reproduce the conditions that would show it.
+
+**Still open, not touched by this verification round:**
+- `switch_layer()` itself was not re-exercised here -- this script tests
+  only the four *new* bindings (`get_design_rules`, `get_head_geometry`,
+  `head_collides`, `rip_up`); `switch_layer()` was bound in an earlier
+  commit and still has never succeeded once against the real bridge in
+  this repo (15/15 and 17/17 rejections, 381e1a7/dc9164e). Re-running
+  `scripts/measure_layer_hop_rescue.py` is what would actually close that.
+- `RouterTools` (the tool layer the LLM agent actually calls) has never
+  run against the real bridge -- only the raw C++ bindings underneath it
+  have. `place_via()`/`switch_to_layer()`/the deviation-warning path in
+  `route_to()` are still unverified end to end.
+- `T_pns` (wall-clock cost per net-route) is still unmeasured --
+  `scripts/measure_waypoint_fidelity.py` has not been re-run this session.
+- `QwenBackend` has never run against a real model -- no GPU involved in
+  this verification round, CPU-only (the bridge).
+
+## The "novel SOTA agent" — superseded, kept as history (see pivot above)
 
 **Target end goal (user-specified):** route dense boards, including
 differential pairs and length tuning -- not just the paper's plain
