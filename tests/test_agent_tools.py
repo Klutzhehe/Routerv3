@@ -213,6 +213,46 @@ def test_step_longer_than_the_cap_is_refused_with_the_cap_stated():
     assert "4.000" in result.message
 
 
+def test_step_a_hair_over_the_cap_from_display_rounding_is_still_accepted():
+    """Live Colab run (Qwen3-4B): the model read a displayed head position
+    rounded to 3 decimals, computed "displayed + 8.0" as its next waypoint,
+    and got rejected -- "that move is 8.000mm but the limit is 8.000mm per
+    call" -- both numbers rendered identically, because the TRUE head
+    position (fuller precision than what to_model() ever shows) made the
+    real step a few microns over 8.0mm. Not raw float epsilon: 32.064 -
+    24.064 == 8.0 exactly in Python. The tolerance exists specifically to
+    absorb this gap between what a model can see (rounded text) and what
+    the check compares (full precision) -- reproduced here directly with a
+    head position that displays as a round number but sits a few microns
+    below it, matching the live case."""
+    # A pad position that DISPLAYS as "24.064" (3-decimal rounding) but
+    # sits a few microns below it -- start_route() reads its position from
+    # net_pads(), so the precise coordinate has to live there, not in
+    # bridge.head directly (start_route() overwrites head from the pad).
+    bridge = StubBridge(
+        pads=[
+            NetPad("net_0", "J1:1", int(24.0637 * MM), 5 * MM, -1),
+            NetPad("net_0", "J2:1", 60 * MM, 5 * MM, -1),
+        ]
+    )
+    tools = make_tools(bridge, max_step_mm=8.0)
+    tools.start_route("net_0")
+
+    # A model computing "24.064 + 8.0" from the displayed value -- a real
+    # step of ~8.0003mm from the TRUE head position, previously rejected.
+    result = tools.route_to(32.064, 5.0)
+    assert result.ok
+
+    # A step meaningfully over the limit (not just display-rounding noise)
+    # must still be refused -- the tolerance is a few microns, not a
+    # loophole.
+    tools2 = make_tools(max_step_mm=8.0)
+    tools2.start_route("net_0")
+    result2 = tools2.route_to(35.0, 5.0)  # 30mm real step
+    assert not result2.ok
+    assert result2.error_code == ErrorCode.STEP_TOO_LONG
+
+
 def test_zero_length_move_refused():
     tools = make_tools()
     tools.start_route("net_0")

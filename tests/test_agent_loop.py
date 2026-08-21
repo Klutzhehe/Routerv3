@@ -188,3 +188,47 @@ def test_transcript_and_board_rendering_artifacts():
         # Check board PNGs were created
         png_files = list(out_dir.glob("*.png"))
         assert len(png_files) >= 1
+
+
+def test_warning_on_an_ok_call_escalates_thinking_for_the_next_turn():
+    """Live Colab run (Qwen3-4B): a real different-net collision surfaced as
+    a WARNING on an otherwise-ok=True route_to() result (push() succeeded;
+    the collision is informational, not a call failure). Under the
+    error-only version of the think-escalation check, that warning never
+    turned thinking back on -- the model kept issuing plain route_to()
+    calls for several more turns after the collision first appeared, only
+    reacting (if at all) once its step budget was nearly gone. A warning
+    must escalate the NEXT turn's thinking the same way a hard error does,
+    without being counted as a failing call for stuck-loop-detection
+    purposes (DeviatingBridge's warning fires on an ACCEPTED push, not a
+    rejected one -- it must not pollute failing_call_history)."""
+    script = [
+        ToolCall("start_route", {"net": "net_0"}),
+        ToolCall("route_to", {"x_mm": 10.0, "y_mm": 5.0}),  # DeviatingBridge: ok=True + warning
+        ToolCall("route_to", {"x_mm": 15.0, "y_mm": 5.0}),
+        ToolCall("finish_route", {}),
+    ]
+    backend = ScriptedBackend(script)
+    agent = make_agent(backend, DeviatingBridge())
+
+    agent.run(net_order=["net_0"])
+
+    steps = agent.step_records
+    assert len(steps) >= 3
+    # Step 0: start_route, think=False (nothing has happened yet).
+    assert steps[0].think is False
+    # Step 1: the route_to that produced the deviation warning -- itself
+    # unescalated, since escalation only applies to the turn AFTER a
+    # warning/error was seen.
+    assert steps[1].think is False
+    assert steps[1].tool_results[0]["ok"] is True
+    assert steps[1].tool_results[0]["warnings"]
+    # Step 2: the very next turn -- this is what the fix is about.
+    assert steps[2].think is True
+
+    # The warning-only call must not have been treated as a stuck-loop
+    # failure: two DIFFERENT route_to() calls ran back to back with no
+    # stuck-loop warning ever injected.
+    for s in steps:
+        for tr in s.tool_results:
+            assert "STUCK LOOP" not in tr["message"]

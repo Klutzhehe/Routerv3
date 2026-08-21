@@ -51,6 +51,26 @@ DEFAULT_DEVIATION_TOLERANCE_MM = 0.5
 # wrong in between.
 DEFAULT_MAX_STEP_MM = 8.0
 
+# Absorbs display-rounding precision loss in the STEP_TOO_LONG check.
+# ToolResult.to_model() rounds every coordinate to 3 decimals (micron
+# precision) for the text an LLM reads -- the underlying comparison in
+# route_to() uses full float precision, which the model can never see.
+# Measured live (Qwen3-4B, first real Colab run): the model read a
+# displayed head position of "24.064", computed "24.064 + 8.0 = 32.064"
+# as its next waypoint, and got rejected: "that move is 8.000mm but the
+# limit is 8.000mm per call" -- both numbers rendered identically, no
+# raw float-epsilon involved (confirmed directly: 32.064 - 24.064 == 8.0
+# exactly in Python), because the TRUE underlying head position was
+# something like 24.0637mm, which *displays* as "24.064" but produces a
+# genuinely-over-limit request once the model's arithmetic runs on it.
+# This sent the model's first escalated-thinking turn down a wrong
+# diagnosis ("the system is strict about steps being shorter") since
+# there was no way for it to see the real, sub-micron cause. A tolerance
+# a few times larger than the display rounding's own max error
+# (0.0005mm/axis, ~0.0007mm combined in 2D) absorbs this without
+# meaningfully loosening the actual per-call step constraint.
+STEP_TOLERANCE_MM = 0.005
+
 SNAP_RADIUS_NM = int(0.5 * MM)
 
 
@@ -359,7 +379,7 @@ class RouterTools:
                 ),
             )
 
-        if step_mm > self.max_step_mm:
+        if step_mm > self.max_step_mm + STEP_TOLERANCE_MM:
             return ToolResult(
                 ok=False,
                 error_code=ErrorCode.STEP_TOO_LONG,

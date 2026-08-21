@@ -247,6 +247,7 @@ class RoutingAgent:
             net_messages.append(assistant_msg)
 
             any_error_in_turn = False
+            any_warning_in_turn = False
 
             # 2. Execute each tool call
             for i, tool_call in enumerate(reply.tool_calls):
@@ -280,6 +281,17 @@ class RoutingAgent:
                         "content": rendered_result,
                     }
                 )
+
+                # A warning on an otherwise-OK call (route_to() landing next
+                # to different-net copper is the measured case: push()
+                # succeeds, ok=True, but a collision has started) is exactly
+                # the kind of thing worth extra deliberation about -- it
+                # just doesn't fail the CALL itself, so it must not feed the
+                # stuck-loop detector's failing_call_history (a warning
+                # isn't a failing call to retry-detect). Tracked separately
+                # from any_error_in_turn for that reason.
+                if result.warnings:
+                    any_warning_in_turn = True
 
                 # Track failure & stuck detection
                 if not result.ok:
@@ -326,8 +338,19 @@ class RoutingAgent:
             if routed or failure_reason is not None:
                 break
 
-            # Latency lever: Think next turn only if this turn encountered an error
-            think_next = any_error_in_turn
+            # Latency lever: think next turn if this turn hit an error OR
+            # produced a warning. Measured live (Qwen3-4B, first real Colab
+            # run) that a collision warning on an ok=True route_to() never
+            # escalated thinking under the error-only version of this check
+            # -- the model kept issuing plain (unescalated) route_to() calls
+            # for several more turns after a real different-net collision
+            # first appeared in the tool result text, only reacting (if at
+            # all) once its step budget was nearly exhausted. A warning by
+            # this tool layer's own design (pcbworld/agent/tools.py) is
+            # never routine noise -- ToolResult only carries one when
+            # something the caller needs to actively reason about happened
+            # -- so it belongs in the same escalation bucket as a hard error.
+            think_next = any_error_in_turn or any_warning_in_turn
 
         # Teardown / budget handling
         if not routed:
