@@ -22,6 +22,8 @@ from collections import namedtuple
 
 import pytest
 
+from tests import fake_bridge
+
 MM = 1_000_000
 
 Candidate = namedtuple("Candidate", ["id", "x", "y", "kind", "net"])
@@ -136,7 +138,11 @@ def _install(nets, reject, fix_reject=None) -> ScriptedBridge:
 def _clean_bridge_module():
     sys.modules.pop("pcbworld_pns_bridge", None)
     yield
-    sys.modules.pop("pcbworld_pns_bridge", None)
+    # Restore the shared fake module (rather than just popping it) so
+    # later test files' deferred `import pcbworld_pns_bridge` (inside env
+    # __init__, e.g. SimpleRouteEnv/PCBRouteEnv) still finds one --
+    # leaving it absent broke every test file collected after this one.
+    fake_bridge.install()
 
 
 def _two_pad_net(name: str, start=(0, 0), target=(10 * MM, 0)):

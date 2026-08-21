@@ -176,7 +176,19 @@ class FakePNSBridge:
 
 
 def install() -> None:
-    module = types.ModuleType("pcbworld_pns_bridge")
+    # Reuse the existing module object across repeated install() calls
+    # (every test file that imports this one calls install() again at its
+    # own collection time). If each call swapped in a brand-new
+    # types.ModuleType, a test file that does `import pcbworld_pns_bridge
+    # as bridge` and later monkeypatches `bridge.PNSBridge` (e.g.
+    # test_diff_pair_route_env.py) would be mutating a module object that
+    # a *different* file's later install() call had already replaced in
+    # sys.modules -- the env under test would silently pick up the
+    # untouched default fixture instead of the monkeypatched one.
+    module = sys.modules.get("pcbworld_pns_bridge")
+    if module is None:
+        module = types.ModuleType("pcbworld_pns_bridge")
+        sys.modules["pcbworld_pns_bridge"] = module
     module.PNSBridge = FakePNSBridge
     module.MODE_ROUTE_SINGLE = 1
     module.MODE_ROUTE_DIFF_PAIR = 2
@@ -186,4 +198,3 @@ def install() -> None:
     module.RM_MARK_OBSTACLES = 0
     module.RM_SHOVE = 1
     module.RM_WALKAROUND = 2
-    sys.modules["pcbworld_pns_bridge"] = module

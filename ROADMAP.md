@@ -275,11 +275,14 @@ agent operates one level up:
 1. Single-net, sparse board -- done (`SimpleRouteEnv`, item 6).
 2. Multi-net, dense board, no diff pairs -- in progress (`PCBRouteEnv`,
    item 4).
-3. Diff-pair routing on sparse boards (`MODE_ROUTE_DIFF_PAIR`, primitive
-   Colab-verified in item 7, not yet wired into an env).
-4. Length-tune single net (`MODE_TUNE_SINGLE`, primitive verified).
-5. Length-tune diff-pair skew (`MODE_TUNE_DIFF_PAIR_SKEW`, hardest,
-   primitive verified).
+3. Diff-pair routing on sparse boards (`MODE_ROUTE_DIFF_PAIR`) -- primitive
+   and `DiffPairRouteEnv`'s leg-sequencing both Colab-verified.
+4. Length-tune single net (`MODE_TUNE_SINGLE`) -- primitive and env both
+   Colab-verified (0.25mm residual gap on the one test case so far --
+   real router behavior, see item 7).
+5. Length-tune diff-pair skew (`MODE_TUNE_DIFF_PAIR_SKEW`, hardest) --
+   primitive Colab-verified (item 7); not yet exercised by
+   `DiffPairRouteEnv`, which only builds `MODE_TUNE_SINGLE` legs today.
 6. Combine: dense board, mixed single/diff-pair/length-matched nets,
    rip-up-and-reroute enabled.
 
@@ -322,21 +325,32 @@ agent operates one level up:
   board (1 plain net + 1 diff pair + 1 two-member length group) visits
   exactly the 5 expected legs in order, terminates correctly, and a tune
   leg's length-mismatch bookkeeping actually runs (not just "doesn't
-  crash"). **Not yet Colab-verified against the real bridge** -- same
-  standing caveat as every other env in this file; the diff-pair/tune
-  *primitives* themselves are Colab-verified (item 7), but this specific
-  leg-sequencing/bookkeeping code has only run against the fake.
+  crash"). **Now also Colab-verified against the real bridge**, on a
+  `generate_board.py` board with 1 diff pair + 1 two-member length group:
+  leg sequence executed in the exact order `_build_legs()` specifies
+  (`diff_pair:diffpair_0_P` -> `direct:lengthgrp_0_0` ->
+  `direct:lengthgrp_0_1` -> `tune:lengthgrp_0_1`), episode terminated
+  cleanly in 26 steps with bounded (non-exploding) reward, and
+  `get_board_geometry()` afterward showed 27 real persisted tracks across
+  all four nets. Length-tuning specifically: reference
+  (`lengthgrp_0_0`) routed at 12.8713mm (2 segments), the real meander
+  placer inserted 14 segments into `lengthgrp_0_1` and closed it to
+  12.6208mm -- a 0.2505mm residual gap, not exact zero. That gap is real
+  router behavior (meander segment granularity), not an env bug -- the
+  target length it tuned toward was itself read back correctly from the
+  reference's actual routed length (12.8713mm matches what
+  `_start_next_leg()` would have passed to `set_target_length()`). Take
+  this as a data point for reward-shaping / success-tolerance decisions
+  later (e.g. treat a tune leg as "succeeded" within some mm tolerance,
+  not exact-zero mismatch) rather than as a bug to fix.
   - Needed a bridge binding that didn't exist: `GetBoardGeometry()` was
     implemented in C++ (`pns_bridge.{h,cpp}`) but never exposed to Python
     -- added the full `bindings.cpp` pybind11 wiring for it
     (`TrackSegment`/`ViaGeom`/`PadGeom`/`ZoneGeom`/`FootprintBBox`/
     `EdgeShape`/`BoardGeometry`, plus `get_board_geometry()` on
-    `PNSBridge`), since the tune-leg logic above needs to read back real
-    segment lengths and find an already-routed net's midpoint. This is
-    new, uncompiled-since-added C++ -- **needs a Colab rebuild to verify**
-    before trusting `DiffPairRouteEnv`'s tune legs against the real
-    bridge; expect the usual "iterate from real linker/runtime output" if
-    anything's wrong, per every other C++ addition in this file.
+    `PNSBridge`). Colab rebuild confirmed it compiles, links, and returns
+    correct data (the 27-track/4-net inspection above came from it
+    directly) -- no longer an open verification item.
 - The two-stream encoder doesn't exist yet; `ppo_baseline.py`'s
   actor-critic is still a plain MLP over the 5-vector (now 8-vector, if
   trained against `DiffPairRouteEnv`).
