@@ -22,6 +22,11 @@ MM = 1_000_000
 NetPad = namedtuple("NetPad", ["net", "pad_name", "x", "y", "layer"])
 Candidate = namedtuple("Candidate", ["id", "x", "y", "kind", "net"])
 DRCViolation = namedtuple("DRCViolation", ["error_code", "message", "severity", "x", "y"])
+TrackSegment = namedtuple("TrackSegment", ["x1", "y1", "x2", "y2", "width", "layer", "net", "is_arc"])
+ViaGeom = namedtuple("ViaGeom", ["x", "y", "diameter", "drill", "layer_top", "layer_bottom", "net"])
+PadGeom = namedtuple("PadGeom", ["x", "y", "size_x", "size_y", "layer_top", "layer_bottom", "net", "pad_name"])
+EdgeShape = namedtuple("EdgeShape", ["shape_type", "x1", "y1", "x2", "y2", "width"])
+BoardGeometry = namedtuple("BoardGeometry", ["tracks", "vias", "pads", "zones", "courtyards", "board_edge"])
 HeadGeometry = namedtuple(
     "HeadGeometry", ["active", "segments", "vias", "end_x", "end_y", "layer", "length"]
 )
@@ -51,6 +56,7 @@ class StubBridge:
             NetPad("net_1", "J4:1", 25 * MM, 15 * MM, -1),
         ]
         self.head = (5 * MM, 5 * MM)
+        self.layer = 0
         self.routing = False
         self.collides = False
         self.fix_ok = True
@@ -68,6 +74,7 @@ class StubBridge:
     def start_route(self, x, y, item_id, layer):
         self.routing = True
         self.head = (x, y)
+        self.layer = layer if layer >= 0 else 0
         return True
 
     def push(self, x, y, item_id=-1):
@@ -76,15 +83,24 @@ class StubBridge:
         self.head = (x, y)
         return True
 
+    def toggle_via_placement(self):
+        self.layer = 1 if self.layer == 0 else 0
+
+    def switch_layer(self, layer):
+        self.layer = layer
+        return True
+
     def fix(self, x, y, item_id=-1, force_finish=False, force_commit=False):
         return self.fix_ok
 
     def commit_routing(self):
         self.committed.append(self.head)
         self.routing = False
+        self.layer = 0
 
     def stop_routing(self):
         self.routing = False
+        self.layer = 0
 
     def run_drc(self):
         return self.violations
@@ -94,7 +110,7 @@ class StubBridge:
         return 3
 
     def get_head_geometry(self):
-        return HeadGeometry(self.routing, [], [], self.head[0], self.head[1], 0, 0.0)
+        return HeadGeometry(self.routing, [], [], self.head[0], self.head[1], self.layer, 0.0)
 
     def head_collides(self):
         return self.collides
@@ -102,6 +118,20 @@ class StubBridge:
     def get_design_rules(self):
         return DesignRules(
             250_000, 600_000, 300_000, 200_000, 150_000, 600_000, 300_000, 250_000
+        )
+
+    def get_board_geometry(self):
+        pads_geom = [
+            PadGeom(p.x, p.y, 500_000, 500_000, 0, 1, p.net, p.pad_name)
+            for p in self._pads
+        ]
+        return BoardGeometry(
+            tracks=[],
+            vias=[],
+            pads=pads_geom,
+            zones=[],
+            courtyards=[],
+            board_edge=[EdgeShape("segment", 0, 0, 50 * MM, 50 * MM, 100_000)],
         )
 
 
@@ -340,3 +370,91 @@ def test_list_nets_reports_mm_coordinates():
     rendered = make_tools().list_nets().to_model()
     assert "(5.000, 5.000)" in rendered
     assert "(25.000, 5.000)" in rendered
+
+
+# -- via and layer switching ----------------------------------------------
+
+
+def test_place_via_and_switch_layer_without_active_route_rejected():
+    tools = make_tools()
+    res1 = tools.place_via()
+    assert not res1.ok
+    assert res1.error_code == ErrorCode.NO_ROUTE_IN_PROGRESS
+
+    res2 = tools.switch_to_layer(1)
+    assert not res2.ok
+    assert res2.error_code == ErrorCode.NO_ROUTE_IN_PROGRESS
+
+
+def test_switch_to_layer_validates_layer_number():
+    tools = make_tools()
+    tools.start_route("net_0")
+
+    bad_layer_res = tools.switch_to_layer(2)
+    assert not bad_layer_res.ok
+    assert bad_layer_res.error_code == ErrorCode.OUT_OF_BOUNDS
+    assert "0" in bad_layer_res.message and "1" in bad_layer_res.message
+
+    bad_type_res = tools.switch_to_layer("F_Cu")  # type: ignore
+    assert not bad_type_res.ok
+    assert bad_type_res.error_code == ErrorCode.OUT_OF_BOUNDS
+
+
+def test_place_via_and_switch_to_layer_toggle_layer():
+    bridge = StubBridge()
+    tools = make_tools(bridge)
+    tools.start_route("net_0")
+
+    assert bridge.layer == 0
+    res_via = tools.place_via()
+    assert res_via.ok
+    assert bridge.layer == 1
+    assert res_via.data["layer"] == 1
+
+    res_switch = tools.switch_to_layer(0)
+    assert res_switch.ok
+    assert bridge.layer == 0
+    assert res_switch.data["layer"] == 0
+
+
+def test_via_violating_design_rules_rejected_with_actionable_error():
+    class IllegalViaBridge(StubBridge):
+        def get_design_rules(self):
+            # via diameter (0.4mm) is below board minimum (0.6mm)
+            return DesignRules(
+                250_000, 400_000, 300_000, 200_000, 150_000, 600_000, 300_000, 250_000
+            )
+
+    tools = make_tools(IllegalViaBridge())
+    tools.start_route("net_0")
+
+    res = tools.place_via()
+    assert not res.ok
+    assert res.error_code == ErrorCode.VIOLATES_DESIGN_RULE
+    assert "0.400" in res.message
+    assert "0.600" in res.message
+    assert "get_board_info()" in res.message
+
+    res2 = tools.switch_to_layer(1)
+    assert not res2.ok
+    assert res2.error_code == ErrorCode.VIOLATES_DESIGN_RULE
+
+
+def test_finish_route_on_back_layer_refused():
+    bridge = StubBridge()
+    tools = make_tools(bridge)
+    tools.start_route("net_0")
+    tools.route_to(10.0, 5.0)
+    tools.switch_to_layer(1)
+
+    # Head is on layer 1 (B_Cu), finish should refuse
+    result = tools.finish_route()
+    assert not result.ok
+    assert "layer 0" in result.message
+    assert "switch_to_layer(0)" in result.message
+
+    # Switching back to layer 0 allows finish
+    tools.switch_to_layer(0)
+    ok_res = tools.finish_route()
+    assert ok_res.ok
+

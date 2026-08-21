@@ -309,10 +309,6 @@ class RoutingAgent:
                     routed = True
                     break
 
-                if tool_call.name == "abandon_route" and result.ok:
-                    failure_reason = "Model voluntarily abandoned route."
-                    break
-
             # Record step transcript
             self.step_records.append(
                 StepRecord(
