@@ -110,6 +110,24 @@ class NetProbeResult:
     finished: bool
     collision_warning_during_route: bool
     finish_error_code: str | None
+    obstacle_net: str | None = None      # None = no obstacle; "" = obstacle w/ no net
+    obstacle_same_net: bool | None = None
+    obstacle_kind: str | None = None
+
+
+def _obstacle_detail(tools, net: str) -> tuple[str | None, bool | None, str | None]:
+    """Pulls get_head_obstacle() directly, not just through a message string
+    -- this is the decisive signal from the C++ fix that replaced the
+    original bare-bool HeadCollides(): does the collision check see the
+    SAME net being routed (near-certainly its own start/target pad, not a
+    real obstacle) or a genuinely DIFFERENT net (real contention)? Returns
+    (obstacle_net_or_None, is_same_net_or_None, kind_or_None)."""
+    if not getattr(tools, "has_obstacle_detail", False):
+        return None, None, None
+    obstacle = tools.bridge.get_head_obstacle()
+    if not obstacle.found:
+        return None, None, None
+    return obstacle.net, (obstacle.net == net), obstacle.kind
 
 
 def _probe_net(tools, net: str, strategy: str, results: list) -> None:
@@ -151,10 +169,14 @@ def _probe_net(tools, net: str, strategy: str, results: list) -> None:
     finish = tools.finish_route()
     finished = finish.ok
 
+    obstacle_net, obstacle_same_net, obstacle_kind = _obstacle_detail(tools, net)
+
     print(
         f"RESULT: net={net!r} strategy={strategy} finished={finished} "
         f"collision_warning_during_route={collided_during_route} "
-        f"finish_error={finish.error_code}"
+        f"finish_error={finish.error_code} "
+        f"obstacle_net={obstacle_net!r} obstacle_same_net={obstacle_same_net} "
+        f"obstacle_kind={obstacle_kind!r}"
     )
 
     if not finished:
@@ -164,7 +186,10 @@ def _probe_net(tools, net: str, strategy: str, results: list) -> None:
         tools.abandon_route()
 
     results.append(
-        NetProbeResult(net, strategy, finished, collided_during_route, finish.error_code)
+        NetProbeResult(
+            net, strategy, finished, collided_during_route, finish.error_code,
+            obstacle_net, obstacle_same_net, obstacle_kind,
+        )
     )
 
 
@@ -212,13 +237,54 @@ def verify(board_path: str, bridge_dir: str | None = None) -> bool:
     print(f"\n  exact-target finish rate: {_rate(exact)}")
     print(f"  near-target  finish rate: {_rate(near)}")
     print(
-        "  (if 'near' clearly beats 'exact', the fix belongs in "
-        "pcbworld/agent/prompts/router.md -- tell the model to stop short of "
-        "the pad and let finish_route() close the gap, not in the C++. If "
-        "BOTH strategies fail at similar rates, this is real board "
-        "contention/DRC, not a pushing-pattern artifact -- see the "
-        "check_drc()/geometry dumps above for whichever nets failed.)"
+        "  (exact vs. near is CONFOUNDED with routing order in this script -- "
+        "strategy alternates with net index, so a difference here could be "
+        "routing order, not the strategy itself. Read this as a secondary "
+        "signal, not the primary one.)"
     )
+
+    # -- THE decisive axis: is the collision self-referential (same net as
+    # the one being routed -- a head touching its own start/target pad) or
+    # a genuine different-net blocker? This is what pcbworld/engine/cpp's
+    # GetHeadObstacle() was added specifically to answer, replacing the
+    # first run's bare head_collides() bool.
+    failed = [r for r in results if not r.finished]
+    same_net_failures = [r for r in failed if r.obstacle_same_net is True]
+    diff_net_failures = [r for r in failed if r.obstacle_same_net is False]
+    unknown_failures = [r for r in failed if r.obstacle_same_net is None]
+
+    print(f"\n  failed nets: {len(failed)}/{len(results)}")
+    print(f"    -- colliding with their OWN net (self-touch, likely benign): {len(same_net_failures)}")
+    for r in same_net_failures:
+        print(f"       {r.net!r} ({r.strategy}) vs. own net {r.obstacle_net!r} ({r.obstacle_kind})")
+    print(f"    -- colliding with a DIFFERENT net (real contention): {len(diff_net_failures)}")
+    for r in diff_net_failures:
+        print(f"       {r.net!r} ({r.strategy}) vs. {r.obstacle_net!r} ({r.obstacle_kind})")
+    print(f"    -- obstacle detail unavailable (older bridge, or not a collision failure): {len(unknown_failures)}")
+
+    if same_net_failures and not diff_net_failures:
+        print(
+            "\n  CONCLUSION: every failure was a same-net (self) collision. This "
+            "confirms the GetHeadObstacle() fix's hypothesis directly -- fix "
+            "belongs in pcbworld/agent/tools.py's _collision_message() / "
+            "router.md guidance (already updated to say 'try finish_route() "
+            "again' for this case), not further C++ changes."
+        )
+    elif diff_net_failures and not same_net_failures:
+        print(
+            "\n  CONCLUSION: every failure was a genuine different-net "
+            "collision. This is real board contention, not a self-touch "
+            "artifact -- the rip_up() recovery path is the correct fix, "
+            "already reflected in the tool's own message."
+        )
+    elif same_net_failures and diff_net_failures:
+        print(
+            "\n  CONCLUSION: both kinds of failure occurred. The self-touch "
+            "artifact was real (some failures) AND genuine contention exists "
+            "separately (other failures) -- both recovery paths are needed, "
+            "which is what the updated _collision_message()/router.md now "
+            "provide."
+        )
 
     routed_nets = {r.net for r in results if r.finished}
     unrouted_nets = [n for n in nets if n not in routed_nets]

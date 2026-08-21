@@ -30,6 +30,7 @@ BoardGeometry = namedtuple("BoardGeometry", ["tracks", "vias", "pads", "zones", 
 HeadGeometry = namedtuple(
     "HeadGeometry", ["active", "segments", "vias", "end_x", "end_y", "layer", "length"]
 )
+HeadObstacle = namedtuple("HeadObstacle", ["found", "net", "kind", "x", "y"])
 DesignRules = namedtuple(
     "DesignRules",
     [
@@ -59,6 +60,15 @@ class StubBridge:
         self.layer = 0
         self.routing = False
         self.collides = False
+        # get_head_obstacle() detail, consulted only when self.collides is
+        # True. Defaults to "same net as whatever's active" (the case a
+        # live Colab run actually produced -- head_collides() firing
+        # against the route's own target pad on a completely empty board)
+        # since that is the scenario RouterTools' _collision_message() most
+        # needs correct test coverage for.
+        self.obstacle_net = "net_0"
+        self.obstacle_kind = "pad"
+        self.obstacle_xy = (25 * MM, 5 * MM)
         self.fix_ok = True
         self.push_ok = True
         self.committed = []
@@ -114,6 +124,17 @@ class StubBridge:
 
     def head_collides(self):
         return self.collides
+
+    def get_head_obstacle(self):
+        if not self.collides:
+            return HeadObstacle(found=False, net="", kind="", x=0, y=0)
+        return HeadObstacle(
+            found=True,
+            net=self.obstacle_net,
+            kind=self.obstacle_kind,
+            x=self.obstacle_xy[0],
+            y=self.obstacle_xy[1],
+        )
 
     def get_design_rules(self):
         return DesignRules(
@@ -259,6 +280,116 @@ def test_collision_is_surfaced_on_an_accepted_move():
     assert any("colliding" in w for w in result.warnings)
 
 
+def test_same_net_collision_warns_it_may_be_the_own_target_pad():
+    """A live Colab run found head_collides() firing on the very first net
+    routed against a completely empty board, at the instant the head
+    reached its own target pad -- get_head_obstacle() reported the
+    colliding item's net as the SAME net being routed. RouterTools must
+    tell an agent that is a likely-benign self-touch, not "rip something
+    up", or it will send the agent chasing a blocker that may not exist."""
+    bridge = StubBridge()
+    bridge.collides = True
+    bridge.obstacle_net = "net_0"  # matches the net being routed below
+    tools = make_tools(bridge)
+    tools.start_route("net_0")
+    result = tools.route_to(10.0, 5.0)
+
+    assert result.ok
+    message = " ".join(result.warnings)
+    assert "OWN net" in message
+    assert "not a real obstacle" in message
+    # The message correctly says "not... needs to be ripped up" -- a
+    # negation, not an instruction. What must NOT appear is an unqualified
+    # imperative telling the agent to go rip something up.
+    assert "rip_up(" not in message
+    assert "call rip_up" not in message.lower()
+
+
+def test_different_net_collision_names_the_actual_blocking_net():
+    bridge = StubBridge()
+    bridge.collides = True
+    bridge.obstacle_net = "net_1"  # a DIFFERENT net than the one being routed
+    bridge.obstacle_kind = "segment"
+    tools = make_tools(bridge)
+    tools.start_route("net_0")
+    result = tools.route_to(10.0, 5.0)
+
+    assert result.ok
+    message = " ".join(result.warnings)
+    assert "net_1" in message
+    assert "segment" in message
+    assert "OWN net" not in message
+
+
+def test_finish_route_same_net_collision_does_not_tell_agent_to_rip_up():
+    """finish_route()'s HEAD_COLLIDES message must not blanket-instruct
+    rip_up() any more -- for the same-net case there is nothing routed yet
+    to rip up (fix() just failed, nothing was committed)."""
+    bridge = StubBridge()
+    bridge.fix_ok = False
+    bridge.collides = True
+    bridge.obstacle_net = "net_0"
+    tools = make_tools(bridge)
+    tools.start_route("net_0")
+    result = tools.finish_route()
+
+    assert not result.ok
+    assert result.error_code == ErrorCode.HEAD_COLLIDES
+    assert "finish_route() again" in result.message or "OWN net" in result.message
+    assert "not a real obstacle" in result.message
+
+
+def test_finish_route_different_net_collision_still_names_the_blocker():
+    bridge = StubBridge()
+    bridge.fix_ok = False
+    bridge.collides = True
+    bridge.obstacle_net = "net_1"
+    tools = make_tools(bridge)
+    tools.start_route("net_0")
+    result = tools.finish_route()
+
+    assert not result.ok
+    assert result.error_code == ErrorCode.HEAD_COLLIDES
+    assert "net_1" in result.message
+
+
+def test_collision_detail_degrades_gracefully_without_get_head_obstacle():
+    """A bridge with head_collides() but not get_head_obstacle() (an older
+    compiled build) must still work -- just with the generic message, not
+    a crash. Composed rather than subclassed-and-deleted, same reasoning as
+    LegacyBridge above: get_head_obstacle is a class method, not an
+    instance attribute, so `del` on the instance wouldn't remove it."""
+
+    class NoObstacleDetailBridge:
+        def __init__(self):
+            self._inner = StubBridge()
+            self._inner.collides = True
+
+        net_pads = property(lambda self: self._inner.net_pads)
+        query_hover_items = property(lambda self: self._inner.query_hover_items)
+        start_route = property(lambda self: self._inner.start_route)
+        push = property(lambda self: self._inner.push)
+        fix = property(lambda self: self._inner.fix)
+        commit_routing = property(lambda self: self._inner.commit_routing)
+        stop_routing = property(lambda self: self._inner.stop_routing)
+        run_drc = property(lambda self: self._inner.run_drc)
+        get_head_geometry = property(lambda self: self._inner.get_head_geometry)
+        head_collides = property(lambda self: self._inner.head_collides)
+        get_design_rules = property(lambda self: self._inner.get_design_rules)
+        # get_head_obstacle deliberately NOT forwarded here.
+
+    bridge = NoObstacleDetailBridge()
+    tools = make_tools(bridge)
+    assert not tools.has_obstacle_detail
+    assert tools.has_collision_readback  # head_collides() IS available
+
+    tools.start_route("net_0")
+    result = tools.route_to(10.0, 5.0)
+
+    assert result.ok
+    assert any("colliding with something" in w for w in result.warnings)
+
+
 def test_missing_head_readback_degrades_loudly_not_silently():
     # A bridge built before the head-state bindings existed. Composed rather
     # than subclassed from StubBridge on purpose -- inheriting and deleting
@@ -293,6 +424,13 @@ def test_finish_route_failure_distinguishes_collision_from_distance():
     bridge = StubBridge()
     bridge.fix_ok = False
     bridge.collides = True
+    # A genuine different-net blocker, not the default same-net collision --
+    # this test's intent is a real obstacle, which is the one case where
+    # naming rip_up() as the fix is still correct. See
+    # test_finish_route_same_net_collision_does_not_tell_agent_to_rip_up
+    # for the other branch, added after a live Colab run showed
+    # head_collides() firing against a route's own target pad.
+    bridge.obstacle_net = "net_1"
     tools = make_tools(bridge)
     tools.start_route("net_0")
     result = tools.finish_route()

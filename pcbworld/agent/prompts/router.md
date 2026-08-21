@@ -23,4 +23,6 @@ You are an expert PCB autorouting agent driving KiCad's headless push-and-shove 
 
 - **Deviation Warnings**: If `route_to` returns `HEAD_DEVIATED` or a warning that the router pushed the head to a different coordinate, adjust your next move relative to the actual reported head position.
 - **Router Refusal / Obstacles**: If `route_to` is rejected, try a detour waypoint perpendicular to the direct path, or place a via to hop to Layer 1.
-- **Collisions at Target**: If `finish_route` reports `HEAD_COLLIDES`, use `check_drc()` to identify the blocking net, then `abandon_route()`, `rip_up(blocking_net)`, route the current net, and reroute the other net afterwards.
+- **Collisions at Target**: If `finish_route` reports `HEAD_COLLIDES`, **read the message carefully -- it names which net the head is actually colliding with.**
+  - If it names a **different** net, that net's copper is really in the way: use `check_drc()` to confirm, then `abandon_route()`, `rip_up(that_net)`, route the current net, and reroute the other net afterwards.
+  - If it says the collision is against **your own net**, this is very likely your own start or target pad, not a real obstacle -- there is nothing to rip up (this net was never committed; `fix()` just failed). Just call `finish_route()` again before trying anything else; if it keeps failing the same way, `abandon_route()` and try approaching the target from a different direction instead of assuming a blocker exists.

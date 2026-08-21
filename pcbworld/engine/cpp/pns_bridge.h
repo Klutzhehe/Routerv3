@@ -333,6 +333,35 @@ public:
     // which they need anyway.
     bool HeadCollides() const;
 
+    // What HeadCollides() actually found, if anything -- added specifically
+    // to turn "is the head colliding" (a bool that already fired on a
+    // Colab run against a completely empty board, first net routed, target
+    // reached exactly) into an observable fact instead of another guess.
+    // KiCad source confirms the check itself uses proven machinery
+    // (NODE::CheckColliding, COLLISION_SEARCH_OPTIONS::m_differentNetsOnly
+    // defaults to true) -- but this file's OWN existing code
+    // (createBoardItem(), converting a PNS::ITEM back to a BOARD_ITEM) already
+    // documents that an in-progress PNS::ITEM's Net() can legitimately come
+    // back null even for items that ARE part of the route being committed
+    // (falls back to NETINFO_LIST::OrphanedItem() there). If the same is
+    // true of the head's own in-progress Traces() items during HeadCollides()'s
+    // check, m_differentNetsOnly's same-net exclusion would not recognize
+    // the head as belonging to its own destination pad's net, and every
+    // route would spuriously "collide" with the very pad it's finishing at.
+    // Reporting the obstacle's actual net/kind/position turns that
+    // hypothesis into something the next Colab run either confirms or
+    // rules out directly, rather than a fourth round of reading headers.
+    struct HeadObstacle
+    {
+        bool found;
+        std::string net;    // empty if the obstacle item has no resolved net
+        std::string kind;   // "pad" | "via" | "segment" | "arc" | "other" --
+                             //   same convention as Candidate::kind
+        int x, y;            // obstacle's anchor point, nm
+    };
+
+    HeadObstacle GetHeadObstacle() const;
+
     // -- Design rules ------------------------------------------------------
     //
     // The board's own sizing rules, so a caller stops guessing them.

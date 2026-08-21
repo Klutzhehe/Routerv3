@@ -169,6 +169,17 @@ class RouterTools:
         # instead of crashing an agent run halfway through a board.
         self.has_head_readback = hasattr(bridge, "get_head_geometry")
         self.has_collision_readback = hasattr(bridge, "head_collides")
+        # get_head_obstacle() -- added after a live Colab run showed
+        # head_collides() firing on the very first net routed against a
+        # completely empty board, at the exact instant the head reached its
+        # own target pad. A bare bool can't say whether that's real
+        # contention or the head detecting its own destination pad as
+        # "different net" (this file's own createBoardItem() already
+        # documents that an in-progress PNS::ITEM's Net() can come back
+        # null). This exposes what the collision check actually found --
+        # net name, item kind, position -- instead of a bool that leaves an
+        # LLM agent guessing what to rip up.
+        self.has_obstacle_detail = hasattr(bridge, "get_head_obstacle")
 
     # -- introspection -----------------------------------------------------
 
@@ -407,9 +418,8 @@ class RouterTools:
 
         if self.has_collision_readback and self.bridge.head_collides():
             warnings.append(
-                "the head is currently colliding with something. finish_route() "
-                "will fail while this is true -- move away or rip up whatever is "
-                "in the way."
+                f"{self._collision_message()} finish_route() will fail while "
+                f"this is true."
             )
             data["head_collides"] = True
 
@@ -451,9 +461,7 @@ class RouterTools:
 
         warnings = []
         if self.has_collision_readback and self.bridge.head_collides():
-            warnings.append(
-                "the head is currently colliding with something after placing via."
-            )
+            warnings.append(self._collision_message())
 
         return ToolResult(
             ok=True,
@@ -505,7 +513,7 @@ class RouterTools:
         head_after = self._head_position_mm()
         warnings = []
         if self.has_collision_readback and self.bridge.head_collides():
-            warnings.append("the head is currently colliding with something.")
+            warnings.append(self._collision_message())
 
         return ToolResult(
             ok=True,
@@ -559,11 +567,16 @@ class RouterTools:
             colliding = self.has_collision_readback and self.bridge.head_collides()
 
             if colliding:
-                reason = (
-                    "the head is colliding with existing copper at the target. "
-                    "Use check_drc() to see what, then rip_up() that net and "
-                    "route it later."
-                )
+                # _collision_message() already distinguishes "colliding with
+                # your own net" (very likely your own start/target pad, not
+                # a real obstacle -- don't rip anything up over this) from
+                # "colliding with net X" (a real blocker -- rip_up(X)). Don't
+                # add a blanket "rip_up() that net" instruction on top of it:
+                # for the same-net case there is nothing to rip up yet (this
+                # net was never committed -- fix() just failed), and for the
+                # real-blocker case _collision_message() already names the
+                # net to check_drc()/rip_up().
+                reason = self._collision_message()
                 code = ErrorCode.HEAD_COLLIDES
             elif distance > self.deviation_tolerance_mm:
                 reason = (
@@ -681,6 +694,37 @@ class RouterTools:
         if not hasattr(self.bridge, "get_design_rules"):
             return None
         return self.bridge.get_design_rules()
+
+    def _collision_message(self) -> str:
+        """Describes what the head is currently colliding with, as
+        specifically as the bridge can say. Falls back to a generic message
+        on an older bridge build that has head_collides() but not
+        get_head_obstacle() -- see has_obstacle_detail's docstring for why
+        the detail matters: a bare "something" leaves an agent unable to
+        tell "rip up net_3" from "you just reached your own target pad,
+        this may not be a real problem, try finish_route() anyway"."""
+        if not self.has_obstacle_detail:
+            return "the head is currently colliding with something."
+
+        obstacle = self.bridge.get_head_obstacle()
+        if not obstacle.found:
+            return "the head is currently colliding with something."
+
+        net = obstacle.net or "(no net)"
+        location = f"at ({_mm(obstacle.x):.3f}, {_mm(obstacle.y):.3f})"
+
+        if self._active_net is not None and obstacle.net == self._active_net:
+            return (
+                f"the head is colliding with a {obstacle.kind} belonging to its OWN net "
+                f"{net!r} {location} -- this is very likely your own start or "
+                f"target pad, not a real obstacle. Try finish_route() before "
+                f"assuming something needs to be ripped up."
+            )
+
+        return (
+            f"the head is colliding with a {obstacle.kind} on net {net!r} {location}. "
+            f"Use check_drc() to confirm, then rip_up({net!r}) and route it later."
+        )
 
     def _validate_via_rules(self) -> ToolResult | None:
         rules = self._design_rules()

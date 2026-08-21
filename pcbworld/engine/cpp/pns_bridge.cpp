@@ -902,29 +902,82 @@ PNS_BRIDGE::HeadGeometry PNS_BRIDGE::GetHeadGeometry() const
 
 bool PNS_BRIDGE::HeadCollides() const
 {
+    return GetHeadObstacle().found;
+}
+
+PNS_BRIDGE::HeadObstacle PNS_BRIDGE::GetHeadObstacle() const
+{
+    HeadObstacle result;
+    result.found = false;
+    result.x = 0;
+    result.y = 0;
+
     if( !m_router || !m_router->Placer() )
-        return false;
+        return result;
 
     PNS::PLACEMENT_ALGO* placer = m_router->Placer();
 
-    // The placer's own working node, not m_router->GetWorld(): the head is
-    // placed against a branch of the world that already accounts for this
-    // route's in-progress items, so asking the base world would report the
-    // head colliding with itself.
-    PNS::NODE* node = placer->CurrentNode( true );
+    // NOTE (corrected from the first version of this method): CurrentNode()'s
+    // bool parameter is aLoopsRemoved (a shove/optimizer concept -- whether
+    // topological loops are stripped from the returned graph), NOT "include
+    // vs exclude this route's own head", confirmed against
+    // pns_placement_algo.h's own doc comment ("Returns the most recent board
+    // state") -- there is no variant of CurrentNode() that excludes the
+    // head's own in-progress items, they are simply part of "the most recent
+    // board state" by definition once Push() has placed them. The prior
+    // comment on this line claiming otherwise was wrong.
+    PNS::NODE* node = placer->CurrentNode();
 
     if( !node )
-        return false;
+        return result;
 
     PNS::ITEM_SET traces = placer->Traces();
 
     for( PNS::ITEM* item : traces.Items() )
     {
-        if( item && node->CheckColliding( item ) )
-            return true;
+        if( !item )
+            continue;
+
+        // auto, not a spelled-out type: OPT_OBSTACLE is NODE::OPT_OBSTACLE,
+        // not PNS::OPT_OBSTACLE -- matching how the proven-correct source
+        // (pns_line_placer.cpp's rhMarkObstacles) takes this same value,
+        // rather than risk a wrong fully-qualified name and a third
+        // guessed-and-failed compile on this file.
+        auto obs = node->CheckColliding( item );
+
+        if( !obs )
+            continue;
+
+        result.found = true;
+
+        // Same PNS::ITEM* -> net-name conversion this file already uses and
+        // has already compiled/linked successfully in createBoardItem()
+        // above -- including its null-safety: an in-progress item's Net()
+        // legitimately can be null, same as createBoardItem() already
+        // documents for items being converted at commit time.
+        if( obs->m_item )
+        {
+            NETINFO_ITEM* net = static_cast<NETINFO_ITEM*>( obs->m_item->Net() );
+            result.net = net ? net->GetNetname().ToStdString() : "";
+
+            switch( obs->m_item->Kind() )
+            {
+            case PNS::ITEM::SOLID_T:   result.kind = "pad";     break;
+            case PNS::ITEM::VIA_T:     result.kind = "via";     break;
+            case PNS::ITEM::SEGMENT_T: result.kind = "segment"; break;
+            case PNS::ITEM::ARC_T:     result.kind = "arc";     break;
+            default:                   result.kind = "other";   break;
+            }
+
+            VECTOR2I pos = obs->m_item->Anchor( 0 );
+            result.x = pos.x;
+            result.y = pos.y;
+        }
+
+        return result;
     }
 
-    return false;
+    return result;
 }
 
 PNS_BRIDGE::DesignRules PNS_BRIDGE::GetDesignRules() const

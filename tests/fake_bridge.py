@@ -47,6 +47,7 @@ HeadVia = namedtuple("HeadVia", ["x", "y", "layer_top", "layer_bottom"])
 HeadGeometry = namedtuple(
     "HeadGeometry", ["active", "segments", "vias", "end_x", "end_y", "layer", "length"]
 )
+HeadObstacle = namedtuple("HeadObstacle", ["found", "net", "kind", "x", "y"])
 
 DesignRules = namedtuple(
     "DesignRules",
@@ -313,6 +314,17 @@ class FakePNSBridge:
             return False
         return False
 
+    def get_head_obstacle(self) -> HeadObstacle:
+        # Matches head_collides()'s own "never collides" default -- this
+        # fake doesn't model real router geometry/collision physics. Tests
+        # that need a collision (e.g. exercising RouterTools'
+        # _collision_message() same-net/different-net branches) override
+        # this via a local subclass, same pattern
+        # scripts/verify_router_tools_live.py's dry-run harness already
+        # uses rather than adding collision-toggle state here that every
+        # other test would have to know to reset.
+        return HeadObstacle(found=False, net="", kind="", x=0, y=0)
+
     def get_design_rules(self) -> DesignRules:
         return self._design_rules
 
@@ -343,6 +355,7 @@ def install() -> None:
     module.HeadSegment = HeadSegment
     module.HeadVia = HeadVia
     module.HeadGeometry = HeadGeometry
+    module.HeadObstacle = HeadObstacle
     module.DesignRules = DesignRules
     module.MODE_ROUTE_SINGLE = 1
     module.MODE_ROUTE_DIFF_PAIR = 2

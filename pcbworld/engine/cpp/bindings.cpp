@@ -112,6 +112,13 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
         .def_readonly( "layer", &PNS_BRIDGE::HeadGeometry::layer )
         .def_readonly( "length", &PNS_BRIDGE::HeadGeometry::length );
 
+    py::class_<PNS_BRIDGE::HeadObstacle>( m, "HeadObstacle" )
+        .def_readonly( "found", &PNS_BRIDGE::HeadObstacle::found )
+        .def_readonly( "net", &PNS_BRIDGE::HeadObstacle::net )
+        .def_readonly( "kind", &PNS_BRIDGE::HeadObstacle::kind )
+        .def_readonly( "x", &PNS_BRIDGE::HeadObstacle::x )
+        .def_readonly( "y", &PNS_BRIDGE::HeadObstacle::y );
+
     py::class_<PNS_BRIDGE::DesignRules>( m, "DesignRules" )
         .def_readonly( "track_width", &PNS_BRIDGE::DesignRules::trackWidth )
         .def_readonly( "via_diameter", &PNS_BRIDGE::DesignRules::viaDiameter )
@@ -143,6 +150,7 @@ PYBIND11_MODULE( pcbworld_pns_bridge, m )
         .def( "get_board_geometry", &PNS_BRIDGE::GetBoardGeometry )
         .def( "get_head_geometry", &PNS_BRIDGE::GetHeadGeometry )
         .def( "head_collides", &PNS_BRIDGE::HeadCollides )
+        .def( "get_head_obstacle", &PNS_BRIDGE::GetHeadObstacle )
         .def( "get_design_rules", &PNS_BRIDGE::GetDesignRules )
         .def( "rip_up", &PNS_BRIDGE::RipUp, py::arg( "net" ) )
         .def( "set_mode", &PNS_BRIDGE::SetMode )
