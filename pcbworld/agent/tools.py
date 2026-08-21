@@ -420,6 +420,104 @@ class RouterTools:
             warnings=warnings,
         )
 
+    def place_via(self) -> ToolResult:
+        """Toggles via placement at the current head position to change copper layers."""
+        if self._active_net is None:
+            return ToolResult(
+                ok=False,
+                error_code=ErrorCode.NO_ROUTE_IN_PROGRESS,
+                message="no route in progress. Call start_route(net) first.",
+            )
+
+        rule_err = self._validate_via_rules()
+        if rule_err is not None:
+            return rule_err
+
+        if not hasattr(self.bridge, "toggle_via_placement"):
+            return ToolResult(
+                ok=False,
+                error_code=ErrorCode.ROUTER_REJECTED,
+                message="this bridge build has no toggle_via_placement() support.",
+            )
+
+        self.bridge.toggle_via_placement()
+
+        head_after = self._head_position_mm()
+        current_layer = 0
+        if self.has_head_readback:
+            head = self.bridge.get_head_geometry()
+            if head.active:
+                current_layer = head.layer
+
+        warnings = []
+        if self.has_collision_readback and self.bridge.head_collides():
+            warnings.append(
+                "the head is currently colliding with something after placing via."
+            )
+
+        return ToolResult(
+            ok=True,
+            message=f"placed via at ({head_after[0]:.3f}, {head_after[1]:.3f}), now on layer {current_layer}",
+            data={
+                "head_mm": head_after,
+                "layer": current_layer,
+                "distance_to_target_mm": self._distance_to_target_mm(),
+            },
+            warnings=warnings,
+        )
+
+    def switch_to_layer(self, layer: int) -> ToolResult:
+        """Switches the active routing layer to 0 (F_Cu) or 1 (B_Cu), placing a via."""
+        if self._active_net is None:
+            return ToolResult(
+                ok=False,
+                error_code=ErrorCode.NO_ROUTE_IN_PROGRESS,
+                message="no route in progress. Call start_route(net) first.",
+            )
+
+        if not isinstance(layer, int) or isinstance(layer, bool) or layer not in (0, 1):
+            return ToolResult(
+                ok=False,
+                error_code=ErrorCode.OUT_OF_BOUNDS,
+                message=f"layer must be 0 (F_Cu) or 1 (B_Cu), got {layer!r}.",
+            )
+
+        rule_err = self._validate_via_rules()
+        if rule_err is not None:
+            return rule_err
+
+        if not hasattr(self.bridge, "switch_layer"):
+            return ToolResult(
+                ok=False,
+                error_code=ErrorCode.ROUTER_REJECTED,
+                message="this bridge build has no switch_layer() support.",
+            )
+
+        accepted = self.bridge.switch_layer(layer)
+        if accepted is False:
+            return ToolResult(
+                ok=False,
+                error_code=ErrorCode.ROUTER_REJECTED,
+                message=f"the router refused to switch to layer {layer}.",
+                data={"head_mm": self._head_position_mm()},
+            )
+
+        head_after = self._head_position_mm()
+        warnings = []
+        if self.has_collision_readback and self.bridge.head_collides():
+            warnings.append("the head is currently colliding with something.")
+
+        return ToolResult(
+            ok=True,
+            message=f"switched to layer {layer}",
+            data={
+                "head_mm": head_after,
+                "layer": layer,
+                "distance_to_target_mm": self._distance_to_target_mm(),
+            },
+            warnings=warnings,
+        )
+
     def finish_route(self) -> ToolResult:
         """Attempts to land the route on its target pad and commit it."""
         if self._active_net is None:
@@ -428,6 +526,23 @@ class RouterTools:
                 error_code=ErrorCode.NO_ROUTE_IN_PROGRESS,
                 message="no route in progress. Call start_route(net) first.",
             )
+
+        if self.has_head_readback:
+            head = self.bridge.get_head_geometry()
+            if head.active and head.layer != 0:
+                return ToolResult(
+                    ok=False,
+                    error_code=ErrorCode.ROUTER_REJECTED,
+                    message=(
+                        f"route head is on layer {head.layer} (B_Cu), but SMD pads are on "
+                        f"layer 0 (F_Cu). Switch back to layer 0 with switch_to_layer(0) "
+                        f"before finishing."
+                    ),
+                    data={
+                        "head_mm": self._head_position_mm(),
+                        "layer": head.layer,
+                    },
+                )
 
         net = self._active_net
         target = self._target_xy_nm
@@ -567,6 +682,42 @@ class RouterTools:
             return None
         return self.bridge.get_design_rules()
 
+    def _validate_via_rules(self) -> ToolResult | None:
+        rules = self._design_rules()
+        if rules is None:
+            return None
+        if hasattr(rules, "min_via_diameter") and hasattr(rules, "via_diameter"):
+            if rules.via_diameter < rules.min_via_diameter:
+                return ToolResult(
+                    ok=False,
+                    error_code=ErrorCode.VIOLATES_DESIGN_RULE,
+                    message=(
+                        f"configured via diameter ({_mm(rules.via_diameter):.3f}mm) is "
+                        f"below board minimum ({_mm(rules.min_via_diameter):.3f}mm). "
+                        f"Check get_board_info()."
+                    ),
+                    data={
+                        "via_diameter_mm": _mm(rules.via_diameter),
+                        "min_via_diameter_mm": _mm(rules.min_via_diameter),
+                    },
+                )
+        if hasattr(rules, "min_via_drill") and hasattr(rules, "via_drill"):
+            if rules.via_drill < rules.min_via_drill:
+                return ToolResult(
+                    ok=False,
+                    error_code=ErrorCode.VIOLATES_DESIGN_RULE,
+                    message=(
+                        f"configured via drill ({_mm(rules.via_drill):.3f}mm) is "
+                        f"below board minimum ({_mm(rules.min_via_drill):.3f}mm). "
+                        f"Check get_board_info()."
+                    ),
+                    data={
+                        "via_drill_mm": _mm(rules.via_drill),
+                        "min_via_drill_mm": _mm(rules.min_via_drill),
+                    },
+                )
+        return None
+
     def _clear_route(self) -> None:
         self._active_net = None
         self._target_xy_nm = None
@@ -641,3 +792,151 @@ class RouterTools:
             )
 
         return None
+
+
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_board_info",
+            "description": "Returns board dimensions and design rules (track width, via sizes, clearance limits in mm).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_nets",
+            "description": "Lists all nets on the board, their pad coordinates (in mm), and routing status.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_route",
+            "description": "Opens a routing session for a given net, starting at its first pad.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "net": {
+                        "type": "string",
+                        "description": "The exact name of the net to route.",
+                    }
+                },
+                "required": ["net"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "route_to",
+            "description": "Moves the active routing head toward (x_mm, y_mm) on the board.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x_mm": {
+                        "type": "number",
+                        "description": "Target X coordinate in millimetres.",
+                    },
+                    "y_mm": {
+                        "type": "number",
+                        "description": "Target Y coordinate in millimetres.",
+                    },
+                },
+                "required": ["x_mm", "y_mm"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "place_via",
+            "description": "Places a via at the current head position to toggle between layer 0 (F_Cu) and layer 1 (B_Cu).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "switch_to_layer",
+            "description": "Switches the active routing layer (0 for F_Cu, 1 for B_Cu), placing a via at current position.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "layer": {
+                        "type": "integer",
+                        "description": "Layer index: 0 for F_Cu (top), 1 for B_Cu (bottom).",
+                    }
+                },
+                "required": ["layer"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish_route",
+            "description": "Connects the routing head to the target pad and commits the route. Head must be on layer 0 (F_Cu).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "abandon_route",
+            "description": "Drops the in-progress route without committing it.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rip_up",
+            "description": "Removes all copper traces and vias for a previously routed net.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "net": {
+                        "type": "string",
+                        "description": "The exact name of the net to rip up.",
+                    }
+                },
+                "required": ["net"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_drc",
+            "description": "Runs Design Rule Checking across the board and returns all clearance/connectivity violations.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+]
