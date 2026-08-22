@@ -41,7 +41,8 @@ def generate_curriculum_dataset(base_dir: str, num_boards_per_stage: int = 20):
             "--num-diff-pairs", "0",
             "--num-length-matched-groups", "0",
             "--seed", str(1000 + i),
-            "--board-size-mm", "35", "35",
+            "--width-mm", "35",
+            "--height-mm", "35",
             "--pad-type", "smd",
         ]
         subprocess.run(cmd, check=True)
@@ -58,7 +59,8 @@ def generate_curriculum_dataset(base_dir: str, num_boards_per_stage: int = 20):
             "--num-diff-pairs", "0",
             "--num-length-matched-groups", "0",
             "--seed", str(2000 + i),
-            "--board-size-mm", "35", "35",
+            "--width-mm", "35",
+            "--height-mm", "35",
             "--pad-type", "smd",
         ]
         subprocess.run(cmd, check=True)
@@ -75,10 +77,12 @@ def generate_curriculum_dataset(base_dir: str, num_boards_per_stage: int = 20):
             "--num-length-matched-groups", "2",
             "--length-matched-group-size", "2",
             "--seed", str(3000 + i),
-            "--board-size-mm", "35", "35",
+            "--width-mm", "35",
+            "--height-mm", "35",
             "--pad-type", "smd",
         ]
         subprocess.run(cmd, check=True)
+
 
     print(f"Successfully generated 3-stage curriculum dataset in {base_dir}!")
 
