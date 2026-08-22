@@ -371,5 +371,25 @@ def test_diff_pair_support():
     assert "diffpair_0_N" in info["completed"]
 
 
+def test_length_matched_group_support():
+    len_nets = [
+        fake_bridge.NetPad("lengthgrp_0_0", "J1:1", 0, 0, -1),
+        fake_bridge.NetPad("lengthgrp_0_0", "J2:1", 20 * fake_bridge.MM, 0, -1),
+        fake_bridge.NetPad("lengthgrp_0_1", "J3:1", 0, 5 * fake_bridge.MM, -1),
+        fake_bridge.NetPad("lengthgrp_0_1", "J4:1", 10 * fake_bridge.MM, 5 * fake_bridge.MM, -1),
+    ]
+    env = _make_env(nets=len_nets, step_size_nm=20 * fake_bridge.MM)
+    obs, info = env.reset()
+    assert env._nets == ["lengthgrp_0_0", "lengthgrp_0_1"]
+    # Route member 0 (the reference)
+    obs, reward, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
+    assert "lengthgrp_0_0" in info["completed"]
+    assert "0" in env._length_group_refs
+
+    # Member 1 should now observe length slack from the reference
+    assert obs[7] > 0.0  # length_slack is reported in the 8th global feature
+
+
+
 
 

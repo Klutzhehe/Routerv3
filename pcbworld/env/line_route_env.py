@@ -99,6 +99,8 @@ class RewardWeights:
     detour: float = 2.0         # per unit of (routed / straight-line - 1)
     drc: float = 0.0            # per violation, once per episode; 0 = off
     ripup: float = 1.0          # penalty charged per ripped-up net
+    length_mismatch: float = 1.0 # penalty per unit length discrepancy on length-matched groups
+
 
 
 
@@ -208,24 +210,30 @@ class LineRouteEnv(gym.Env):
         usable = {
             n: p
             for n, p in two_pad.items()
-            if len(p) == 2 and (n.startswith("net_") or (n.startswith("diffpair_") and n.endswith("_P")))
+            if len(p) == 2 and (
+                n.startswith("net_")
+                or (n.startswith("diffpair_") and n.endswith("_P"))
+                or n.startswith("lengthgrp_")
+            )
         }
-
 
         if self.net_order is not None:
             ordered = [n for n in self.net_order if n in usable]
         else:
-            # Shortest-first. Net ordering is deliberately a heuristic, not a
-            # learned decision (docs/RL_PLAN.md): it removes a combinatorial
-            # dimension the policy would otherwise have to explore, and is
-            # revisited only if a stage plateaus.
-            def span(name: str) -> float:
+            # Group ordering: ensure lengthgrp_<g>_0 routes before member 1, 2...
+            # Within plain/diffpair nets, sort shortest-first.
+            def sort_key(name: str) -> tuple[int, float]:
+                if name.startswith("lengthgrp_"):
+                    parts = name.split("_")
+                    g, m = int(parts[1]), int(parts[2])
+                    return (1000 + g, float(m))
                 a, b = usable[name]
-                return math.hypot(a.x - b.x, a.y - b.y)
+                return (0, math.hypot(a.x - b.x, a.y - b.y))
 
-            ordered = sorted(usable, key=span)
+            ordered = sorted(usable, key=sort_key)
 
         return ordered[: self.max_nets] if self.max_nets else ordered
+
 
     def _refresh_static_segments(self) -> None:
         """Committed copper, board outline, and pad geometry. Called once per
@@ -275,6 +283,8 @@ class LineRouteEnv(gym.Env):
         self._ripup_count = 0
         self._blocking_nets = set()
         self._ripups_performed = []
+        self._length_group_refs: dict[str, float] = {}
+        self._target_ref_length = 0.0
 
         self._refresh_static_segments()
         self._begin_net()
@@ -294,13 +304,21 @@ class LineRouteEnv(gym.Env):
         self._steps = 0
         self._collides = False
         self._blocking_nets = set()
+        self._target_ref_length = 0.0
 
         if net.startswith("diffpair_"):
             self.bridge.set_mode(self._module.MODE_ROUTE_DIFF_PAIR)
             self.bridge.set_diff_pair_gap(150_000)
             self.bridge.set_diff_pair_width(200_000)
+        elif net.startswith("lengthgrp_"):
+            self.bridge.set_mode(self._module.MODE_ROUTE_SINGLE)
+            parts = net.split("_")
+            group_idx, member_idx = parts[1], int(parts[2])
+            if member_idx > 0:
+                self._target_ref_length = self._length_group_refs.get(group_idx, 0.0)
         else:
             self.bridge.set_mode(self._module.MODE_ROUTE_SINGLE)
+
 
         start_id = self._pad_candidate(int(a.x), int(a.y))
         self._route_active = bool(
@@ -415,6 +433,11 @@ class LineRouteEnv(gym.Env):
             self._completed.append(net)
             if net.startswith("diffpair_") and net.endswith("_P"):
                 self._completed.append(net[:-2] + "_N")
+            elif net.startswith("lengthgrp_"):
+                parts = net.split("_")
+                group_idx, member_idx = parts[1], int(parts[2])
+                if member_idx == 0:
+                    self._length_group_refs[group_idx] = self._routed_len
         else:
             self.bridge.stop_routing()
             self._failed.append(net)
@@ -484,6 +507,11 @@ class LineRouteEnv(gym.Env):
     def _observe(self) -> np.ndarray:
         if self._net_index >= len(self._nets):
             return np.zeros(self.obs_config.flat_size, dtype=np.float32)
+
+        length_slack = 0.0
+        if self._target_ref_length > 0:
+            length_slack = max(0.0, self._target_ref_length - self._routed_len)
+
         return build_observation(
             self._obstacles,
             head=self._pos,
@@ -496,7 +524,9 @@ class LineRouteEnv(gym.Env):
             straight_line_length=self._straight_len,
             head_collides=self._collides,
             config=self.obs_config,
+            length_slack=length_slack,
         )
+
 
     def _info(self) -> dict:
         return {
