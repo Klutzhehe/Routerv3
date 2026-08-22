@@ -327,3 +327,30 @@ def test_board_pool_support():
     obs, info = env.reset()
     assert env.observation_space.contains(obs)
 
+
+def test_ripup_and_reroute_flow():
+    # Two nets: net_1 routes first and commits. When net_0 routes, we inject a collision with net_1.
+    env = _make_env(enable_ripup=True, max_ripups_per_episode=2, max_steps_per_net=3, step_size_nm=1)
+    env.reset()
+    # Route net_1 to completion
+    env._completed.append("net_1")
+    env._net_index = 0
+    env._nets = ["net_0", "net_1"]
+    env._begin_net()
+
+    # Simulate collision with net_1
+    env.bridge.head_collides = lambda: True
+    env.bridge.get_head_obstacle = lambda: fake_bridge.HeadObstacle(found=True, net="net_1", kind="segment", x=0, y=0)
+
+
+    # Take steps until timeout triggers rip-up
+    for _ in range(3):
+        env.step(np.array([0.0], dtype=np.float32))
+
+    # net_1 should have been ripped up and re-queued
+    assert env._ripup_count == 1
+    assert "net_1" in env._ripups_performed
+    assert "net_1" not in env._completed
+    assert env._nets.count("net_1") >= 1
+
+

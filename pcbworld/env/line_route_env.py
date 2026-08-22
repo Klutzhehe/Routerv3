@@ -98,6 +98,8 @@ class RewardWeights:
     net_failed: float = 5.0
     detour: float = 2.0         # per unit of (routed / straight-line - 1)
     drc: float = 0.0            # per violation, once per episode; 0 = off
+    ripup: float = 1.0          # penalty charged per ripped-up net
+
 
 
 class LineRouteEnv(gym.Env):
@@ -117,6 +119,8 @@ class LineRouteEnv(gym.Env):
         max_steps_per_net: int = 80,
         gamma: float = 0.99,
         run_drc_at_episode_end: bool = False,
+        enable_ripup: bool = False,
+        max_ripups_per_episode: int = 8,
     ) -> None:
         super().__init__()
 
@@ -146,6 +150,9 @@ class LineRouteEnv(gym.Env):
         self.max_steps_per_net = max_steps_per_net
         self.gamma = gamma
         self.run_drc_at_episode_end = run_drc_at_episode_end
+        self.enable_ripup = enable_ripup
+        self.max_ripups_per_episode = max_ripups_per_episode
+
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
         self.observation_space = spaces.Box(
@@ -156,6 +163,9 @@ class LineRouteEnv(gym.Env):
         self._pads: list = []
         self._nets: list[str] = []
         self._net_index = 0
+        self._ripup_count = 0
+        self._blocking_nets: set[str] = set()
+        self._ripups_performed: list[str] = []
         self._static_segments: list = []   # refreshed once per net, not per step
         self._pad_geoms: list = []         # PadGeom, refreshed alongside
         self._obstacles: list = []         # per-net obstacle set, not per-step
@@ -257,6 +267,9 @@ class LineRouteEnv(gym.Env):
         assert self._nets, "no routable two-pad 'net_*' nets on this board"
         self._net_index = 0
         self._completed, self._failed = [], []
+        self._ripup_count = 0
+        self._blocking_nets = set()
+        self._ripups_performed = []
 
         self._refresh_static_segments()
         self._begin_net()
@@ -275,6 +288,7 @@ class LineRouteEnv(gym.Env):
         self._routed_len = 0.0
         self._steps = 0
         self._collides = False
+        self._blocking_nets = set()
 
         start_id = self._pad_candidate(int(a.x), int(a.y))
         self._route_active = bool(
@@ -312,6 +326,11 @@ class LineRouteEnv(gym.Env):
         self._collides = bool(self.bridge.head_collides())
         self._steps += 1
 
+        if self._collides and hasattr(self.bridge, "get_head_obstacle"):
+            obs_item = self.bridge.get_head_obstacle()
+            if getattr(obs_item, "found", False) and obs_item.net and (obs_item.net in self._completed):
+                self._blocking_nets.add(obs_item.net)
+
         dist = math.hypot(self._target_xy[0] - self._pos[0], self._target_xy[1] - self._pos[1])
         reward = self._shaping(prev_dist, dist) - self.weights.step
         if self._collides:
@@ -322,9 +341,27 @@ class LineRouteEnv(gym.Env):
             net_done = self._try_finish()
             reward += self.weights.net_done if net_done else 0.0
         if not net_done and self._steps >= self.max_steps_per_net:
-            self._abandon()
-            reward -= self.weights.net_failed
-            net_done = True
+            # Check if rip-up can clear a blocking trace
+            if self.enable_ripup and (self._ripup_count < self.max_ripups_per_episode) and self._blocking_nets:
+                victim_net = sorted(self._blocking_nets)[-1]
+                self._blocking_nets.remove(victim_net)
+                self.bridge.stop_routing()
+                self.bridge.rip_up(victim_net)
+                if victim_net in self._completed:
+                    self._completed.remove(victim_net)
+                # Re-queue victim net to be routed later
+                self._nets.append(victim_net)
+                self._ripup_count += 1
+                self._ripups_performed.append(victim_net)
+                reward -= self.weights.ripup
+                # Retry current net on cleared board
+                self._refresh_static_segments()
+                self._begin_net()
+                net_done = False
+            else:
+                self._abandon()
+                reward -= self.weights.net_failed
+                net_done = True
 
         if net_done:
             reward -= self.weights.detour * max(0.0, self._routed_len / self._straight_len - 1.0)
@@ -442,7 +479,10 @@ class LineRouteEnv(gym.Env):
             "steps": self._steps,
             "collides": self._collides,
             "routed_length_nm": self._routed_len,
+            "ripup_count": self._ripup_count,
+            "ripups_performed": list(self._ripups_performed),
         }
+
 
     def close(self):
         if self._route_active:

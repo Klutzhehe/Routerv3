@@ -366,6 +366,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=5_000)
+    parser.add_argument("--enable-ripup", action="store_true", help="Enable rip-up and reroute for conflicting traces")
+    parser.add_argument("--max-ripups", type=int, default=8, help="Max rip-up operations per episode")
     parser.add_argument("--use-legacy-env", action="store_true", help="Use PCBRouteEnv instead of LineRouteEnv")
     args = parser.parse_args()
 
@@ -374,7 +376,12 @@ def main() -> None:
         env = PCBRouteEnv(args.board_path)
     else:
         from pcbworld.env.line_route_env import LineRouteEnv
-        env = LineRouteEnv(args.board_path)
+        env = LineRouteEnv(
+            args.board_path,
+            enable_ripup=args.enable_ripup,
+            max_ripups_per_episode=args.max_ripups,
+        )
+
 
     cfg = PPOConfig(
         total_timesteps=args.total_timesteps,
