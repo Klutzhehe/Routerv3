@@ -205,7 +205,12 @@ class LineRouteEnv(gym.Env):
         for pad in self._pads:
             if pad.net:
                 two_pad.setdefault(pad.net, []).append(pad)
-        usable = {n: p for n, p in two_pad.items() if len(p) == 2 and n.startswith("net_")}
+        usable = {
+            n: p
+            for n, p in two_pad.items()
+            if len(p) == 2 and (n.startswith("net_") or (n.startswith("diffpair_") and n.endswith("_P")))
+        }
+
 
         if self.net_order is not None:
             ordered = [n for n in self.net_order if n in usable]
@@ -290,11 +295,19 @@ class LineRouteEnv(gym.Env):
         self._collides = False
         self._blocking_nets = set()
 
+        if net.startswith("diffpair_"):
+            self.bridge.set_mode(self._module.MODE_ROUTE_DIFF_PAIR)
+            self.bridge.set_diff_pair_gap(150_000)
+            self.bridge.set_diff_pair_width(200_000)
+        else:
+            self.bridge.set_mode(self._module.MODE_ROUTE_SINGLE)
+
         start_id = self._pad_candidate(int(a.x), int(a.y))
         self._route_active = bool(
             self.bridge.start_route(int(a.x), int(a.y), start_id, 0)
         )
         self._rebuild_obstacles()
+
 
     def step(self, action):
         turn = float(np.clip(np.asarray(action).reshape(-1)[0], -1.0, 1.0)) * MAX_TURN_RAD
@@ -400,15 +413,22 @@ class LineRouteEnv(gym.Env):
         if ok:
             self.bridge.commit_routing()
             self._completed.append(net)
+            if net.startswith("diffpair_") and net.endswith("_P"):
+                self._completed.append(net[:-2] + "_N")
         else:
             self.bridge.stop_routing()
             self._failed.append(net)
+            if net.startswith("diffpair_") and net.endswith("_P"):
+                self._failed.append(net[:-2] + "_N")
         self._route_active = False
         return ok
 
     def _abandon(self) -> None:
+        net = self._nets[self._net_index]
         self.bridge.stop_routing()
-        self._failed.append(self._nets[self._net_index])
+        self._failed.append(net)
+        if net.startswith("diffpair_") and net.endswith("_P"):
+            self._failed.append(net[:-2] + "_N")
         self._route_active = False
 
     def _episode_end_penalty(self) -> float:
@@ -435,10 +455,13 @@ class LineRouteEnv(gym.Env):
         segments = list(self._static_segments)
 
         # A pad is an obstacle unless it belongs to the net being routed, in
-        # which case it is an endpoint. board_segments() cannot make that call
-        # itself -- it has no idea which net is active -- so it is made here.
+        # which case it is an endpoint. For diff pairs, both P and N pads are endpoints.
+        own_nets = {net}
+        if net.startswith("diffpair_") and net.endswith("_P"):
+            own_nets.add(net[:-2] + "_N")
+
         for pad in self._pad_geoms:
-            if pad.net != net:
+            if pad.net not in own_nets:
                 segments.append(pad_to_segment(pad, kind=KIND_PAD))
 
         # Nets not yet routed enter as the straight lines they will have to
@@ -449,8 +472,14 @@ class LineRouteEnv(gym.Env):
                 continue
             a, b = [p for p in self._pads if p.net == future]
             segments.append(ghost_segment((a.x, a.y), (b.x, b.y), future))
+            if future.startswith("diffpair_") and future.endswith("_P"):
+                n_leg = future[:-2] + "_N"
+                n_pads = [p for p in self._pads if p.net == n_leg]
+                if len(n_pads) == 2:
+                    segments.append(ghost_segment((n_pads[0].x, n_pads[0].y), (n_pads[1].x, n_pads[1].y), n_leg))
 
         return segments
+
 
     def _observe(self) -> np.ndarray:
         if self._net_index >= len(self._nets):

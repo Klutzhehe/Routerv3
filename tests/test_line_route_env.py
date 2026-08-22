@@ -354,3 +354,22 @@ def test_ripup_and_reroute_flow():
     assert env._nets.count("net_1") >= 1
 
 
+def test_diff_pair_support():
+    diff_nets = [
+        fake_bridge.NetPad("diffpair_0_P", "J1:1", 0, 0, -1),
+        fake_bridge.NetPad("diffpair_0_P", "J2:1", 20 * fake_bridge.MM, 0, -1),
+        fake_bridge.NetPad("diffpair_0_N", "J1:2", 0, 1 * fake_bridge.MM, -1),
+        fake_bridge.NetPad("diffpair_0_N", "J2:2", 20 * fake_bridge.MM, 1 * fake_bridge.MM, -1),
+    ]
+    env = _make_env(nets=diff_nets, step_size_nm=20 * fake_bridge.MM)
+    obs, info = env.reset()
+    assert env._nets == ["diffpair_0_P"]
+    assert env.bridge._mode == 2  # MODE_ROUTE_DIFF_PAIR
+    # Take a step and finish
+    obs, reward, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
+    assert "diffpair_0_P" in info["completed"]
+    assert "diffpair_0_N" in info["completed"]
+
+
+
+
