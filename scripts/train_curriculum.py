@@ -86,6 +86,7 @@ def train_curriculum_live(
     checkpoint_dir: str = "/content/drive/MyDrive/routerv3_curriculum",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     boards_per_stage: int = 25,
+    stage_limit: int | None = None,
 ):
     dataset_path = Path(dataset_dir)
     stage1_dir = dataset_path / "stage1_basics"
@@ -100,25 +101,28 @@ def train_curriculum_live(
         {
             "name": "Stage 1: Basics (2-4 Nets, Single Obstacles)",
             "board_dir": str(stage1_dir),
-            "timesteps": 30_000,
+            "timesteps": 80_000,
             "enable_ripup": False,
             "max_ripups": 0,
         },
         {
             "name": "Stage 2: Corridors (5-8 Nets, Crossing Traffic)",
             "board_dir": str(stage2_dir),
-            "timesteps": 50_000,
+            "timesteps": 60_000,
             "enable_ripup": False,
             "max_ripups": 0,
         },
         {
             "name": "Stage 3: Full Production (Mixed Signals & Rip-Up)",
             "board_dir": str(stage3_dir),
-            "timesteps": 80_000,
+            "timesteps": 100_000,
             "enable_ripup": True,
             "max_ripups": 6,
         },
     ]
+
+    if stage_limit is not None:
+        stages = stages[:stage_limit]
 
     total_curriculum_steps = sum(s["timesteps"] for s in stages)
     print(f"Starting Curriculum Training on device: {device.upper()} (Total Steps: {total_curriculum_steps:,})")
@@ -152,10 +156,11 @@ def train_curriculum_live(
             board_dir,
             step_size_nm=500_000,
             snap_radius_nm=400_000,
-            max_steps_per_net=100,
+            max_steps_per_net=120,
             enable_ripup=stage_info["enable_ripup"],
             max_ripups_per_episode=stage_info["max_ripups"],
         )
+
 
         obs_dim = int(np.prod(env.observation_space.shape))
         action_dim = int(np.prod(env.action_space.shape))
