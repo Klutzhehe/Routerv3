@@ -1,37 +1,28 @@
-"""Minimal single-process PPO baseline for PCBRouteEnv.
+"""PPO baseline trainer for PCBRouteEnv and LineRouteEnv.
 
-Deliberately small and dependency-light (plain PyTorch, no RL framework)
-rather than matching the PCBWorld paper's exact network (their Fourier-
-feature-encoded Transformer policy) -- this is meant as the "does the
-plumbing work at all" sanity check ROADMAP.md's step 5 asks for before any
-of the deferred "novel SOTA agent" directions (rip-up-reroute, graph-
-transformer policy, net-ordering meta-policy) get attempted on top of it.
-
-Only ever runs against pcbworld.env.pcb_route_env.PCBRouteEnv, which needs
-the Colab-built pcbworld_pns_bridge -- this file's control flow (rollout
-collection, GAE, the clipped-surrogate update) is exercised locally against
-a fake env in tests/test_ppo_baseline.py, but the actual routing reward
-signal has never been observed end to end. Treat a first training run's
-numbers as "does this crash and produce finite losses", not "is this a
-good policy" -- matching against the paper's own numbers is future work
-once this at least runs.
-
-Single environment, single process -- see docs/performance.md for why
-real training throughput needs multiple OS-process env workers
-(gymnasium.vector.AsyncVectorEnv or similar); not implemented here since
-this is the "does the loop work" baseline, not the throughput-tuned
-trainer.
+Supports:
+  - Standard MLP ActorCritic (for flat raster/scalar envs)
+  - LineActorCritic (for line-geometry observation with segment pooling)
+  - Observation normalization for the 8 global features via RunningMeanStd
+  - Checkpoint saving to local / Google Drive path
+  - Tracking of net completion rates alongside episode rewards
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
+import os
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
+
+from pcbworld.agents.line_policy import LineActorCritic, RunningMeanStd
+from pcbworld.env.line_obs import NUM_GLOBAL, NUM_SEGMENT_FEATURES
 
 
 @dataclasses.dataclass
@@ -49,9 +40,14 @@ class PPOConfig:
     max_grad_norm: float = 0.5
     hidden_size: int = 64
     device: str = "cpu"
+    checkpoint_interval: int = 5_000
+    checkpoint_dir: str | None = None
+    normalize_globals: bool = True
 
 
 class ActorCritic(nn.Module):
+    """Standard MLP Actor-Critic fallback for flat vector observations."""
+
     def __init__(self, obs_dim: int, action_dim: int, hidden_size: int = 64):
         super().__init__()
 
@@ -130,13 +126,35 @@ def compute_gae(
     return advantages, returns
 
 
-def collect_rollout(env, policy: ActorCritic, obs, n_steps: int, device: str):
+def _preprocess_obs(obs: np.ndarray, rms: RunningMeanStd | None) -> np.ndarray:
+    if rms is None:
+        return obs
+    norm_obs = obs.copy()
+    norm_obs[:NUM_GLOBAL] = rms.normalize(obs[:NUM_GLOBAL])
+    return norm_obs
+
+
+def collect_rollout(
+    env,
+    policy: nn.Module,
+    obs: np.ndarray,
+    n_steps: int,
+    device: str,
+    rms: RunningMeanStd | None = None,
+):
     buffer = RolloutBuffer.empty()
     episode_rewards = []
     current_episode_reward = 0.0
+    completed_nets = 0
+    failed_nets = 0
 
     for _ in range(n_steps):
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        # Update running mean/std on the raw 8 global features
+        if rms is not None:
+            rms.update(obs[:NUM_GLOBAL])
+
+        processed_obs = _preprocess_obs(obs, rms)
+        obs_t = torch.as_tensor(processed_obs, dtype=torch.float32, device=device).unsqueeze(0)
 
         with torch.no_grad():
             action_t, log_prob_t, value_t = policy.act(obs_t)
@@ -144,11 +162,11 @@ def collect_rollout(env, policy: ActorCritic, obs, n_steps: int, device: str):
         action = action_t.squeeze(0).cpu().numpy()
         clipped_action = np.clip(action, env.action_space.low, env.action_space.high)
 
-        next_obs, reward, terminated, truncated, _info = env.step(clipped_action)
+        next_obs, reward, terminated, truncated, info = env.step(clipped_action)
         done = terminated or truncated
 
         buffer.add(
-            obs,
+            processed_obs,
             action,
             log_prob_t.item(),
             reward,
@@ -162,17 +180,32 @@ def collect_rollout(env, policy: ActorCritic, obs, n_steps: int, device: str):
         if done:
             episode_rewards.append(current_episode_reward)
             current_episode_reward = 0.0
+            if "completed" in info and "failed" in info:
+                completed_nets += len(info["completed"])
+                failed_nets += len(info["failed"])
             obs, _info = env.reset()
 
+    processed_last_obs = _preprocess_obs(obs, rms)
     with torch.no_grad():
         last_value = policy.act(
-            torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            torch.as_tensor(processed_last_obs, dtype=torch.float32, device=device).unsqueeze(0)
         )[2].item()
 
-    return buffer, obs, last_value, episode_rewards
+    rollout_info = {
+        "episode_rewards": episode_rewards,
+        "completed_nets": completed_nets,
+        "failed_nets": failed_nets,
+    }
+    return buffer, obs, last_value, rollout_info
 
 
-def ppo_update(policy: ActorCritic, optimizer, buffer: RolloutBuffer, last_value: float, cfg: PPOConfig) -> dict:
+def ppo_update(
+    policy: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    buffer: RolloutBuffer,
+    last_value: float,
+    cfg: PPOConfig,
+) -> dict:
     obs = torch.as_tensor(np.asarray(buffer.obs), dtype=torch.float32, device=cfg.device)
     actions = torch.as_tensor(np.asarray(buffer.actions), dtype=torch.float32, device=cfg.device)
     old_log_probs = torch.as_tensor(np.asarray(buffer.log_probs), dtype=torch.float32, device=cfg.device)
@@ -232,33 +265,93 @@ def ppo_update(policy: ActorCritic, optimizer, buffer: RolloutBuffer, last_value
     return last_stats
 
 
-def train(env, cfg: PPOConfig | None = None) -> ActorCritic:
+def save_checkpoint(
+    checkpoint_dir: str | Path,
+    steps_done: int,
+    policy: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    rms: RunningMeanStd | None,
+    cfg: PPOConfig,
+    stats: dict,
+) -> None:
+    path = Path(checkpoint_dir)
+    path.mkdir(parents=True, exist_ok=True)
+
+    state = {
+        "steps_done": steps_done,
+        "policy_state_dict": policy.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "rms_mean": rms.mean if rms is not None else None,
+        "rms_var": rms.var if rms is not None else None,
+        "rms_count": rms.count if rms is not None else None,
+        "config": dataclasses.asdict(cfg),
+        "last_stats": stats,
+    }
+
+    torch.save(state, path / "policy_latest.pt")
+    torch.save(state, path / f"policy_{steps_done}.pt")
+
+    stats_file = path / "training_stats.jsonl"
+    with open(stats_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"steps": steps_done, **stats}) + "\n")
+
+
+def train(env, cfg: PPOConfig | None = None) -> nn.Module:
     cfg = cfg or PPOConfig()
 
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
 
-    policy = ActorCritic(obs_dim, action_dim, cfg.hidden_size).to(cfg.device)
+    # Detect if observation matches LineRouteEnv (globals + K * 12 features)
+    is_line_obs = (obs_dim >= NUM_GLOBAL) and ((obs_dim - NUM_GLOBAL) % NUM_SEGMENT_FEATURES == 0)
+
+    if is_line_obs:
+        policy = LineActorCritic(action_dim=action_dim).to(cfg.device)
+        rms = RunningMeanStd(shape=(NUM_GLOBAL,)) if cfg.normalize_globals else None
+    else:
+        policy = ActorCritic(obs_dim, action_dim, cfg.hidden_size).to(cfg.device)
+        rms = None
+
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
 
     obs, _info = env.reset()
     steps_done = 0
+    last_checkpoint_step = 0
 
     while steps_done < cfg.total_timesteps:
-        buffer, obs, last_value, episode_rewards = collect_rollout(
-            env, policy, obs, cfg.rollout_steps, cfg.device
+        buffer, obs, last_value, rollout_info = collect_rollout(
+            env, policy, obs, cfg.rollout_steps, cfg.device, rms=rms
         )
         stats = ppo_update(policy, optimizer, buffer, last_value, cfg)
         steps_done += cfg.rollout_steps
 
-        mean_reward = float(np.mean(episode_rewards)) if episode_rewards else float("nan")
+        episodes = rollout_info["episode_rewards"]
+        mean_reward = float(np.mean(episodes)) if episodes else float("nan")
+        comp = rollout_info["completed_nets"]
+        failed = rollout_info["failed_nets"]
+        comp_rate = (comp / (comp + failed) * 100.0) if (comp + failed) > 0 else float("nan")
+
+        comp_str = f"completion_rate={comp_rate:.1f}% ({comp}/{comp+failed})" if (comp + failed) > 0 else "completion_rate=n/a"
+
         print(
-            f"steps={steps_done} episodes={len(episode_rewards)} "
-            f"mean_episode_reward={mean_reward:.3f} "
-            f"policy_loss={stats.get('policy_loss', float('nan')):.4f} "
-            f"value_loss={stats.get('value_loss', float('nan')):.4f} "
-            f"entropy={stats.get('entropy', float('nan')):.4f}"
+            f"steps={steps_done:6d} episodes={len(episodes):3d} "
+            f"mean_reward={mean_reward:8.2f} {comp_str} "
+            f"policy_loss={stats.get('policy_loss', float('nan')):7.4f} "
+            f"value_loss={stats.get('value_loss', float('nan')):7.4f} "
+            f"entropy={stats.get('entropy', float('nan')):6.4f}"
         )
+
+        if cfg.checkpoint_dir and (steps_done - last_checkpoint_step >= cfg.checkpoint_interval or steps_done >= cfg.total_timesteps):
+            save_checkpoint(
+                cfg.checkpoint_dir,
+                steps_done,
+                policy,
+                optimizer,
+                rms,
+                cfg,
+                {"mean_reward": mean_reward, "completion_rate": comp_rate, **stats},
+            )
+            last_checkpoint_step = steps_done
 
     return policy
 
@@ -268,14 +361,30 @@ def main() -> None:
     parser.add_argument("board_path", help=".kicad_pcb file to train on")
     parser.add_argument("--total-timesteps", type=int, default=20_000)
     parser.add_argument("--rollout-steps", type=int, default=512)
+    parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument("--minibatch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--checkpoint-dir", type=str, default=None)
+    parser.add_argument("--checkpoint-interval", type=int, default=5_000)
+    parser.add_argument("--use-legacy-env", action="store_true", help="Use PCBRouteEnv instead of LineRouteEnv")
     args = parser.parse_args()
 
-    # Deferred import: pcbworld_pns_bridge only exists after the Colab
-    # build in notebooks/00_setup.ipynb.
-    from pcbworld.env.pcb_route_env import PCBRouteEnv
+    if args.use_legacy_env:
+        from pcbworld.env.pcb_route_env import PCBRouteEnv
+        env = PCBRouteEnv(args.board_path)
+    else:
+        from pcbworld.env.line_route_env import LineRouteEnv
+        env = LineRouteEnv(args.board_path)
 
-    env = PCBRouteEnv(args.board_path)
-    cfg = PPOConfig(total_timesteps=args.total_timesteps, rollout_steps=args.rollout_steps)
+    cfg = PPOConfig(
+        total_timesteps=args.total_timesteps,
+        rollout_steps=args.rollout_steps,
+        epochs=args.epochs,
+        minibatch_size=args.minibatch_size,
+        learning_rate=args.lr,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_interval=args.checkpoint_interval,
+    )
     train(env, cfg)
 
 
