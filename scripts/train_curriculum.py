@@ -12,18 +12,12 @@ import argparse
 import os
 import sys
 import time
-from pathlib import Path
-
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-
-try:
-    from IPython.display import clear_output, display
-    HAS_IPYTHON = True
-except ImportError:
-    HAS_IPYTHON = False
 
 from pcbworld.agents.line_policy import LineActorCritic, RunningMeanStd
 from pcbworld.agents.ppo_baseline import PPOConfig, collect_rollout, ppo_update, save_checkpoint
@@ -76,9 +70,8 @@ def plot_live_curves(history: dict[str, list], output_path: str | Path | None = 
     if output_path:
         fig.savefig(output_path, bbox_inches="tight")
 
-    if HAS_IPYTHON:
-        plt.show()
     plt.close(fig)
+
 
 
 def train_curriculum_live(
@@ -216,25 +209,21 @@ def train_curriculum_live(
             remaining_steps = max(0, total_curriculum_steps - cumulative_steps)
             eta_sec = remaining_steps / max(1e-5, sps)
 
-            # Live in-notebook dashboard display
-            if HAS_IPYTHON:
-                clear_output(wait=True)
+            short_stage = stage_name.split(":")[0].strip()
+            comp_str = f"Completion: {comp_rate:5.1f}% ({comp:2d}/{comp+failed:2d})"
+            loss_str = f"P-Loss: {stats.get('policy_loss', 0.0):.4f} | V-Loss: {stats.get('value_loss', 0.0):.4f}"
+            timing_str = f"{sps:.1f} sps | ETA: {int(eta_sec//60):02d}m{int(eta_sec%60):02d}s"
 
-            print("=" * 80)
-            print(f"            ROUTERV3 CURRICULUM TRAINING DASHBOARD (GPU: {device.upper()})")
-            print("=" * 80)
-            print(f"Current Stage:       [{stage_idx}/3] {stage_name}")
-            print(f"Curriculum Progress: {cumulative_steps:,} / {total_curriculum_steps:,} steps ({cumulative_steps/total_curriculum_steps*100:.1f}%)")
-            print(f"Stage Progress:      {stage_steps:,} / {stage_timesteps:,} steps ({stage_steps/stage_timesteps*100:.1f}%)")
-            print(f"Training Speed:      {sps:.1f} steps/sec | Batch Time: {(t1-t0):.2f}s")
-            print(f"Elapsed Time:        {int(elapsed//60):02d}m {int(elapsed%60):02d}s | ETA: {int(eta_sec//60):02d}m {int(eta_sec%60):02d}s")
-            print("-" * 80)
-            print(f"Rollout Metrics:     Completion Rate: {comp_rate:5.1f}% ({comp}/{comp+failed} nets) | Mean Reward: {mean_reward:6.2f}")
-            print(f"Loss Metrics:        Policy Loss: {stats.get('policy_loss', 0.0):.4f} | Value Loss: {stats.get('value_loss', 0.0):.4f} | Entropy: {stats.get('entropy', 0.0):.4f}")
-            print("=" * 80)
+            print(
+                f"  [{short_stage}] Step {stage_steps:6d}/{stage_timesteps:6d} | "
+                f"{comp_str} | Reward: {mean_reward:6.2f} | {loss_str} | {timing_str}",
+                flush=True
+            )
 
-            # Render live training curves inline
-            plot_live_curves(history, plot_path)
+            # Update saved curves at checkpoint interval
+            if stage_steps - last_chk_step >= cfg.checkpoint_interval or stage_steps >= stage_timesteps:
+                plot_live_curves(history, plot_path)
+
 
             if stage_steps - last_chk_step >= cfg.checkpoint_interval or stage_steps >= stage_timesteps:
                 save_checkpoint(
