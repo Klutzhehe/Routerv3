@@ -19,7 +19,25 @@ fi
 
 sudo apt-get update -qq || true
 sudo apt-get build-dep -y kicad || true
-sudo apt-get install -y kicad cmake ninja-build build-essential libwxgtk3.2-dev libboost-all-dev libglm-dev libglew-dev libcurl4-openssl-dev libssl-dev libgl1-mesa-dev libglu1-mesa-dev libglvnd-dev mesa-common-dev python3-dev
+# python3.12-dev, explicit: KiCad 9.0.8's whole CMake tree (its own
+# find_package(PythonLibs) calls, e.g. for libkicommon -- separate from
+# and unaffected by anything pcbworld_bridge's own CMakeLists.txt
+# controls) consistently resolves to Python 3.12, matching every build
+# that succeeded before a Colab base-image update moved the default
+# `python3` to 3.13. That resolution still happens correctly on an
+# updated image -- CMake finds the *path* it expects -- but the image no
+# longer ships 3.12's headers/shared library by default, so the path
+# points at nothing: first surfaced as a missing /usr/include/python3.12
+# (pybind11's own target), then, after chasing that with a
+# python3.13-specific override that only fixed pybind11's own target, as
+# a missing /usr/lib/x86_64-linux-gnu/libpython3.12.so at link time for
+# libkicommon.so, a KiCad core library the override never touched. Ubuntu
+# ships multiple python3.X packages side by side without conflict; making
+# 3.12 available again (this apt package pulls in the shared library as a
+# dependency of the headers) lets EVERY find_package(PythonLibs) call in
+# KiCad's tree -- not just this repo's own subdirectory -- resolve
+# consistently to the same, real interpreter, the way it always has.
+sudo apt-get install -y kicad cmake ninja-build build-essential libwxgtk3.2-dev libboost-all-dev libglm-dev libglew-dev libcurl4-openssl-dev libssl-dev libgl1-mesa-dev libglu1-mesa-dev libglvnd-dev mesa-common-dev python3-dev python3.12-dev
 pip install -q pybind11
 
 echo "=== STAGE: restore cached KiCad build from Drive (if available) ==="
@@ -70,30 +88,29 @@ if [ ! -f build/CMakeCache.txt ] || [ "$RESTORED_FROM_CACHE" = "1" ]; then
   if [ "$RESTORED_FROM_CACHE" = "1" ] && [ -f build/CMakeCache.txt ]; then
     echo "cache was restored from Drive this run -- its recorded toolchain paths may be stale in this runtime (already happened once: a Python-version change in Colab's base image broke a cached cmake path). Forcing a reconfigure rather than trusting it."
   fi
-  # PYBIND11_FINDPYTHON=ON + an explicit Python3_EXECUTABLE: hit for real
-  # on a Colab runtime with multiple Pythons installed (system python3 ->
-  # 3.13, but /usr/include/python3.12 also present from an older image
-  # layer) -- pybind11 v2.9.2 (installed here via `pip install pybind11`,
-  # predates FindPython being the default) resolves its module's include
-  # dirs via CMake's legacy, deprecated FindPythonLibs, which is known to
-  # pick a DIFFERENT Python than the one actually in use when more than
-  # one coexists on a system: `CMake Error ... pybind11::module includes
-  # non-existent path "/usr/include/python3.12"`, even though python3 -m
-  # pybind11 --cmakedir (used just above for PYBIND11_CMAKE_DIR) already
-  # resolved correctly via the SAME python3. PYBIND11_FINDPYTHON=ON
-  # switches pybind11 onto CMake's modern find_package(Python3) path,
-  # which is far more consistent about honoring a pinned executable;
-  # Python3_EXECUTABLE removes the remaining ambiguity outright. Low risk
-  # to carry even if this pybind11 version doesn't read the flag -- CMake
-  # silently ignores an unused -D cache variable rather than failing.
+  # NOT pinned to a specific Python here (an earlier version of this
+  # script tried -DPYBIND11_FINDPYTHON=ON + -DPython3_EXECUTABLE=python3
+  # to fix a python3.12-headers-missing error on pcbworld_bridge's own
+  # target -- wrong direction, reverted). That override only affected
+  # THIS repo's own find_package(pybind11 CONFIG REQUIRED) call; KiCad's
+  # OWN CMakeLists.txt has its own, separate find_package(PythonLibs)
+  # calls for its core libraries (libkicommon etc.) that the override
+  # never touched, and those keep resolving to 3.12 regardless -- the
+  # override just meant pcbworld_pns_bridge's own module got built
+  # against 3.13 headers while linking against libkicommon.so, itself
+  # built against 3.12, a real ABI-mismatch risk even where it appeared
+  # to "work". The actual fix belongs where it's applied above: keep
+  # python3.12-dev installed so the SAME python (whichever version every
+  # find_package(PythonLibs) call in KiCad's tree, including pybind11's
+  # own, consistently and naturally resolves to) is real on disk, rather
+  # than fighting to redirect one target onto a different version than
+  # everything it links against.
   cmake -S . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DKICAD_BUILD_QA_TESTS=OFF \
     -DKICAD_SCRIPTING_WXPYTHON=OFF \
     -DKICAD_BUILD_I18N=OFF \
     -DKICAD_USE_CMAKE_FINDPROTOBUF=ON \
-    -DPYBIND11_FINDPYTHON=ON \
-    -DPython3_EXECUTABLE="$(command -v python3)" \
     -Dpybind11_DIR="$PYBIND11_CMAKE_DIR"
 else
   echo "build/CMakeCache.txt already exists from this same session -- skipping configure (rm -rf build to force a clean reconfigure)"

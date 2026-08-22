@@ -77,30 +77,43 @@ way; see `docs/engine_access.md` / `docs/performance.md` for the full
    legitimate same-session-retry case (re-running after an earlier
    failure, same runtime, safe to skip) is unaffected, since that case
    never sets the flag.
-   **Forcing that reconfigure surfaced a second, independent Python-
-   detection bug**, not caused by the fix above: `pybind11::module`
-   includes `/usr/include/python3.12` in its `INTERFACE_INCLUDE_DIRECTORIES`
-   — a path that doesn't exist on a Colab runtime whose `python3` resolves
-   to 3.13. This repo's own `pcbworld/engine/cpp/CMakeLists.txt` does
-   nothing beyond `find_package(pybind11 CONFIG REQUIRED)`; every bit of
-   Python-version resolution happens inside pybind11's own imported CMake
-   config. The pip-installed pybind11 here is v2.9.2, old enough to
-   predate `PYBIND11_FINDPYTHON` defaulting on, so it resolves headers via
-   CMake's legacy, deprecated `FindPythonLibs` module — a module with a
-   well-known failure mode of picking a *different* Python than the one
-   actually in use when more than one coexists on a system (exactly what
-   happened: `python3 -m pybind11 --cmakedir`, used earlier in the same
-   script, already resolved correctly via the same `python3`).
-   `setup_env.sh` now passes `-DPYBIND11_FINDPYTHON=ON` (switches pybind11
-   onto CMake's modern, more consistent `find_package(Python3)` path) and
-   `-DPython3_EXECUTABLE="$(command -v python3)"` (removes the remaining
-   ambiguity outright). This is the standard, documented fix for this
-   class of pybind11/CMake bug, not something root-caused against this
-   repo's own source the way the C++ binding issues above were — if it
-   doesn't fully resolve it, the next fallback is hardcoding
-   `-DPython3_INCLUDE_DIR`/`-DPython3_LIBRARY` from
-   `python3 -c "import sysconfig; ..."` directly, bypassing CMake's Python
-   detection entirely, not yet attempted.
+   **Forcing that reconfigure surfaced a second Python issue, and the
+   first attempt at fixing it made things worse in a real way — record
+   kept honest, not silently corrected.** Symptom: `pybind11::module`
+   included `/usr/include/python3.12` in its
+   `INTERFACE_INCLUDE_DIRECTORIES`, a path absent on a Colab runtime whose
+   `python3` resolves to 3.13. First attempt: `-DPYBIND11_FINDPYTHON=ON` +
+   `-DPython3_EXECUTABLE=python3`, reasoning that pybind11 v2.9.2 (old
+   enough to predate `PYBIND11_FINDPYTHON` defaulting on) was using
+   CMake's legacy, deprecated `FindPythonLibs` and picking a mismatched
+   Python. That flag genuinely fixed `pcbworld_bridge`'s *own*
+   `find_package(pybind11 CONFIG REQUIRED)` call — confirmed, the next
+   configure log showed it correctly resolving 3.13 — but it does nothing
+   for KiCad's *own*, separate `find_package(PythonLibs)` calls elsewhere
+   in KiCad's CMake tree (e.g. for `libkicommon`), which the flag never
+   touches and which kept resolving to 3.12 regardless (confirmed by
+   CMake's own `Python3_EXECUTABLE ... not used` warning). Net effect:
+   pushed `pcbworld_pns_bridge`'s own module onto 3.13 headers while it
+   still links against `libkicommon.so`, built against 3.12 — a real
+   cross-version ABI mismatch the first fix *introduced*, not fixed, and
+   the very next build stage caught it as a link error instead of a
+   configure error (`libpython3.12.so`, needed by `libkicommon.so.9.0.8`,
+   missing).
+   **The actual root cause, once traced through both failures together:**
+   every `find_package(PythonLibs)` call across KiCad's whole tree —
+   including pybind11's own, unforced — has always and still consistently
+   resolves to 3.12; that is *why* every build succeeded before this
+   Colab image's base layer moved its default `python3` to 3.13. The
+   resolution itself was never broken. What changed is that the image
+   stopped shipping 3.12's headers/shared library by default, so the path
+   CMake correctly expects points at nothing. The fix reverted the
+   `PYBIND11_FINDPYTHON`/`Python3_EXECUTABLE` override entirely (fighting
+   to redirect one target's Python version was the wrong lever) and
+   instead added `python3.12-dev` to `setup_env.sh`'s apt dependencies —
+   Ubuntu ships multiple `python3.X` packages side by side without
+   conflict — so the *same* Python every `find_package` call in the tree
+   already, consistently wants is simply real on disk again. Still
+   unverified in Colab as of this writing.
 4. **`ROUTER::LoadSettings()` must be called before any routing call.**
    `PNS::ROUTER`'s constructor leaves `m_settings = nullptr`; the first
    real routing call dereferences it unguarded. `PNS_BRIDGE::LoadBoard()`
