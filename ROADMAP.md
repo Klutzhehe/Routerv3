@@ -60,6 +60,23 @@ way; see `docs/engine_access.md` / `docs/performance.md` for the full
    re-runs fast — don't skip
    step 2 (`git pull`) before rebuilding, or you'll rebuild against stale
    local code.
+   **A restored cache can be stale in a way that isn't about code.**
+   Hit for real: a cache built under a Python 3.12 Colab base image
+   recorded a pip-installed `cmake` binary's absolute path
+   (`/usr/local/lib/python3.12/dist-packages/cmake/data/bin/cmake`) inside
+   the cached `build.ninja`'s own regeneration rule. A later session's
+   Colab image had moved to Python 3.13 — a base-image change entirely
+   outside this repo's control — that exact path no longer existed, and
+   `ninja` failed outright (`subcommand failed`) before compiling
+   anything, because `setup_env.sh`'s "skip reconfigure" check only ever
+   tested whether `build/CMakeCache.txt` existed, never whether the
+   toolchain paths it recorded were still valid in *this* runtime. Fixed
+   in `setup_env.sh`: a `RESTORED_FROM_CACHE` flag, set only when a
+   Drive tarball was actually restored *this run*, now forces a
+   reconfigure regardless of whether `CMakeCache.txt` exists — the
+   legitimate same-session-retry case (re-running after an earlier
+   failure, same runtime, safe to skip) is unaffected, since that case
+   never sets the flag.
 4. **`ROUTER::LoadSettings()` must be called before any routing call.**
    `PNS::ROUTER`'s constructor leaves `m_settings = nullptr`; the first
    real routing call dereferences it unguarded. `PNS_BRIDGE::LoadBoard()`

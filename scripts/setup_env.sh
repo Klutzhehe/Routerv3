@@ -24,9 +24,11 @@ pip install -q pybind11
 
 echo "=== STAGE: restore cached KiCad build from Drive (if available) ==="
 cd "$WORKDIR"
+RESTORED_FROM_CACHE=0
 if [ ! -d kicad-src ] && [ -f "$DRIVE_CACHE_TARBALL" ]; then
   echo "found $DRIVE_CACHE_TARBALL, restoring (skips clone + most of configure/build)"
   tar xzf "$DRIVE_CACHE_TARBALL"
+  RESTORED_FROM_CACHE=1
 else
   echo "no cache to restore (first run, or already have a local kicad-src)"
 fi
@@ -49,7 +51,25 @@ cd "$WORKDIR/kicad-src"
 PYBIND11_CMAKE_DIR="$(python3 -m pybind11 --cmakedir)"
 echo "pybind11 cmake dir: $PYBIND11_CMAKE_DIR"
 
-if [ ! -f build/CMakeCache.txt ]; then
+# A restored Drive cache carries the PAST session's build/CMakeCache.txt,
+# whose recorded toolchain paths (notably build.ninja's own "regenerate"
+# rule, which shells out to whatever CMAKE_COMMAND path was resolved at
+# generation time) are only valid if Colab's underlying base image hasn't
+# changed since. It does change -- hit for real: a cache built under a
+# Python 3.12 Colab image recorded a pip-installed cmake at
+# /usr/local/lib/python3.12/dist-packages/cmake/data/bin/cmake; a later
+# session's image had moved to Python 3.13, that exact path no longer
+# existed, and ninja's build.ninja regeneration failed outright before
+# compiling anything. Mere existence of CMakeCache.txt (the ORIGINAL
+# check) can't distinguish that from the legitimate same-session-retry
+# case (re-running this script after an earlier failure, same runtime,
+# same toolchain, safe to skip reconfigure) -- RESTORED_FROM_CACHE does,
+# since it's only set true when THIS run pulled a tarball from Drive, a
+# genuinely different environment than whichever session produced it.
+if [ ! -f build/CMakeCache.txt ] || [ "$RESTORED_FROM_CACHE" = "1" ]; then
+  if [ "$RESTORED_FROM_CACHE" = "1" ] && [ -f build/CMakeCache.txt ]; then
+    echo "cache was restored from Drive this run -- its recorded toolchain paths may be stale in this runtime (already happened once: a Python-version change in Colab's base image broke a cached cmake path). Forcing a reconfigure rather than trusting it."
+  fi
   cmake -S . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DKICAD_BUILD_QA_TESTS=OFF \
@@ -58,7 +78,7 @@ if [ ! -f build/CMakeCache.txt ]; then
     -DKICAD_USE_CMAKE_FINDPROTOBUF=ON \
     -Dpybind11_DIR="$PYBIND11_CMAKE_DIR"
 else
-  echo "build/CMakeCache.txt already exists, skipping configure (rm -rf build to force a clean reconfigure)"
+  echo "build/CMakeCache.txt already exists from this same session -- skipping configure (rm -rf build to force a clean reconfigure)"
 fi
 
 echo "=== STAGE: build pcbworld_pns_bridge ==="
