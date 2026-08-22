@@ -21,6 +21,32 @@ is. The GPU forward pass was measured at 1306 net-decisions/sec on a T4
 T_pns > 0.766 ms * num_workers -- this script's T_pns histogram is the input
 to that inequality.
 
+## Gate B (docs/RL_PLAN.md) -- added later, and now the main reason to run this
+
+The line-geometry RL plan hangs on one measurable question this script is
+already 90% of the way to answering, so it answers it here rather than in a
+second Colab session:
+
+  - PER-CALL WALL CLOCK, not just per-net. A line-geometry observation calls
+    get_board_geometry()/get_head_geometry() EVERY STEP, not once per net,
+    so the breakdown decides whether that observation is affordable at all
+    and how many worker processes the GPU can feed. See TimingBridge.
+
+  - DOES head_collides() PREDICT A fix() REJECTION? push() accepted 72/72
+    net-attempts across three runs while fix() rejected ~67% -- success is
+    silent, failure is late. If the collision signal fires during the pushes
+    before a rejected fix() and stays quiet before an accepted one, the
+    per-step reward in docs/RL_PLAN.md is real signal and the planned 1-D
+    heading action space works. If it fires equally in both, one terminal
+    bit has to carry ~20 steps of credit and the action granularity must
+    change BEFORE a trainer is written. See AttemptRecord.
+
+    Run --no-collision-trace once as a control: probing the router mid-route
+    should not change the outcome, and if the direct-success count moves,
+    the measurement is perturbing the thing it measures and the correlation
+    is void. This repo has been bitten by measurement-side bugs producing
+    router "findings" more than once (see this file's own git history).
+
 Deliberately exercises MODE_ROUTE_SINGLE only, not diff pairs or length
 tuning: DiffPairRouteEnv's legs decompose into MODE_ROUTE_SINGLE /
 MODE_ROUTE_DIFF_PAIR / MODE_TUNE_SINGLE, but the diff-pair and tune
@@ -37,6 +63,7 @@ pcbworld/data/generate_board.py as a genuinely separate process first.
 Usage (after notebooks/00_setup.ipynb has built the bridge):
     python3 pcbworld/data/generate_board.py board.kicad_pcb --num-nets 24 --seed 0
     python3 scripts/measure_waypoint_fidelity.py board.kicad_pcb
+    python3 scripts/measure_waypoint_fidelity.py board.kicad_pcb --no-collision-trace
 
     Leave board size at generate_board.py's own default (50x50mm) unless you
     have deliberately checked the net count against its min_spacing_mm=3.0 --
@@ -52,6 +79,7 @@ import glob
 import statistics
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 MM = 1_000_000
@@ -86,6 +114,72 @@ def _load_bridge(bridge_dir: str | None):
         "pcbworld_pns_bridge not found. Run notebooks/00_setup.ipynb through its "
         "build step first, or pass --bridge-dir /path/to/kicad-src's parent."
     )
+
+
+class TimingBridge:
+    """Transparent proxy recording wall-clock per bridge method.
+
+    Per-net elapsed time was already measured; what docs/RL_PLAN.md's Gate B
+    needs is the BREAKDOWN -- which call dominates. That decides worker count
+    (push() at 0.1ms and push() at 10ms are different training designs) and
+    whether per-step observation building is affordable at all, since a
+    line-geometry observation calls get_board_geometry()/get_head_geometry()
+    every single step, not once per net.
+
+    A proxy rather than call-site instrumentation: every existing call site
+    stays untouched, so this cannot change the behavior it is measuring.
+    Overhead is one perf_counter() pair per call (~100ns) against calls
+    expected to be microseconds at minimum -- negligible, but it IS included
+    in the numbers, so treat sub-microsecond means as noise.
+    """
+
+    def __init__(self, bridge) -> None:
+        self._bridge = bridge
+        self.timings: dict[str, list[float]] = defaultdict(list)
+
+    def __getattr__(self, name: str):
+        # Only reached when normal lookup fails, so self._bridge/self.timings
+        # resolve without recursion.
+        attr = getattr(self._bridge, name)
+        if not callable(attr):
+            return attr
+
+        def timed(*args, **kwargs):
+            t0 = time.perf_counter()
+            try:
+                return attr(*args, **kwargs)
+            finally:
+                self.timings[name].append(time.perf_counter() - t0)
+
+        return timed
+
+
+@dataclasses.dataclass
+class AttemptRecord:
+    """One (net, strategy) attempt -- the unit the collision/fix correlation
+    is computed over. A net can produce up to 6 of these.
+
+    Exists to answer docs/RL_PLAN.md's Gate B question, which gates the whole
+    action-space choice: push() accepted 72/72 while fix() rejected ~67%, so
+    success is silent and failure is late. If head_collides() fires during
+    the pushes that precede a REJECTED fix() and stays quiet before an
+    ACCEPTED one, there is a real dense per-step reward signal and the 1-D
+    heading policy works. If it fires equally in both, one terminal bit has
+    to carry ~20 steps of credit and the action granularity has to change
+    before any trainer is written.
+    """
+
+    net: str
+    strategy: str
+    pushes: int
+    first_collision_step: int | None  # index of the first push after which
+                                      #   head_collides() was True
+    collided_nets: list[str]
+    fix_ok: bool
+
+    @property
+    def collided(self) -> bool:
+        return self.first_collision_step is not None
 
 
 @dataclasses.dataclass
@@ -153,8 +247,18 @@ def _pick_pad_candidate(candidates: list, label: str, warnings: list[str]):
 
 
 def _route_one_net(
-    bridge, module, pads: list, net: str, warnings: list[str]
+    bridge,
+    module,
+    pads: list,
+    net: str,
+    warnings: list[str],
+    attempts_out: list[AttemptRecord] | None = None,
+    trace_collisions: bool = True,
 ) -> NetResult:
+    # attempts_out/trace_collisions are appended-to, optional parameters
+    # rather than a changed return type: scripts/measure_layer_hop_rescue.py
+    # imports this function directly and calls it with the original five
+    # arguments.
     net_pads = [p for p in pads if p.net == net]
     assert len(net_pads) == 2, f"{net!r} has {len(net_pads)} pad(s), expected 2 (see generate_board.py)"
     start_pad, target_pad = net_pads
@@ -173,12 +277,29 @@ def _route_one_net(
     assert target_candidates, f"no candidate at {net!r}'s target pad"
     target_id = _pick_pad_candidate(target_candidates, f"{net}/target", warnings).id
 
-    def try_push_sequence(points: list[tuple[int, int]]) -> tuple[int, int | None]:
+    can_trace = trace_collisions and hasattr(bridge, "head_collides")
+    can_name_obstacle = can_trace and hasattr(bridge, "get_head_obstacle")
+
+    def try_push_sequence(
+        points: list[tuple[int, int]], collisions: list[tuple[int, str]]
+    ) -> tuple[int, int | None]:
         """Pushes each point in order. Returns (accepted_count,
-        first_rejection_index or None)."""
+        first_rejection_index or None).
+
+        After each accepted push, asks the router whether the head now
+        collides -- appending (step_index, obstacle_net) to `collisions`.
+        This is the only early failure signal available: push()'s own return
+        value has never once been False against the real bridge.
+        """
         for i, (x, y) in enumerate(points):
             if not bridge.push(x, y, -1):
                 return i, i
+            if can_trace and bridge.head_collides():
+                obstacle = ""
+                if can_name_obstacle:
+                    detail = bridge.get_head_obstacle()
+                    obstacle = detail.net if detail.found else ""
+                collisions.append((i, obstacle))
         return len(points), None
 
     # Attempts, in order: one big hop, a 5-point straight polyline (what an
@@ -218,9 +339,28 @@ def _route_one_net(
             f"start_route (re-)failed for {net!r} on attempt {attempt_name!r}"
         )
         requested = len(waypoints)
-        accepted, rejected_at = try_push_sequence(waypoints)
+        collisions: list[tuple[int, str]] = []
+        accepted, rejected_at = try_push_sequence(waypoints, collisions)
+
+        def record(fix_ok: bool) -> None:
+            if attempts_out is None:
+                return
+            attempts_out.append(
+                AttemptRecord(
+                    net=net,
+                    strategy=attempt_name,
+                    pushes=accepted,
+                    first_collision_step=collisions[0][0] if collisions else None,
+                    collided_nets=sorted({n for _, n in collisions if n}),
+                    fix_ok=fix_ok,
+                )
+            )
 
         if rejected_at is not None:
+            # No fix() was reached, so this attempt carries no information
+            # about the collision/fix correlation -- deliberately not
+            # recorded as fix_ok=False, which would poison the statistic
+            # with attempts that never got to try.
             bridge.stop_routing()
             continue
 
@@ -230,6 +370,7 @@ def _route_one_net(
         # (False, False) and every "failed" net had accepted==requested
         # (push() always reached the target; only this call rejected it).
         fixed = bridge.fix(target_xy[0], target_xy[1], target_id, True, True)
+        record(fix_ok=bool(fixed))
         if fixed:
             strategy = attempt_name
             reached = True
@@ -286,9 +427,10 @@ def run(
     num_nets: int,
     bridge_dir: str | None,
     save_image: str | None = None,
+    trace_collisions: bool = True,
 ) -> list[NetResult]:
     bridge_module = _load_bridge(bridge_dir)
-    bridge = bridge_module.PNSBridge()
+    bridge = TimingBridge(bridge_module.PNSBridge())
 
     assert bridge.load_board(board_path), f"load_board failed: {board_path}"
     bridge.set_mode(bridge_module.MODE_ROUTE_SINGLE)
@@ -316,7 +458,11 @@ def run(
           f"(collision mode RM_MARK_OBSTACLES, track width {TRACK_WIDTH_NM / MM:.2f}mm)\n")
 
     warnings: list[str] = []
-    results = [_route_one_net(bridge, bridge_module, pads, net, warnings) for net in net_names]
+    attempts: list[AttemptRecord] = []
+    results = [
+        _route_one_net(bridge, bridge_module, pads, net, warnings, attempts, trace_collisions)
+        for net in net_names
+    ]
 
     violations = bridge.run_drc()
 
@@ -395,6 +541,61 @@ def run(
     for v in violations[:10]:
         print(f"    [{v.severity}] {v.message} @ ({v.x / MM:.2f}, {v.y / MM:.2f})")
 
+    print(f"\n{'=' * 70}")
+    print("GATE B -- IS THERE A DENSE PER-STEP SIGNAL? (docs/RL_PLAN.md)")
+    if not trace_collisions:
+        print("  collision tracing DISABLED (--no-collision-trace). This is the control run:")
+        print("  its direct-success count should match a traced run's. If it doesn't, calling")
+        print("  head_collides() mid-route perturbs the router and the traced numbers are void.")
+    elif not attempts:
+        print("  no attempt reached a fix() call -- nothing to correlate.")
+    else:
+        failed = [a for a in attempts if not a.fix_ok]
+        succeeded = [a for a in attempts if a.fix_ok]
+
+        def collided_frac(group: list[AttemptRecord]) -> float:
+            return sum(1 for a in group if a.collided) / len(group) if group else float("nan")
+
+        p_fail, p_ok = collided_frac(failed), collided_frac(succeeded)
+        print(f"  attempts that reached a fix() call: {len(attempts)} "
+              f"({len(succeeded)} accepted, {len(failed)} rejected)")
+        print(f"  P(head_collides fired | fix REJECTED) = {p_fail:.2f}  (n={len(failed)})")
+        print(f"  P(head_collides fired | fix ACCEPTED) = {p_ok:.2f}  (n={len(succeeded)})")
+
+        lead = [a.pushes - a.first_collision_step for a in failed if a.collided]
+        if lead:
+            print(f"  lead time on rejected attempts: the signal first fired "
+                  f"{statistics.mean(lead):.1f} pushes (mean) before fix() was called "
+                  f"-- that is how much credit-assignment distance it buys")
+
+        blamed = sorted({n for a in attempts for n in a.collided_nets})
+        if blamed:
+            print(f"  obstacle nets named by get_head_obstacle(): {blamed[:10]}"
+                  f"{' ...' if len(blamed) > 10 else ''}")
+
+        if len(failed) < 5 or len(succeeded) < 5:
+            print(f"\n  -> INCONCLUSIVE: fewer than 5 samples in a bucket. Re-run with more nets.")
+        elif p_fail - p_ok >= 0.3:
+            print(f"\n  -> SEPARATION ({p_fail - p_ok:+.2f}). head_collides() predicts fix()")
+            print(f"     rejection, so the per-step collision penalty in docs/RL_PLAN.md's reward")
+            print(f"     is real signal and the 1-D heading action space is viable as specified.")
+        else:
+            print(f"\n  -> NO SEPARATION ({p_fail - p_ok:+.2f}). head_collides() does NOT predict")
+            print(f"     fix() rejection. One terminal bit would have to carry ~20 steps of credit.")
+            print(f"     Per docs/RL_PLAN.md this blocks the trainer: revisit action granularity")
+            print(f"     (macro waypoints, or a learned value on committed geometry) FIRST.")
+
+    print(f"\n{'=' * 70}")
+    print("PER-CALL WALL CLOCK -- ms (sets worker count; a line-geometry observation calls")
+    print("get_board_geometry()/get_head_geometry() every step, not once per net)")
+    total_s = sum(sum(v) for v in bridge.timings.values()) or 1.0
+    print(f"  {'call':<22} {'n':>6} {'mean':>9} {'median':>9} {'p90':>9} {'max':>9} {'share':>7}")
+    for name, samples in sorted(bridge.timings.items(), key=lambda kv: -sum(kv[1])):
+        ms = [s * 1e3 for s in samples]
+        print(f"  {name:<22} {len(ms):>6} {statistics.mean(ms):>9.3f} "
+              f"{statistics.median(ms):>9.3f} {_percentile(ms, 0.9):>9.3f} {max(ms):>9.3f} "
+              f"{sum(samples) / total_s:>6.1%}")
+
     print(f"\nT_pns (wall clock per net, includes query/start_route/all pushes/fix/commit)")
     print(f"  n={len(times_ms)}  mean={statistics.mean(times_ms):.2f}ms  "
           f"median={statistics.median(times_ms):.2f}ms  "
@@ -429,5 +630,18 @@ if __name__ == "__main__":
         help="PNG path to save a rendered view of the final board state to "
         "(requires matplotlib; not installed by default outside Colab)",
     )
+    parser.add_argument(
+        "--no-collision-trace",
+        action="store_true",
+        help="skip the per-push head_collides() probe. Run this ONCE as a control: if the "
+        "direct-success count differs from a traced run's, the probe itself is perturbing "
+        "the router and the Gate B correlation is void.",
+    )
     args = parser.parse_args()
-    run(args.board_path, args.num_nets, args.bridge_dir, args.save_image)
+    run(
+        args.board_path,
+        args.num_nets,
+        args.bridge_dir,
+        args.save_image,
+        trace_collisions=not args.no_collision_trace,
+    )

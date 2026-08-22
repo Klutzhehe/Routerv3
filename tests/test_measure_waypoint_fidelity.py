@@ -343,3 +343,163 @@ def test_save_image_omitted_by_default_does_not_touch_matplotlib():
     run("board.kicad_pcb", num_nets=1, bridge_dir=None)
     if not had_matplotlib:
         assert "matplotlib" not in sys.modules
+
+
+# ---------------------------------------------------------------------------
+# Gate B instrumentation (docs/RL_PLAN.md): per-call timing, and whether
+# head_collides() predicts a fix() rejection.
+# ---------------------------------------------------------------------------
+
+HeadObstacle = namedtuple("HeadObstacle", ["found", "net", "kind", "x", "y"])
+
+
+class TracingBridge(ScriptedBridge):
+    """ScriptedBridge plus a scripted collision signal.
+
+    `collide_after` is the number of accepted pushes after which
+    head_collides() starts reporting True, or None for never. The real
+    router's collision state is geometry; this is a scripted stand-in whose
+    only job is to prove the trace records the right STEP INDEX and obstacle
+    identity -- not to model when a collision would really occur.
+    """
+
+    def __init__(self, nets, reject, fix_reject=None, collide_after=None, obstacle="net_9"):
+        super().__init__(nets, reject, fix_reject)
+        self._collide_after = collide_after
+        self._pushes = 0
+        self._obstacle = obstacle
+        self.head_collides_calls = 0
+
+    def start_route(self, x, y, item_id, layer):
+        self._pushes = 0
+        return super().start_route(x, y, item_id, layer)
+
+    def push(self, x, y, item_id=-1):
+        accepted = super().push(x, y, item_id)
+        if accepted:
+            self._pushes += 1
+        return accepted
+
+    def head_collides(self):
+        self.head_collides_calls += 1
+        return self._collide_after is not None and self._pushes > self._collide_after
+
+    def get_head_obstacle(self):
+        return HeadObstacle(True, self._obstacle, "segment", 0, 0)
+
+
+def _route_one(bridge, collide_trace=True):
+    """Drives _route_one_net directly -- run() keeps its AttemptRecords
+    internal, and the per-attempt records are what these tests are about."""
+    from scripts.measure_waypoint_fidelity import _route_one_net
+
+    module = types.ModuleType("pcbworld_pns_bridge")
+    module.MODE_ROUTE_SINGLE = 1
+    module.RM_MARK_OBSTACLES = 0
+    attempts: list = []
+    warnings: list[str] = []
+    result = _route_one_net(
+        bridge, module, bridge.net_pads(), "net_0", warnings, attempts, collide_trace
+    )
+    return result, attempts
+
+
+def test_timing_bridge_delegates_and_records_every_call():
+    from scripts.measure_waypoint_fidelity import TimingBridge
+
+    inner = ScriptedBridge(_two_pad_net("net_0"), reject=lambda x, y: False)
+    timed = TimingBridge(inner)
+
+    assert timed.load_board("board.kicad_pcb") is True  # return value passes through
+    timed.push(1, 2, -1)
+    timed.push(3, 4, -1)
+
+    assert len(timed.timings["push"]) == 2
+    assert len(timed.timings["load_board"]) == 1
+    assert all(t >= 0 for t in timed.timings["push"])
+
+
+def test_timing_bridge_records_a_call_that_raises():
+    """A call that throws still consumed wall clock, and losing that sample
+    would silently bias the very measurement this exists to produce."""
+    from scripts.measure_waypoint_fidelity import TimingBridge
+
+    class Exploding:
+        def push(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    timed = TimingBridge(Exploding())
+    with pytest.raises(RuntimeError):
+        timed.push(1, 2)
+    assert len(timed.timings["push"]) == 1
+
+
+def test_collision_trace_records_the_first_step_and_names_the_obstacle():
+    bridge = TracingBridge(
+        _two_pad_net("net_0"),
+        reject=lambda x, y: False,
+        fix_reject=lambda x, y: True,  # force every attempt to reach fix() and fail
+        collide_after=0,               # collides from the very first push
+        obstacle="net_7",
+    )
+    _, attempts = _route_one(bridge)
+
+    assert attempts, "no attempt reached a fix() call"
+    first = attempts[0]
+    assert first.collided
+    assert first.first_collision_step == 0
+    assert first.collided_nets == ["net_7"]
+    assert first.fix_ok is False
+
+
+def test_attempts_that_never_reach_fix_are_not_recorded():
+    """A push() rejection means fix() was never called, so the attempt says
+    nothing about whether collisions predict fix() rejections. Recording it
+    as fix_ok=False would poison the correlation with attempts that never
+    got to try."""
+    bridge = TracingBridge(
+        _two_pad_net("net_0"),
+        reject=lambda x, y: True,  # every push rejected -> fix() never reached
+        collide_after=0,
+    )
+    _, attempts = _route_one(bridge)
+
+    assert attempts == []
+
+
+def test_no_separation_case_records_collisions_on_accepted_fixes_too():
+    """The failure mode Gate B is looking for: the signal fires everywhere,
+    including on attempts that go on to succeed, and therefore predicts
+    nothing."""
+    bridge = TracingBridge(
+        _two_pad_net("net_0"),
+        reject=lambda x, y: False,
+        collide_after=0,
+    )
+    _, attempts = _route_one(bridge)
+
+    assert len(attempts) == 1
+    assert attempts[0].fix_ok is True
+    assert attempts[0].collided, "expected the scripted signal to fire on a successful attempt"
+
+
+def test_collision_trace_can_be_disabled_for_the_control_run():
+    """--no-collision-trace must not call head_collides() at all: the point
+    of the control is to show the probe itself doesn't perturb the router."""
+    bridge = TracingBridge(
+        _two_pad_net("net_0"), reject=lambda x, y: False, collide_after=0
+    )
+    _, attempts = _route_one(bridge, collide_trace=False)
+
+    assert bridge.head_collides_calls == 0
+    assert attempts and attempts[0].first_collision_step is None
+
+
+def test_trace_degrades_when_the_bridge_build_predates_head_collides():
+    """RouterTools already probes these with hasattr rather than assuming --
+    an older .so must still run this script, just without the Gate B data."""
+    bridge = ScriptedBridge(_two_pad_net("net_0"), reject=lambda x, y: False)
+    assert not hasattr(bridge, "head_collides")
+
+    _, attempts = _route_one(bridge)
+    assert attempts and attempts[0].first_collision_step is None

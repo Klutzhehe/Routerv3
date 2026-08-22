@@ -24,6 +24,14 @@ everything else that consumes NetPads()/get_board_geometry()):
     longest member, or MODE_TUNE_DIFF_PAIR_SKEW if a group's members are
     themselves diff pairs -- not currently combined with diff pairs here):
                                          "lengthgrp_<g>_<member>"
+
+Pad attachment type is a whole-board switch (`pad_type`), not per-net: SMD
+(front copper only, the default and what every existing board here used) or
+THT/plated-through (spans both copper layers). The THT option exists for
+scripts/diagnose_layer_switch.py, which needs to vary exactly one thing --
+whether the route's start item spans the layer being switched to -- to test
+why switch_layer() has never once succeeded against the real bridge. See
+that script's hypothesis table.
 """
 
 import argparse
@@ -54,6 +62,8 @@ def generate_synthetic_board(
     diff_pair_pitch_mm: float = 1.0,
     min_spacing_mm: float = 3.0,
     margin_mm: float = 5.0,
+    pad_type: str = "smd",
+    tht_drill_mm: float = 0.5,
 ) -> None:
     """Writes a gridless 2-layer board mixing plain, diff-pair, and
     length-matched-group nets (see module docstring for the naming
@@ -68,7 +78,20 @@ def generate_synthetic_board(
     since that's what makes them routable as a coupled pair -- everything
     else still respects `min_spacing_mm` against every pad placed so far,
     diff-pair legs included.
+
+    `pad_type` is "smd" (front copper only -- the default, and what every
+    board generated before this option existed used) or "tht" (plated
+    through-hole, layer set spanning F_Cu *and* B_Cu, with a drill). The
+    drill is `min(tht_drill_mm, size_mm * 0.6)` so a smaller pad still
+    keeps an annular ring rather than becoming a hole with no copper --
+    which matters because diff-pair pads default to 0.3mm, far smaller
+    than tht_drill_mm's 0.5mm default. THT + diff pairs is not a
+    combination anything here has verified; the option exists for plain
+    nets (see the module docstring).
     """
+    if pad_type not in ("smd", "tht"):
+        raise ValueError(f"pad_type must be 'smd' or 'tht', got {pad_type!r}")
+
     rng = random.Random(seed)
 
     board = pcbnew.BOARD()
@@ -113,11 +136,27 @@ def generate_synthetic_board(
         # base_seqVect) -- identical here, not re-derived.
         pad = pcbnew.PAD(fp)
         pad.SetNumber("1")
-        pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
         pad.SetShape(pcbnew.PAD_SHAPE_CIRCLE)
         pad.SetSize(pcbnew.VECTOR2I(pcbnew.FromMM(size_mm), pcbnew.FromMM(size_mm)))
+
+        # LSET is built via base_seqVect either way rather than
+        # LSET.AllCuMask() -- the seqVect construction is the one already
+        # proven against this KiCad version here and in make_toy_board.py,
+        # and introducing a second LSET-construction API is exactly the
+        # kind of unforced pcbnew-surface risk this file avoids.
         layer_vec = pcbnew.base_seqVect()
         layer_vec.append(pcbnew.F_Cu)
+
+        if pad_type == "tht":
+            pad.SetAttribute(pcbnew.PAD_ATTRIB_PTH)
+            layer_vec.append(pcbnew.B_Cu)
+            drill_mm = min(tht_drill_mm, size_mm * 0.6)
+            pad.SetDrillSize(
+                pcbnew.VECTOR2I(pcbnew.FromMM(drill_mm), pcbnew.FromMM(drill_mm))
+            )
+        else:
+            pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+
         pad.SetLayerSet(pcbnew.LSET(layer_vec))
         pad.SetPosition(pos)
         pad.SetNet(net)
@@ -189,6 +228,14 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--width-mm", type=float, default=50.0)
     parser.add_argument("--height-mm", type=float, default=50.0)
+    parser.add_argument(
+        "--pad-type",
+        choices=("smd", "tht"),
+        default="smd",
+        help="smd (front copper only, default) or tht (plated through-hole, "
+        "spans both copper layers -- see scripts/diagnose_layer_switch.py)",
+    )
+    parser.add_argument("--tht-drill-mm", type=float, default=0.5)
     args = parser.parse_args()
 
     generate_synthetic_board(
@@ -199,10 +246,12 @@ if __name__ == "__main__":
         length_matched_group_size=args.length_matched_group_size,
         seed=args.seed,
         board_size_mm=(args.width_mm, args.height_mm),
+        pad_type=args.pad_type,
+        tht_drill_mm=args.tht_drill_mm,
     )
     print(
         f"wrote {args.path} ({args.num_nets} plain nets, "
         f"{args.num_diff_pairs} diff pairs, "
         f"{args.num_length_matched_groups} length-matched groups of "
-        f"{args.length_matched_group_size})"
+        f"{args.length_matched_group_size}, {args.pad_type.upper()} pads)"
     )

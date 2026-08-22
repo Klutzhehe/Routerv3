@@ -275,6 +275,60 @@ session. **Still open** from the original verification list:
   over time"), as opposed to just "doesn't crash". This is genuinely
   untested against the real bridge.
 
+## Pivot 2: back to RL, on line geometry — CURRENT DIRECTION
+
+**Read [`docs/RL_PLAN.md`](docs/RL_PLAN.md) first; it is the live plan.**
+[`docs/ROUTER_CAPABILITIES.md`](docs/ROUTER_CAPABILITIES.md) is the
+paste-into-a-fresh-session summary of what the engine can actually do, with
+every claim tagged LIVE / LOCAL / BROKEN.
+
+The LLM direction below is now history too, for a measured reason rather
+than a taste one: the first real Qwen3-4B run routed 2/3 nets at ~9-62
+seconds *per decision*, one net costing 933s for 15 steps. The
+context-overflow and repetition-collapse bugs found afterwards were real and
+are fixed, but they were symptoms — ~10s x ~20 decisions x 24 nets is over
+an hour per board. A ~200k-parameter policy makes the same decision in
+~0.1ms. The LLM agent is kept as a **debugging oracle** (hand it a board the
+policy failed and read its reasoning), which preserves the debuggability
+argument that motivated the pivot away from RL in the first place.
+
+What changes versus the abandoned CFP design: the board is fed to the policy
+as **line segments** (`get_board_geometry()` already returns exactly that),
+not a 256x256 raster. Three reasons, in ascending order of weight: no
+rasterizer needs writing (CFP's build-order step 2, never started); the
+canvas encoder was **71% of a measured forward pass** and disappears; and a
+256px raster over a 50mm board is **0.195 mm/px against a 0.2 mm clearance**,
+so the legality margin the router actually enforces is sub-pixel and the
+raster structurally cannot represent it. Unrouted nets are lines too (a
+straight pad-to-pad "ghost" segment), which is most of what CFP's reserve
+plane existed to provide, for one one-hot bit.
+
+**Two gates before any trainer is written** (both need one Colab run, and
+both are now implemented and locally tested):
+
+1. **Gate A — why `switch_layer()` is 0-for-32.**
+   `scripts/diagnose_layer_switch.py` tests four hypotheses plus two
+   controls in a single run, instead of the one-hypothesis-per-session pace
+   that has already cost two rounds. Needs a THT board, so
+   `generate_board.py` gained `--pad-type tht` (verified against the local
+   KiCad 9.0 install: PTH attribute, layer set spanning F_Cu *and* B_Cu,
+   0.5mm drill; the SMD default is unchanged at F_Cu-only, no drill).
+   **Measured while building it: `pcbnew.B_Cu` is `2` on KiCad 9, not the
+   pre-9 `31` and not the `1` that `fake_bridge.py`'s toggle informally
+   assumes.** Nothing in the tree records which value the historical
+   0-for-32 runs passed (`measure_layer_hop_rescue.py` takes `--back-layer`
+   as a required argument), so a wrong constant is not yet excluded — the
+   script's layer-id sweep settles it either way.
+2. **Gate B — is there a dense per-step reward signal?**
+   `scripts/measure_waypoint_fidelity.py` now also records per-call wall
+   clock (a line-geometry observation calls `get_board_geometry()` every
+   step, not once per net) and correlates `head_collides()` against whether
+   `fix()` later accepted. `push()` accepted 72/72 while `fix()` rejected
+   ~67%: if the collision signal separates the two populations, the planned
+   1-D heading action space works; if it doesn't, one terminal bit has to
+   carry ~20 steps of credit and the action granularity changes first.
+   Run `--no-collision-trace` once as a control.
+
 ## Pivot: LLM routing agent, replacing the RL direction
 
 **The RL direction below (CFP, `pcbworld/agents/cfp/`, the waypoint-RL env)
