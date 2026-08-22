@@ -94,6 +94,25 @@ def plot_live_curves(history: dict[str, list], output_path: str | Path | None = 
 
 
 
+def _chk_stats(mean_reward, smooth_rate, comp_rate, win_comp, win_total, stats) -> dict:
+    """What gets written into the checkpoint and into training_stats.jsonl.
+
+    `completion_rate` is the POOLED figure. It used to be the raw per-rollout
+    one, which meant anything reading checkpoint metadata was reading the very
+    number the console output tells you to ignore -- four such samples in a row
+    read as a 50 -> 31 -> 70 -> 73 trajectory when the 31 was a single n=13
+    rollout. The raw value is kept alongside, named for what it is.
+    """
+    return {
+        "mean_reward": mean_reward,
+        "completion_rate": smooth_rate,
+        "completion_pooled_completed": win_comp,
+        "completion_pooled_total": win_total,
+        "completion_rate_this_rollout": comp_rate,
+        **stats,
+    }
+
+
 def train_curriculum_live(
     dataset_dir: str = "/content/curriculum_dataset",
     checkpoint_dir: str = "/content/drive/MyDrive/routerv3_curriculum",
@@ -268,7 +287,7 @@ def train_curriculum_live(
                     optimizer,
                     rms,
                     cfg,
-                    {"mean_reward": mean_reward, "completion_rate": comp_rate, **stats},
+                    _chk_stats(mean_reward, smooth_rate, comp_rate, win_comp, win_total, stats),
                 )
                 # Also save master latest checkpoint
                 save_checkpoint(
@@ -278,7 +297,7 @@ def train_curriculum_live(
                     optimizer,
                     rms,
                     cfg,
-                    {"mean_reward": mean_reward, "completion_rate": comp_rate, **stats},
+                    _chk_stats(mean_reward, smooth_rate, comp_rate, win_comp, win_total, stats),
                 )
                 last_chk_step = stage_steps
 

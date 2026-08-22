@@ -99,12 +99,22 @@ class RewardWeights:
     dominant gradient was "do not touch anything", and the cheapest policy
     satisfying it is to wander in open copper (-6.2) rather than to route.
 
-    It compounds: while the head is jammed the router will not move it, so the
-    observation is frozen and the -0.5 accrues against a state the agent
-    cannot act its way out of. `max_collision_steps` ends the net after 16
-    CONSECUTIVE stuck steps, which caps the penalty near -13, keeps success
-    (+26.4) the dominant term, and returns the sample budget to boards where
-    something is still learnable.
+    The original diagnosis assumed the router refused to move a colliding
+    head, so the penalty accrued against a frozen state. MEASURED ON COLAB,
+    that is false: over 2000 steps, 275 collided and the head still advanced
+    501244 nm on each of them -- a full 0.5 mm step. A colliding head is not
+    jammed, it is contouring, and the whole 120-step budget can legitimately
+    be spent in contact.
+
+    So the time cap is not what bounds this; the per-step weight has to. At
+    0.5 a fully-contacting net cost -66 against a +26.4 success (2.51x), which
+    is the same failure-dominates-success shape the cap was meant to remove.
+    At 0.15 the worst case is -24.2 (0.92x) and the measured 13.75%-contact
+    case is -8.7, so contact stays a real signal without outweighing the
+    reason to route at all.
+
+    `max_collision_steps` stays as a safety net for a genuinely frozen head.
+    On the measured behaviour it never fires, which is the correct outcome.
 
     Two qualifiers, both load-bearing:
 
@@ -121,7 +131,7 @@ class RewardWeights:
 
     progress: float = 1.0
     step: float = 0.01          # gentle step cost so detours are viable
-    collision: float = 0.5      # the Gate-B-validated per-step failure signal
+    collision: float = 0.15     # the Gate-B-validated per-step failure signal
     max_collision_steps: int = 16   # give up after this many CONSECUTIVE collision
                                     # steps; see the note below
     net_done: float = 25.0

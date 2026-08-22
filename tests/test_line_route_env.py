@@ -557,11 +557,18 @@ def test_the_collision_run_resets_when_the_head_gets_free():
         assert info["failed"] == [], "a run that keeps breaking is not a jam"
 
 
-def test_capping_the_jam_keeps_success_worth_more_than_failure():
-    """The reward-shape claim, as arithmetic rather than as a comment."""
+def test_a_fully_contacting_net_still_costs_less_than_a_success_pays():
+    """The reward-shape claim, as arithmetic rather than as a comment.
+
+    Colab measured the head advancing a full 0.5 mm step on every one of 275
+    colliding steps, so a colliding head is contouring, not jammed, and the
+    whole per-net budget can legitimately be spent in contact. The time cap
+    therefore does not bound this -- the per-step weight has to.
+    """
     w = RewardWeights()
-    worst_jam = -(w.collision + w.step) * w.max_collision_steps - w.net_failed
-    assert abs(worst_jam) < w.net_done, (
-        f"a jammed net costs {worst_jam:.1f} against a success worth +{w.net_done:.1f}; "
-        "failure must not dominate the gradient"
+    budget = 120  # max_steps_per_net used by the curriculum
+    worst = -(w.collision + w.step) * budget - w.net_failed
+    assert abs(worst) < w.net_done, (
+        f"a net that collides for its whole budget costs {worst:.1f} against a "
+        f"success worth +{w.net_done:.1f}; failure must not dominate the gradient"
     )
