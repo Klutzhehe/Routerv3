@@ -1,76 +1,49 @@
-# Handoff: via-hop protocol + env smoke run
+# Handoff: smoke re-run after the per-step caching fix
 
-Two independent things in one Colab trip. No C++ changed since the last
-rebuild, so a restored Drive cache is fine.
+Small run. The previous smoke run measured 0.745ms/step against a 0.035ms
+budget, because the obstacle list was being rebuilt every step when nothing
+in it changes within a net. That is now cached per net. Two things need
+confirming: the speedup is real, and the refactor changed no behaviour.
 
-Paste the block below to Antigravity.
+Cached build is fine — no C++ changed.
 
 ---
 
-> **Run two scripts in Colab and report their real output.**
-> Do not edit tracked source — if something fails, report the failure with
-> its full output instead of fixing it (`AGENTS.md`).
+> **Re-run one script in Colab and report its output.**
+> Do not edit tracked source — report failures with their full output
+> instead of fixing them (`AGENTS.md`).
 >
 > **Setup:** `notebooks/00_setup.ipynb` steps 1–4. Don't skip step 2
-> (`git pull`) — both scripts are new. No C++ changed since the last run, so
-> a cached build is fine.
->
-> **1 — Via-hop protocol.** Gate A proved `switch_layer()` is dead and that
-> `toggle_via_placement()` commits a via, but not that a route can change
-> layer and keep going. This tests that.
+> (`git pull`) — the fix being tested is in the latest commit. A restored
+> Drive cache is fine, no C++ changed.
 >
 > ```bash
-> python3 pcbworld/data/generate_board.py smd1.kicad_pcb --num-nets 1 --seed 0 && python3 scripts/diagnose_via_hop.py smd1.kicad_pcb 2>&1 | tee via_hop.log
+> python3 pcbworld/data/generate_board.py board24.kicad_pcb --num-nets 24 --seed 0 && python3 scripts/smoke_line_env.py board24.kicad_pcb 2>&1 | tee smoke_env2.log
 > ```
 >
-> **2 — Env smoke run.** First time the new RL environment touches the real
-> router. It has a predicted answer, so it is a test rather than a smoke
-> check: the env's `a = 0` action means "walk straight at the target", so the
-> greedy policy IS the straight-line router, and that router already measured
-> **9/24** on this board.
+> Same board, same seed as last time, so the numbers are directly comparable.
 >
-> ```bash
-> python3 pcbworld/data/generate_board.py board24.kicad_pcb --num-nets 24 --seed 0 && python3 scripts/smoke_line_env.py board24.kicad_pcb 2>&1 | tee smoke_env.log
-> ```
->
-> Keep each `generate_board.py` call as its own process exactly as written —
-> it uses system `pcbnew`, which crashes if it shares a process with the
-> bridge.
->
-> **Report back — real output, not a summary:**
-> - `via_hop.log` in full, especially the `VERDICT` block verbatim and the
->   `committed:` note naming how many vias and the per-layer track counts —
->   that line is the only part that proves anything on disk.
-> - `smoke_env.log` in full: both the greedy and random `---` blocks and the
->   whole `VERDICT`. The numbers I need are **routed n/24 for greedy**,
->   **routed n/24 for random**, and the **median wall clock per step**.
-> - Any `AssertionError` with its full traceback — the smoke script asserts
->   on every observation, so an assertion means the env disagrees with the
->   real router about something specific.
-> - If anything segfaults: the last line printed before the crash plus the
->   `faulthandler`/`gdb` traceback, same as before.
+> **Report back:**
+> - `smoke_env2.log` in full — both `---` blocks and the whole `VERDICT`.
+> - The three numbers I am comparing against the previous run:
+>   **greedy routed n/24** (was 8/24), **random routed n/24** (was 9/24), and
+>   **median wall clock per step** (was 0.745ms).
+> - Any `AssertionError` with its full traceback.
 
 ---
 
-## What the outcomes mean
+## What the numbers mean
 
-**Via hop:**
+| | Previous | Expected now |
+|---|---|---|
+| greedy routed | 8/24 | **exactly 8/24** |
+| random routed | 9/24 | 9/24 |
+| median ms/step | 0.745 | well below — the point of the change |
 
-| Result | Consequence |
-|---|---|
-| `LAYER HOPPING CONFIRMED ON DISK` | Two-layer routing works; a place-via action goes into the env for stage 3 |
-| `PARTIAL` | Head state looked right, copper disagreed — the exact overclaim the script exists to catch |
-| `NO MID-ROUTE HOP` | Stay single-layer; revisit only if stage 3 plateaus |
+**Greedy moving off 8/24 is the finding, not the speed.** The change was pure
+caching: the obstacle set is identical, just built once per net instead of
+once per step. If completions move, the cache is going stale somewhere the
+env still needs it fresh, and that matters far more than the millisecond.
 
-**Env smoke:**
-
-| Greedy result | Consequence |
-|---|---|
-| Near 9/24 | The whole stack lines up against real geometry — start PPO on stage 1 |
-| 0/24 | Structural break (heading convention, snap radius vs step size, pad candidates). PPO would train against a broken env |
-| Well below 9/24 | The env does something, but not what the straight-line router does. Understand before training |
-| Well above 9/24 | Not automatically good — incremental 1mm pushes should beat one big push somewhat, but a large jump wants explaining |
-
-Random must come in **below** greedy. If it ties, the action isn't affecting
-outcomes and there's no gradient for PPO to follow — that's a stop-and-fix,
-not a curiosity.
+Random can drift by a net or two — it is seeded, but it consumes a different
+number of RNG draws if any episode length changes.
