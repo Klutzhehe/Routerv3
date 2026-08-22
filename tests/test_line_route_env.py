@@ -572,3 +572,101 @@ def test_a_fully_contacting_net_still_costs_less_than_a_success_pays():
         f"a net that collides for its whole budget costs {worst:.1f} against a "
         f"success worth +{w.net_done:.1f}; failure must not dominate the gradient"
     )
+
+
+# -- the obstacle-aware potential ---------------------------------------
+
+
+def test_the_observation_carries_the_distance_the_reward_is_shaped_on():
+    """dist_to_target is the straight line; the potential is the obstacle-free
+    path. A critic given only the former is asked to predict returns from a
+    feature blind to what generates them."""
+    env = _one_net()
+    obs, _ = env.reset()
+    gi = GLOBAL_INDEX["geodesic_dist"]
+    assert obs[gi] > 0.0
+    assert obs[gi] >= obs[GLOBAL_INDEX["dist_to_target"]] - 1e-3, (
+        "an obstacle-free route can never be shorter than the straight line"
+    )
+
+
+def test_an_unreachable_target_falls_back_to_the_straight_line_for_the_whole_net():
+    """Mixing the two potentials within one net would put a reward spike on
+    every switch -- exactly the farmable artifact potential-based shaping
+    exists to rule out. The fallback is decided once, at _begin_net."""
+    from pcbworld.env.geodesic import GeodesicConfig
+
+    # Inflation wider than the board seals every cell, so nothing is routable.
+    env = _one_net(geodesic_config=GeodesicConfig(inflation_nm=50 * MM))
+    obs, _ = env.reset()
+    assert env._field is None, "should have dropped the field for this net"
+
+    gi, di = GLOBAL_INDEX["geodesic_dist"], GLOBAL_INDEX["dist_to_target"]
+    assert obs[gi] == pytest.approx(obs[di], rel=1e-6)
+
+    for _ in range(5):
+        obs, reward, *_ = env.step(np.array([0.0], dtype=np.float32))
+        assert math.isfinite(reward)
+        assert obs[gi] == pytest.approx(obs[di], rel=1e-6)
+
+
+# net_0 runs 2mm -> 20mm at y=10mm; net_1's pad sits at (11mm, 10mm), squarely
+# on that line. net_1 is the longer net, so shortest-first routes net_0 first
+# and that pad is a genuine obstacle rather than an endpoint.
+_BLOCKED_NETS = [
+    fake_bridge.NetPad("net_0", "A", 2 * MM, 10 * MM, -1),
+    fake_bridge.NetPad("net_0", "B", 20 * MM, 10 * MM, -1),
+    fake_bridge.NetPad("net_1", "C", 11 * MM, 10 * MM, -1),
+    fake_bridge.NetPad("net_1", "D", 11 * MM, 32 * MM, -1),
+]
+
+
+def _blocked_env():
+    bridge.PNSBridge = lambda: fake_bridge.FakePNSBridge(nets=_BLOCKED_NETS)
+    return LineRouteEnv(
+        "fake_board.kicad_pcb",
+        obs_config=LineObsConfig(k_nearest=32, max_steps=120),
+        max_steps_per_net=120,
+    )
+
+
+def test_the_reward_now_pays_to_go_round_an_obstacle_rather_than_into_it():
+    """The whole point of the change, measured through step()'s real reward.
+
+    Under the straight-line potential this ordering was inverted at every
+    distance: driving at the obstacle paid +0.0545 against +0.0050 for
+    contouring, so each step of a correct detour scored worse than the wrong
+    move and 600k steps of PPO never assembled one. Benchmarked against the
+    greedy router afterwards, the learned policy sat at 62.10% against the
+    baseline's 62.90% -- indistinguishable, at a 1.06x wirelength ratio that
+    says it was still drawing straight lines.
+    """
+
+    def reward_for(action, after_n_straight_steps):
+        env = _blocked_env()
+        env.reset()
+        for _ in range(after_n_straight_steps):
+            env.step(np.array([0.0], dtype=np.float32))
+        return env.step(np.array([action], dtype=np.float32))[1]
+
+    for approach in (0, 10, 16):
+        straight = reward_for(0.0, approach)
+        veer = reward_for(0.22, approach)  # ~20 degrees off the bearing
+        assert veer > straight, (
+            f"{approach} steps in: driving at the pad pays {straight:+.4f} against "
+            f"{veer:+.4f} for going round it -- the potential still rewards the "
+            "wrong move"
+        )
+
+
+def test_the_detour_shows_up_in_the_observation_before_the_head_reaches_it():
+    """The policy has to be able to SEE that a detour is coming, or the critic
+    is predicting returns from a feature blind to what drives them."""
+    env = _blocked_env()
+    obs, _ = env.reset()
+    straight_line = obs[GLOBAL_INDEX["dist_to_target"]]
+    obstacle_free = obs[GLOBAL_INDEX["geodesic_dist"]]
+    assert obstacle_free > straight_line, (
+        f"pad sits on the line but geodesic ({obstacle_free:.3f}) does not exceed "
+        f"straight-line ({straight_line:.3f})"
+    )

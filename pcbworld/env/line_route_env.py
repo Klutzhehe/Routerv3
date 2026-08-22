@@ -67,6 +67,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from pcbworld.env.geodesic import GeodesicConfig, GeodesicField
 from pcbworld.env.line_obs import (
     KIND_PAD,
     MM,
@@ -162,6 +163,7 @@ class LineRouteEnv(gym.Env):
         max_steps_per_net: int = 100,
         gamma: float = 0.99,
 
+        geodesic_config: GeodesicConfig | None = None,
         run_drc_at_episode_end: bool = False,
         enable_ripup: bool = False,
         max_ripups_per_episode: int = 8,
@@ -196,6 +198,7 @@ class LineRouteEnv(gym.Env):
         self.run_drc_at_episode_end = run_drc_at_episode_end
         self.enable_ripup = enable_ripup
         self.max_ripups_per_episode = max_ripups_per_episode
+        self._geodesic_config = geodesic_config or GeodesicConfig(cell_nm=float(step_size_nm))
 
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
@@ -223,6 +226,7 @@ class LineRouteEnv(gym.Env):
         self._routed_len = 0.0
         self._collides = False
         self._collision_run = 0
+        self._field: GeodesicField | None = None
         self._completed: list[str] = []
         self._failed: list[str] = []
 
@@ -385,7 +389,7 @@ class LineRouteEnv(gym.Env):
         heading = base_heading + turn
         self._prev_heading = heading
 
-        prev_dist = math.hypot(dx, dy)
+        prev_pos = self._pos
         goal = (
             self._pos[0] + self.step_size_nm * math.cos(heading),
             self._pos[1] + self.step_size_nm * math.sin(heading),
@@ -418,7 +422,7 @@ class LineRouteEnv(gym.Env):
                 self._blocking_nets.add(obs_item.net)
 
         dist = math.hypot(self._target_xy[0] - self._pos[0], self._target_xy[1] - self._pos[1])
-        reward = self._shaping(prev_dist, dist) - self.weights.step
+        reward = self._shaping(prev_pos, self._pos) - self.weights.step
         if self._collides:
             reward -= self.weights.collision
 
@@ -469,11 +473,25 @@ class LineRouteEnv(gym.Env):
 
     # -- internals ------------------------------------------------------
 
-    def _shaping(self, prev_dist: float, dist: float) -> float:
-        scale = self.obs_config.length_scale
-        phi_prev = -self.weights.progress * prev_dist / scale
-        phi_next = -self.weights.progress * dist / scale
-        return self.gamma * phi_next - phi_prev
+    def _potential(self, pos: tuple[float, float]) -> float:
+        """-(distance still to travel) / length_scale.
+
+        Obstacle-free distance when a field exists, straight-line when it does
+        not. Never a mix within one net: `_rebuild_obstacles` drops the field
+        for the whole net if the target is unreachable, so the definition is
+        fixed for the duration and the telescoping stays honest."""
+        d = self._geodesic_dist(pos)
+        return -self.weights.progress * d / self.obs_config.length_scale
+
+    def _geodesic_dist(self, pos: tuple[float, float]) -> float:
+        if self._field is not None:
+            c = self._field.cost_to_go(pos[0], pos[1])
+            if math.isfinite(c):
+                return c
+        return math.hypot(self._target_xy[0] - pos[0], self._target_xy[1] - pos[1])
+
+    def _shaping(self, prev_pos, pos) -> float:
+        return self.gamma * self._potential(pos) - self._potential(prev_pos)
 
     def _try_finish(self) -> bool:
         """force_finish/force_commit=True is the Colab-verified convention
@@ -532,6 +550,22 @@ class LineRouteEnv(gym.Env):
         """
         self._obstacles = self._build_obstacles()
 
+        # Same lifetime as the obstacle cache it is built from: committed
+        # copper only changes when a net finishes, so the cost-to-go field is
+        # valid for exactly as long as this list is. ~20ms per net against a
+        # ~1.4s rollout.
+        self._field = GeodesicField.build(
+            self._obstacles,
+            head=self._pos,
+            target=self._target_xy,
+            config=self._geodesic_config,
+        )
+        if not self._field.reachable:
+            # No obstacle-free route exists at all. Fall back to the straight
+            # line for the whole net rather than per query -- a potential that
+            # changes definition mid-net puts a reward spike on the switch.
+            self._field = None
+
     def _build_obstacles(self) -> list:
         net = self._nets[self._net_index] if self._net_index < len(self._nets) else ""
         segments = list(self._static_segments)
@@ -588,6 +622,7 @@ class LineRouteEnv(gym.Env):
             # while colliding and from the target bearing otherwise. None means
             # "the target bearing", which the obs frame already encodes as +x.
             base_heading=self._prev_heading if self._collides else None,
+            geodesic_dist=self._geodesic_dist(self._pos),
         )
 
 

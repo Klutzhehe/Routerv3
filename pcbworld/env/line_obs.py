@@ -43,6 +43,14 @@ the greedy baseline rather than below it -- the property the CFP design
 wanted from its zero-init flat field, obtained here by choosing coordinates
 well instead of by architecture.
 
+## geodesic_dist
+
+`dist_to_target` is the straight line. The reward's potential is the shortest
+obstacle-free path (see env/geodesic.py), and those differ by exactly the
+amount an obstacle is in the way -- so a critic given only the straight line
+is being asked to predict returns from a feature blind to what generates
+them. This carries the quantity the potential is actually built from.
+
 ## base_heading_cos / base_heading_sin
 
 The env does not always turn from the target bearing. While the head is
@@ -105,6 +113,7 @@ GLOBAL_FEATURES: tuple[str, ...] = (
     "length_slack",       # / length_scale; 0 until the length-tuning stage
     "base_heading_cos",   # see below -- the frame the NEXT action turns from
     "base_heading_sin",
+    "geodesic_dist",      # shortest OBSTACLE-FREE distance / length_scale
 )
 NUM_GLOBAL = len(GLOBAL_FEATURES)
 
@@ -277,6 +286,7 @@ def build_observation(
     config: LineObsConfig,
     length_slack: float = 0.0,
     base_heading: float | None = None,
+    geodesic_dist: float | None = None,
 ) -> np.ndarray:
     """The flat observation vector: globals, then k_nearest segment rows.
 
@@ -307,6 +317,13 @@ def build_observation(
         bearing = math.atan2(target[1] - head[1], target[0] - head[0])
         delta = base_heading - bearing
         obs[8], obs[9] = math.cos(delta), math.sin(delta)
+
+    # The distance the reward is actually shaped on. dist_to_target is the
+    # straight line, which is what the potential USED to use; the critic has
+    # to predict returns driven by the obstacle-free distance, and cannot do
+    # that from a feature that ignores the obstacles. None means no field was
+    # built, in which case the two coincide by definition.
+    obs[10] = (dist if geodesic_dist is None else geodesic_dist) / scale
 
     if not segments:
         return obs

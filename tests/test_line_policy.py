@@ -116,7 +116,8 @@ def test_rms_update_accepts_a_single_unbatched_sample():
 
 def test_rms_matches_whether_fed_batched_or_one_at_a_time():
     rng = np.random.default_rng(1)
-    data = rng.normal(size=(500, NUM_GLOBAL)).astype(np.float32) * [1, 2, 3, 4, 5, 6, 7, 8, 9, 10][:NUM_GLOBAL]
+    # per-feature scales, so a collapse across features would show up
+    data = rng.normal(size=(500, NUM_GLOBAL)).astype(np.float32) * np.arange(1, NUM_GLOBAL + 1)
 
     batched = RunningMeanStd(shape=(NUM_GLOBAL,))
     batched.update(data)
