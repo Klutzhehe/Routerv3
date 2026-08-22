@@ -123,10 +123,19 @@ class LineRouteEnv(gym.Env):
         # Deferred: the bridge only exists after the Colab build, and a type
         # checker or a test collecting this file must not hard-fail.
         import pcbworld_pns_bridge as bridge
+        import os
 
         self._module = bridge
         self.bridge = bridge.PNSBridge()
-        self.board_path = board_path
+        if isinstance(board_path, (list, tuple)):
+            self.board_paths = list(board_path)
+        elif os.path.isdir(board_path):
+            self.board_paths = sorted([os.path.join(board_path, f) for f in os.listdir(board_path) if f.endswith(".kicad_pcb")])
+            assert self.board_paths, f"No .kicad_pcb boards found in directory {board_path}"
+        else:
+            self.board_paths = [board_path]
+
+        self.board_path = self.board_paths[0]
         self.net_order = net_order
         self.max_nets = max_nets
         self.obs_config = obs_config or LineObsConfig(max_steps=max_steps_per_net)
@@ -143,7 +152,7 @@ class LineRouteEnv(gym.Env):
             low=-np.inf, high=np.inf, shape=(self.obs_config.flat_size,), dtype=np.float32
         )
 
-        self._board_loaded = False
+        self._current_board_path: str | None = None
         self._pads: list = []
         self._nets: list[str] = []
         self._net_index = 0
@@ -226,9 +235,11 @@ class LineRouteEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
 
-        if not self._board_loaded:
-            assert self.bridge.load_board(self.board_path), f"load_board failed: {self.board_path}"
-            self._board_loaded = True
+        chosen_board = np.random.choice(self.board_paths) if len(self.board_paths) > 1 else self.board_paths[0]
+        if self._current_board_path != chosen_board:
+            assert self.bridge.load_board(chosen_board), f"load_board failed: {chosen_board}"
+            self._current_board_path = chosen_board
+            self.board_path = chosen_board
             self._pads = list(self.bridge.net_pads())
 
         # reset() rather than reloading: it strips tracks/vias and keeps

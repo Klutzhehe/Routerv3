@@ -44,7 +44,9 @@ def _make_env(nets=None, **kwargs) -> LineRouteEnv:
     bridge.PNSBridge = lambda: fake_bridge.FakePNSBridge(nets=nets or _NETS)
     kwargs.setdefault("obs_config", LineObsConfig(k_nearest=8, max_steps=40))
     kwargs.setdefault("max_steps_per_net", 40)
-    return LineRouteEnv("fake_board.kicad_pcb", **kwargs)
+    board_path = kwargs.pop("board_path", "fake_board.kicad_pcb")
+    return LineRouteEnv(board_path, **kwargs)
+
 
 
 def _one_net(**kwargs):
@@ -316,3 +318,12 @@ def test_globals_report_progress_within_the_observation():
     obs, *_ = env.step(np.array([0.0], dtype=np.float32))
     assert obs[0] < start_dist
     assert obs[NUM_GLOBAL - 1] == 0.0  # length_slack unused until the tuning stage
+
+
+def test_board_pool_support():
+    boards = ["fake_board1.kicad_pcb", "fake_board2.kicad_pcb"]
+    env = _make_env(board_path=boards)
+    assert env.board_paths == boards
+    obs, info = env.reset()
+    assert env.observation_space.contains(obs)
+
