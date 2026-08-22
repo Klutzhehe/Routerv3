@@ -1,52 +1,48 @@
-# Handoff: Gate A re-run (round 2)
+# Handoff: via-hop protocol run (round 3)
 
-Gate B is **done and passed** — no need to run it again. Round 1's Gate A
-segfaulted on its second trial; that was a real use-after-free in
-`PNS_BRIDGE::LoadBoard()`, now fixed. **The C++ changed, so this round needs
-a real rebuild, not a cache restore.**
+Gate A and Gate B are both **done**. Round 2 proved `switch_layer()` is dead
+(accepts only a no-op; every hypothesis eliminated) and that
+`toggle_via_placement()` commits a real via — but **not** that a route can
+change layer and keep going, which is the half stage 3+ needs.
+
+This run tests one specific protocol. No C++ changed since round 2, so a
+cached build is fine.
 
 Paste the block below to Antigravity.
 
 ---
 
-> **Rebuild the bridge and re-run one diagnostic in Colab.**
+> **Run one diagnostic in Colab and report its real output.**
 > Do not edit tracked source — if something fails, report the failure with
 > its full output instead of fixing it (`AGENTS.md`).
 >
-> **Setup:** `notebooks/00_setup.ipynb` steps 1–4. **Do not skip step 2
-> (`git pull`)** — `pcbworld/engine/cpp/pns_bridge.cpp` changed since the
-> last run, and this run is pointless without it. The build step will
-> recompile the changed file; if it reports nothing to do, the pull did not
-> land and the run should stop there.
+> **Setup:** `notebooks/00_setup.ipynb` steps 1–4. Don't skip step 2
+> (`git pull`) — the script is new. No C++ changed since the last run, so a
+> restored Drive cache is fine this time.
 >
-> **Step 0 — confirm the rebuild actually happened:**
 > ```bash
-> ls -l --time-style=+%Y-%m-%dT%H:%M /content/kicad-src/build/pcbworld_bridge/pcbworld_pns_bridge*.so
-> date
+> python3 pcbworld/data/generate_board.py smd1.kicad_pcb --num-nets 1 --seed 0 && python3 scripts/diagnose_via_hop.py smd1.kicad_pcb 2>&1 | tee via_hop.log
 > ```
-> Report both. If the `.so` timestamp is older than this session, the new
-> C++ is not in the running module and everything below is meaningless.
->
-> **Gate A:**
-> ```bash
-> python3 pcbworld/data/generate_board.py smd1.kicad_pcb --num-nets 1 --seed 0
-> python3 pcbworld/data/generate_board.py tht1.kicad_pcb --num-nets 1 --seed 0 --pad-type tht
-> python3 scripts/diagnose_layer_switch.py smd1.kicad_pcb --tht-board tht1.kicad_pcb 2>&1 | tee gate_a.log
-> ```
->
-> Keep each `generate_board.py` call as its own process exactly as written —
-> it uses system `pcbnew`, which crashes if it shares a process with the
-> bridge.
 >
 > **Report back — real output, not a summary:**
-> - Step 0: both outputs.
-> - `gate_a.log`: the whole thing. Every trial row now prints as it
->   completes, so even a crash leaves a usable log — send whatever the log
->   contains, including a partial one.
-> - The `VERDICT` block verbatim. It prints conclusions, not just booleans —
->   that block is the actual deliverable.
+> - `via_hop.log` in full. Every row prints as it completes, so send a
+>   partial log if it crashes.
+> - The `VERDICT` block verbatim.
 > - Any row showing `ERROR`, with its exception text.
-> - **If it segfaults again**, say which trial name was the last one printed
->   before the crash, and include the `faulthandler`/`gdb` traceback the same
->   way you did last time — that was exactly what made the previous bug
->   findable.
+> - Pay particular attention to the `full_two_hop` rows: the `committed:`
+>   note naming how many vias and the per-layer track counts is the only
+>   part of this that proves anything on disk. Send that line exactly.
+> - If it segfaults: the last trial name printed, plus the
+>   `faulthandler`/`gdb` traceback, same as before.
+
+---
+
+## What the outcomes mean
+
+| Result | Consequence |
+|---|---|
+| `LAYER HOPPING CONFIRMED ON DISK` — vias committed **and** tracks on two layers | Two-layer routing works. A place-via action goes into the env; stage 3 can use it |
+| `PARTIAL` — route committed but single-layer copper | Head state looked right and the copper disagreed. That is precisely the overclaim round 2 made; the script is built to catch it |
+| `NO MID-ROUTE HOP` | Stay single-layer. Stages 1–3 don't need vias; revisit only if stage 3 plateaus against the 9/24 baseline |
+
+None of these block the trainer — stages 1 and 2 are single-layer by design.
