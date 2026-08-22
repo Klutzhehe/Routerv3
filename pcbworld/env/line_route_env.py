@@ -92,14 +92,15 @@ class RewardWeights:
     """
 
     progress: float = 1.0
-    step: float = 0.02
+    step: float = 0.01          # gentle step cost so detours are viable
     collision: float = 0.5      # the Gate-B-validated per-step failure signal
     net_done: float = 10.0
     net_failed: float = 5.0
-    detour: float = 2.0         # per unit of (routed / straight-line - 1)
+    detour: float = 0.5         # relaxed so going around obstacles is not penalized
     drc: float = 0.0            # per violation, once per episode; 0 = off
     ripup: float = 1.0          # penalty charged per ripped-up net
     length_mismatch: float = 1.0 # penalty per unit length discrepancy on length-matched groups
+
 
 
 
@@ -305,6 +306,7 @@ class LineRouteEnv(gym.Env):
         self._collides = False
         self._blocking_nets = set()
         self._target_ref_length = 0.0
+        self._prev_heading = math.atan2(self._target_xy[1] - self._start_xy[1], self._target_xy[0] - self._start_xy[0])
 
         if net.startswith("diffpair_"):
             self.bridge.set_mode(self._module.MODE_ROUTE_DIFF_PAIR)
@@ -330,13 +332,15 @@ class LineRouteEnv(gym.Env):
     def step(self, action):
         turn = float(np.clip(np.asarray(action).reshape(-1)[0], -1.0, 1.0)) * MAX_TURN_RAD
 
-        # Bearing to the target, then the policy's turn on top of it. This is
-        # what makes a=0 mean "straight at the pad" -- the same convention
-        # line_obs.py's frame uses, and the two must not drift apart.
         dx = self._target_xy[0] - self._pos[0]
         dy = self._target_xy[1] - self._pos[1]
         bearing = math.atan2(dy, dx) if (dx or dy) else 0.0
-        heading = bearing + turn
+
+        # When colliding against an obstacle, maintain heading momentum so turns
+        # contour along the obstacle perimeter rather than getting pulled straight back into it.
+        base_heading = self._prev_heading if self._collides else bearing
+        heading = base_heading + turn
+        self._prev_heading = heading
 
         prev_dist = math.hypot(dx, dy)
         goal = (
@@ -345,8 +349,6 @@ class LineRouteEnv(gym.Env):
         )
 
         self.bridge.push(int(goal[0]), int(goal[1]), -1)
-
-
 
         # Read the head back rather than trusting the requested point: push()
         # is ROUTER::Move(), which may not land exactly where it was told, and
@@ -425,11 +427,14 @@ class LineRouteEnv(gym.Env):
         """force_finish/force_commit=True is the Colab-verified convention
         (commit 7f746b6) and is what snaps the route to the target pad."""
         net = self._nets[self._net_index]
+        # Push router head directly into the target pad candidate ID to snap both legs
+        self.bridge.push(int(self._target_xy[0]), int(self._target_xy[1]), self._target_id)
         ok = bool(
             self.bridge.fix(
                 int(self._target_xy[0]), int(self._target_xy[1]), self._target_id, True, True
             )
         )
+
         if ok:
             self.bridge.commit_routing()
             self._completed.append(net)
