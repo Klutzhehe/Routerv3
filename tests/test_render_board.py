@@ -17,7 +17,8 @@ matplotlib.use("Agg")  # headless -- no display in a test run
 import matplotlib.pyplot as plt
 import pytest
 
-from pcbworld.viz.render_board import _net_color, render_board
+from pcbworld.viz.render_board import _net_color, render_board, render_board_layers_split
+
 
 MM = 1_000_000
 
@@ -163,5 +164,33 @@ def test_title_reports_track_and_via_counts_by_default():
         [], [], [], [],
     )
     ax = render_board(geometry)
-    assert "1 track segment" in ax.get_title()
-    assert "1 via" in ax.get_title()
+    assert "1 track(s)" in ax.get_title()
+    assert "1 via(s)" in ax.get_title()
+
+
+def test_layer_filtering_isolates_front_and_back_copper():
+    track_top = TrackSegment(0, 0, 10 * MM, 0, 250_000, 0, "net_0", False)
+    track_bot = TrackSegment(0, 10 * MM, 10 * MM, 10 * MM, 250_000, 31, "net_1", False)
+    geometry = BoardGeometry([track_top, track_bot], [], [], [], [], [])
+
+    ax_top = render_board(geometry, layer=0)
+    assert len(ax_top.lines) == 1
+    assert "F_Cu" in ax_top.get_title()
+
+    ax_bot = render_board(geometry, layer=31)
+    assert len(ax_bot.lines) == 1
+    assert "B_Cu" in ax_bot.get_title()
+
+    ax_all = render_board(geometry, layer=None)
+    assert len(ax_all.lines) == 2
+
+
+def test_render_board_layers_split_creates_three_panels(tmp_path):
+    track = TrackSegment(0, 0, 10 * MM, 0, 250_000, 0, "net_0", False)
+    geometry = BoardGeometry([track], [], [], [], [], [EdgeShape("rect", 0, 0, 20 * MM, 20 * MM, 0)])
+
+    out_file = tmp_path / "split_test.png"
+    fig, axes = render_board_layers_split(geometry, save_path=str(out_file))
+    assert len(axes) == 3
+    assert out_file.exists()
+
