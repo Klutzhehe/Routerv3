@@ -23,6 +23,8 @@ tests/          # Unit + integration tests
 docs/           # Design notes, findings on KiCad API surface
 ```
 
+**Picking this up mid-project?** Start with [`docs/HANDOVER.md`](docs/HANDOVER.md).
+
 Two parallel tracks: [`kicad_plugin/`](kicad_plugin/) is a working-today LLM
 advisor Action Plugin (reads board state, asks an LLM, reports back) using
 KiCad's standard scripting API -- no build required, but it can't drive the
