@@ -102,12 +102,21 @@ class RewardWeights:
     It compounds: while the head is jammed the router will not move it, so the
     observation is frozen and the -0.5 accrues against a state the agent
     cannot act its way out of. `max_collision_steps` ends the net after 16
-    CONSECUTIVE collision steps (8 mm of contact at a 0.5 mm step), which caps
-    the penalty near -13, keeps success (+26.4) the dominant term, and returns
-    the sample budget to boards where something is still learnable.
+    CONSECUTIVE stuck steps, which caps the penalty near -13, keeps success
+    (+26.4) the dominant term, and returns the sample budget to boards where
+    something is still learnable.
 
-    Consecutive rather than cumulative on purpose: the target is the jammed
-    state specifically, so escaping and re-contacting elsewhere resets it.
+    Two qualifiers, both load-bearing:
+
+    Consecutive rather than cumulative -- the target is the jammed state
+    specifically, so escaping and re-contacting elsewhere resets the count.
+
+    STUCK rather than merely colliding. Contour-following holds contact for as
+    long as the obstacle lasts, so a plain collision count would abandon the
+    net partway through the exact manoeuvre this is meant to make affordable,
+    and the agent would never collect a completed detour to learn from. A head
+    that is colliding and still advancing is working; one that is colliding and
+    not moving is the case worth cutting.
     """
 
     progress: float = 1.0
@@ -383,7 +392,14 @@ class LineRouteEnv(gym.Env):
         self._pos = (float(head.end_x), float(head.end_y))
         self._routed_len += moved
         self._collides = bool(self.bridge.head_collides())
-        self._collision_run = self._collision_run + 1 if self._collides else 0
+        # Only a STUCK collision counts toward the jam. Sliding along an
+        # obstacle keeps head_collides() true for as long as the contact
+        # lasts, so counting every colliding step would abandon the net in
+        # the middle of a successful contour -- killing the one manoeuvre
+        # this is supposed to make affordable. A frozen head is the thing
+        # worth giving up on, and `moved` is what distinguishes the two.
+        stuck = self._collides and moved < 0.25 * self.step_size_nm
+        self._collision_run = self._collision_run + 1 if stuck else 0
         self._steps += 1
 
         if self._collides and hasattr(self.bridge, "get_head_obstacle"):

@@ -37,6 +37,7 @@ try:
 except ImportError:
     torch = None
 
+from pcbworld.env.line_obs import NUM_GLOBAL
 from pcbworld.env.line_route_env import LineRouteEnv
 from pcbworld.viz.render_board import render_board_layers_split
 
@@ -99,9 +100,9 @@ def evaluate_board(
     rms: RunningMeanStd | None = None,
     enable_ripup: bool = True,
     max_ripups: int = 8,
-    step_size_nm: int = 800_000,
-    snap_radius_nm: int = 600_000,
-    max_steps_per_net: int = 100,
+    step_size_nm: int = 500_000,
+    snap_radius_nm: int = 400_000,
+    max_steps_per_net: int = 120,
     run_drc: bool = True,
     render_path: str | None = None,
 ) -> BoardBenchmarkResult:
@@ -132,7 +133,7 @@ def evaluate_board(
         if policy is not None and torch is not None:
             norm_obs = obs.copy()
             if rms is not None:
-                norm_obs[:8] = rms.normalize(obs[:8])
+                norm_obs[:NUM_GLOBAL] = rms.normalize(obs[:NUM_GLOBAL])
             obs_t = torch.as_tensor(norm_obs, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 dist, _ = policy.forward(obs_t)

@@ -468,37 +468,77 @@ def test_observation_exposes_the_frame_the_next_turn_uses():
     assert informed == pytest.approx(_ONE_STEP_IN_SCALE_UNITS, rel=1e-3)
 
 
-def test_a_jammed_net_is_abandoned_after_max_collision_steps():
+class _FrozenCollidingBridge(_AlwaysCollidingBridge):
+    """Collides AND refuses to move: the real jam, and the only case the cap
+    is meant to cut. push() reports the head back at where it already was,
+    which is what RM_MARK_OBSTACLES does when the move is into an obstacle."""
+
+    def push(self, x: int, y: int, item_id: int = -1) -> bool:
+        if self._current_pos is None:
+            return False
+        return super().push(*self._current_pos, item_id)
+
+
+def _frozen_env(**kwargs) -> LineRouteEnv:
+    bridge.PNSBridge = lambda: _FrozenCollidingBridge(nets=_NETS[:2])
+    kwargs.setdefault("obs_config", LineObsConfig(k_nearest=8, max_steps=40))
+    kwargs.setdefault("max_steps_per_net", 40)
+    return LineRouteEnv("fake_board.kicad_pcb", **kwargs)
+
+
+def test_a_frozen_net_is_abandoned_after_max_collision_steps():
     """Uncapped, a jammed net bled 0.5/step for its whole 120-step budget: -60,
-    91% of the failed net's return and 5.8x what a clean success paid. The cap
-    ends the net instead."""
-    env = _colliding_env(reward_weights=RewardWeights(max_collision_steps=5))
+    91% of the failed net's return and 5.8x what a clean success paid."""
+    env = _frozen_env(reward_weights=RewardWeights(max_collision_steps=5))
     env.reset()
 
+    total = 0.0
     for i in range(4):
-        _, _, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
-        assert info["failed"] == [], f"gave up early at step {i + 1}"
+        _, r, _, _, info = env.step(np.array([0.0], dtype=np.float32))
+        total += r
         assert info["collision_run"] == i + 1
+        assert info["failed"] == [], f"gave up early at step {i + 1}"
 
-    _, _, _, _, info = env.step(np.array([0.0], dtype=np.float32))
+    _, r, _, _, info = env.step(np.array([0.0], dtype=np.float32))
+    total += r
     assert info["failed"] == ["net_0"]
     assert info["net_index"] == 1, "should have moved on to the next net"
+    assert total > -10.0, f"jam cost {total:.2f}; the cap is not bounding it"
+
+
+def test_contour_following_is_not_treated_as_a_jam():
+    """A head sliding along an obstacle collides continuously but keeps moving.
+
+    Counting that as a jam would abandon the net in the middle of the detour --
+    the one manoeuvre the cap exists to make affordable -- so the agent would
+    never collect a completed detour to learn from. Only colliding AND frozen
+    counts.
+    """
+    env = _colliding_env(reward_weights=RewardWeights(max_collision_steps=3))
+    env.reset()
+    for i in range(20):
+        _, _, terminated, _, info = env.step(np.array([0.3], dtype=np.float32))
+        if terminated:
+            break
+        assert info["collides"], "fixture should be colliding throughout"
+        assert info["collision_run"] == 0, f"moving head counted as jammed at step {i + 1}"
+        assert info["failed"] == []
 
 
 def test_the_collision_run_resets_when_the_head_gets_free():
-    """Consecutive, not cumulative: escaping and re-contacting elsewhere is
+    """Consecutive, not cumulative: breaking free and re-jamming elsewhere is
     normal contour-following, not a jam."""
 
-    class _Intermittent(fake_bridge.FakePNSBridge):
+    class _Intermittent(_FrozenCollidingBridge):
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
             self.calls = 0
 
-        def head_collides(self) -> bool:
-            if not self._routing_active:
-                return False
+        def push(self, x: int, y: int, item_id: int = -1) -> bool:
             self.calls += 1
-            return self.calls % 3 != 0  # collide, collide, free, repeat
+            if self.calls % 3 == 0:          # every third step it gets free
+                return fake_bridge.FakePNSBridge.push(self, x, y, item_id)
+            return super().push(x, y, item_id)
 
     bridge.PNSBridge = lambda: _Intermittent(nets=_NETS[:2])
     env = LineRouteEnv(

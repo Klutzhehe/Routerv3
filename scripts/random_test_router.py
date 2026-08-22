@@ -33,6 +33,7 @@ try:
 except ImportError:
     torch = None
 
+from pcbworld.env.line_obs import NUM_GLOBAL
 from pcbworld.env.line_route_env import LineRouteEnv
 from pcbworld.viz.render_board import render_board_layers_split
 
@@ -103,9 +104,9 @@ def run_random_test(
         board_path,
         enable_ripup=enable_ripup,
         max_ripups_per_episode=max_ripups,
-        step_size_nm=800_000,
-        snap_radius_nm=600_000,
-        max_steps_per_net=100,
+        step_size_nm=500_000,
+        snap_radius_nm=400_000,
+        max_steps_per_net=120,
     )
 
     t0 = time.perf_counter()
@@ -120,7 +121,7 @@ def run_random_test(
         if policy is not None:
             norm_obs = obs.copy()
             if rms is not None:
-                norm_obs[:8] = rms.normalize(obs[:8])
+                norm_obs[:NUM_GLOBAL] = rms.normalize(obs[:NUM_GLOBAL])
             obs_t = torch.as_tensor(norm_obs, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 dist, _ = policy.forward(obs_t)
