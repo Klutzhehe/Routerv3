@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -42,6 +43,42 @@ from pcbworld.env.line_route_env import LineRouteEnv
 from pcbworld.viz.render_board import render_board_layers_split
 
 MM = 1_000_000
+
+
+def oracle_action(env) -> "np.ndarray":
+    """Follow the cost-to-go field exactly: the ceiling this env can reach.
+
+    Not a policy to ship -- a measurement. Three training runs have landed on
+    the greedy baseline, and every diagnosis so far has assumed the agent
+    simply cannot find its way around obstacles. This settles whether that is
+    even the binding constraint: it steers perfectly by the same field the
+    reward is shaped on, with no network and no exploration, searching only
+    the +/-90 degrees the action space can actually reach. If this also lands
+    near 63%, no steering policy was ever going to clear it and the ceiling
+    is somewhere else entirely.
+    """
+    from pcbworld.env.line_route_env import MAX_TURN_RAD
+
+    if getattr(env, "_field", None) is None:
+        return np.array([0.0], dtype=np.float32)
+
+    x, y = env._pos
+    bearing = math.atan2(env._target_xy[1] - y, env._target_xy[0] - x)
+    # Mirror step()'s own frame exactly, or the turn is measured from the
+    # wrong zero and the "oracle" is just noise.
+    base = env._prev_heading if env._collides else bearing
+
+    best_turn, best_cost = 0.0, math.inf
+    for turn in np.linspace(-MAX_TURN_RAD, MAX_TURN_RAD, 61):
+        th = base + turn
+        cost = env._field.cost_to_go(
+            x + env.step_size_nm * math.cos(th),
+            y + env.step_size_nm * math.sin(th),
+        )
+        if cost < best_cost:
+            best_cost, best_turn = cost, turn
+
+    return np.array([best_turn / MAX_TURN_RAD], dtype=np.float32)
 
 
 @dataclass
@@ -67,6 +104,10 @@ class BoardBenchmarkResult:
     wirelength_ratio: float
     wall_clock_ms: float
     ms_per_step: float
+    # net name -> "fix_rejected" | "out_of_steps" | "jammed". These are three
+    # different problems sharing one completion number, and which one dominates
+    # decides whether steering was ever the thing to fix.
+    failure_reasons: dict
 
 
 @dataclass
@@ -84,6 +125,10 @@ class BenchmarkSuiteSummary:
     total_drc_violations: int
     median_ms_per_step: float
     mean_ms_per_board: float
+    failures_fix_rejected: int
+    failures_out_of_steps: int
+    failures_jammed: int
+    failures_unattributed: int
 
 
 def _classify_net(name: str) -> str:
@@ -105,6 +150,7 @@ def evaluate_board(
     max_steps_per_net: int = 120,
     run_drc: bool = True,
     render_path: str | None = None,
+    oracle: bool = False,
 ) -> BoardBenchmarkResult:
     env = LineRouteEnv(
         board_path,
@@ -130,7 +176,9 @@ def evaluate_board(
     total_straight_nm = 0.0
 
     while not terminated and steps < len(all_nets) * max_steps_per_net * 2:
-        if policy is not None and torch is not None:
+        if oracle:
+            action = oracle_action(env)
+        elif policy is not None and torch is not None:
             norm_obs = obs.copy()
             if rms is not None:
                 norm_obs[:NUM_GLOBAL] = rms.normalize(obs[:NUM_GLOBAL])
@@ -153,6 +201,7 @@ def evaluate_board(
 
     completed = info["completed"]
     failed = info["failed"]
+    failure_reasons = info.get("failure_reasons", {})
     total_completed = len(completed)
     total_nets = len(all_nets)
 
@@ -215,6 +264,7 @@ def evaluate_board(
         wirelength_ratio=wirelength_ratio,
         wall_clock_ms=wall_clock_ms,
         ms_per_step=ms_per_step,
+        failure_reasons=failure_reasons,
     )
 
 
@@ -225,6 +275,7 @@ def run_benchmark_suite(
     max_ripups: int = 8,
     render_dir: str | None = None,
     json_out: str | None = None,
+    oracle: bool = False,
 ) -> tuple[list[BoardBenchmarkResult], BenchmarkSuiteSummary]:
     policy = None
     rms = None
@@ -251,6 +302,7 @@ def run_benchmark_suite(
             enable_ripup=enable_ripup,
             max_ripups=max_ripups,
             render_path=render_file,
+            oracle=oracle,
         )
         results.append(res)
         print(
@@ -273,6 +325,11 @@ def run_benchmark_suite(
     len_t = sum(r.lengthgrp_total for r in results)
     len_c = sum(r.lengthgrp_completed for r in results)
 
+    reasons = [r for res in results for r in res.failure_reasons.values()]
+    fix_rej = sum(1 for r in reasons if r == "fix_rejected")
+    oos = sum(1 for r in reasons if r == "out_of_steps")
+    jam = sum(1 for r in reasons if r == "jammed")
+
     summary = BenchmarkSuiteSummary(
         total_boards=len(results),
         total_nets_evaluated=tot_eval,
@@ -287,6 +344,10 @@ def run_benchmark_suite(
         total_drc_violations=sum(r.drc_violations for r in results),
         median_ms_per_step=float(np.median([r.ms_per_step for r in results])),
         mean_ms_per_board=float(np.mean([r.wall_clock_ms for r in results])),
+        failures_fix_rejected=fix_rej,
+        failures_out_of_steps=oos,
+        failures_jammed=jam,
+        failures_unattributed=(tot_eval - tot_comp) - (fix_rej + oos + jam),
     )
 
     print("\n" + "=" * 80)
@@ -303,6 +364,18 @@ def run_benchmark_suite(
     print(f"Total DRC Violations:          {summary.total_drc_violations}")
     print(f"Median Decision Latency:       {summary.median_ms_per_step:6.3f} ms / step")
     print(f"Mean Board Routing Time:       {summary.mean_ms_per_board:6.1f} ms / board")
+    n_failed = tot_eval - tot_comp
+    if n_failed:
+        print("-" * 80)
+        print(f"WHY THE {n_failed} FAILED NETS FAILED")
+        print(f"  reached the pad, fix() refused:   {summary.failures_fix_rejected:4d}"
+              f"  ({summary.failures_fix_rejected / n_failed * 100:5.1f}%)  <- not a steering problem")
+        print(f"  never reached it (out of steps):  {summary.failures_out_of_steps:4d}"
+              f"  ({summary.failures_out_of_steps / n_failed * 100:5.1f}%)  <- navigation")
+        print(f"  head frozen against copper:       {summary.failures_jammed:4d}"
+              f"  ({summary.failures_jammed / n_failed * 100:5.1f}%)")
+        if summary.failures_unattributed:
+            print(f"  unattributed:                     {summary.failures_unattributed:4d}")
     print("=" * 80)
 
     if json_out:
@@ -325,6 +398,9 @@ def main():
     parser.add_argument("--max-ripups", type=int, default=8, help="Max rip-ups per board")
     parser.add_argument("--render-dir", type=str, default=None, help="Directory to save layer-split PNGs")
     parser.add_argument("--json-out", type=str, default=None, help="Path to write JSON benchmark summary")
+    parser.add_argument("--oracle", action="store_true",
+                        help="Steer by the geodesic field directly instead of a policy: measures "
+                             "the ceiling this env and action space can reach at all")
     args = parser.parse_args()
 
     if os.path.isdir(args.boards):
@@ -343,6 +419,7 @@ def main():
         max_ripups=args.max_ripups,
         render_dir=args.render_dir,
         json_out=args.json_out,
+        oracle=args.oracle,
     )
 
 

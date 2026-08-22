@@ -670,3 +670,41 @@ def test_the_detour_shows_up_in_the_observation_before_the_head_reaches_it():
         f"pad sits on the line but geodesic ({obstacle_free:.3f}) does not exceed "
         f"straight-line ({straight_line:.3f})"
     )
+
+
+def test_failed_nets_record_why_they_failed():
+    """Three different problems wear the same "37% did not route" number.
+
+    Reaching the pad and having fix() refused is not a steering failure;
+    running out of steps is. Until they are separated, "the agent cannot get
+    around obstacles" is an assumption rather than a measurement -- and three
+    training runs were spent on that assumption.
+    """
+    env = _one_net(max_steps_per_net=3, step_size_nm=1)
+    env.reset()
+    info = None
+    for _ in range(5):
+        _, _, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
+        if terminated:
+            break
+    assert info["failed"] == ["net_0"]
+    assert info["failure_reasons"] == {"net_0": "out_of_steps"}
+
+
+def test_a_jammed_net_is_recorded_separately_from_a_starved_one():
+    env = _frozen_env(reward_weights=RewardWeights(max_collision_steps=3))
+    env.reset()
+    info = None
+    for _ in range(4):
+        _, _, _, _, info = env.step(np.array([0.0], dtype=np.float32))
+    assert info["failure_reasons"] == {"net_0": "jammed"}
+
+
+def test_failure_reasons_reset_between_episodes():
+    env = _one_net(max_steps_per_net=3, step_size_nm=1)
+    env.reset()
+    for _ in range(5):
+        if env.step(np.array([0.0], dtype=np.float32))[2]:
+            break
+    _, info = env.reset()
+    assert info["failure_reasons"] == {}

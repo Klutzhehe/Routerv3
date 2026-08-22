@@ -229,6 +229,11 @@ class LineRouteEnv(gym.Env):
         self._field: GeodesicField | None = None
         self._completed: list[str] = []
         self._failed: list[str] = []
+        # Why each failed net failed. Three very different problems wear the
+        # same "37% did not route" number, and until they are separated the
+        # obvious reading -- "it cannot steer around obstacles" -- is an
+        # assumption rather than a measurement.
+        self._failure_reasons: dict[str, str] = {}
 
     # -- setup ----------------------------------------------------------
 
@@ -327,6 +332,7 @@ class LineRouteEnv(gym.Env):
         assert self._nets, "no routable two-pad 'net_*' nets on this board"
         self._net_index = 0
         self._completed, self._failed = [], []
+        self._failure_reasons = {}
         self._ripup_count = 0
         self._blocking_nets = set()
         self._ripups_performed = []
@@ -450,7 +456,7 @@ class LineRouteEnv(gym.Env):
                 self._begin_net()
                 net_done = False
             else:
-                self._abandon()
+                self._abandon("jammed" if jammed else "out_of_steps")
                 reward -= self.weights.net_failed
                 net_done = True
 
@@ -518,15 +524,17 @@ class LineRouteEnv(gym.Env):
         else:
             self.bridge.stop_routing()
             self._failed.append(net)
+            self._failure_reasons[net] = "fix_rejected"
             if net.startswith("diffpair_") and net.endswith("_P"):
                 self._failed.append(net[:-2] + "_N")
         self._route_active = False
         return ok
 
-    def _abandon(self) -> None:
+    def _abandon(self, reason: str = "out_of_steps") -> None:
         net = self._nets[self._net_index]
         self.bridge.stop_routing()
         self._failed.append(net)
+        self._failure_reasons[net] = reason
         if net.startswith("diffpair_") and net.endswith("_P"):
             self._failed.append(net[:-2] + "_N")
         self._route_active = False
@@ -639,6 +647,7 @@ class LineRouteEnv(gym.Env):
             "routed_length_nm": self._routed_len,
             "ripup_count": self._ripup_count,
             "ripups_performed": list(self._ripups_performed),
+            "failure_reasons": dict(self._failure_reasons),
         }
 
 

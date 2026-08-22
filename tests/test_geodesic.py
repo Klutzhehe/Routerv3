@@ -232,3 +232,50 @@ def test_building_the_field_is_deterministic():
     a = _field(segs).cost
     b = _field(segs).cost
     assert np.array_equal(np.nan_to_num(a, posinf=-1), np.nan_to_num(b, posinf=-1))
+
+
+def test_the_oracle_steers_around_a_blocker_and_comes_back():
+    """`benchmark_router.oracle_action` follows the field directly, with no
+    network and no exploration. It is the ceiling measurement: if steering
+    perfectly by the same field the reward is shaped on still lands near the
+    62.90% greedy baseline, then no steering policy was ever going to clear
+    it and the ceiling is somewhere other than navigation.
+
+    Pinned here because the turn has to be measured from step()'s own base
+    heading -- off that zero the "oracle" is just noise, and would look like
+    evidence that the ceiling is real when it is a bug.
+    """
+    from tests import fake_bridge
+
+    fake_bridge.install()
+    import pcbworld_pns_bridge as bridge
+
+    from pcbworld.env.line_obs import LineObsConfig
+    from pcbworld.env.line_route_env import LineRouteEnv
+    from scripts.benchmark_router import oracle_action
+
+    nets = [
+        fake_bridge.NetPad("net_0", "A", 2 * MM, 10 * MM, -1),
+        fake_bridge.NetPad("net_0", "B", 20 * MM, 10 * MM, -1),
+        fake_bridge.NetPad("net_1", "C", 11 * MM, 10 * MM, -1),   # squarely in the way
+        fake_bridge.NetPad("net_1", "D", 11 * MM, 32 * MM, -1),
+    ]
+    bridge.PNSBridge = lambda: fake_bridge.FakePNSBridge(nets=nets)
+    env = LineRouteEnv(
+        "fake_board.kicad_pcb",
+        obs_config=LineObsConfig(k_nearest=32, max_steps=120),
+        max_steps_per_net=120,
+    )
+    env.reset()
+
+    turns, ys = [], []
+    for _ in range(20):
+        a = oracle_action(env)
+        turns.append(float(a[0]))
+        env.step(a)
+        ys.append(env._pos[1])
+
+    assert turns[0] > 0.1, f"should veer off the line immediately, got {turns[0]:+.3f}"
+    assert max(ys) > 10.5 * MM, "should have moved clear of the blocker's row"
+    assert min(turns) < -0.1, "should turn back toward the pad once past the blocker"
+    assert all(abs(t) <= 1.0 for t in turns), "must stay inside the action limit"
