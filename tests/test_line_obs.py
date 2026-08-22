@@ -13,8 +13,10 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pytest
 
 from pcbworld.env.line_obs import (
+    GLOBAL_INDEX,
     KIND_GHOST,
     KIND_PAD,
     KIND_TRACK,
@@ -207,3 +209,66 @@ def test_observation_is_float32_and_the_advertised_size():
     obs = _obs([_seg(1.0 * MM, 0.0, 2.0 * MM, 0.0)])
     assert obs.dtype == np.float32
     assert obs.shape == (NUM_GLOBAL + CFG.k_nearest * NUM_SEGMENT_FEATURES,)
+
+
+# -- base heading --------------------------------------------------------
+
+
+def test_base_heading_defaults_to_the_target_bearing():
+    """None means "the next turn is measured from the target bearing", and the
+    target bearing is +x in this frame -- so the unit vector is (1, 0)."""
+    obs = _obs([])
+    ci, si = GLOBAL_INDEX["base_heading_cos"], GLOBAL_INDEX["base_heading_sin"]
+    assert obs[ci] == pytest.approx(1.0)
+    assert obs[si] == pytest.approx(0.0)
+
+
+def test_base_heading_is_relative_to_the_target_bearing():
+    ci, si = GLOBAL_INDEX["base_heading_cos"], GLOBAL_INDEX["base_heading_sin"]
+
+    # Head at origin, target on +x, so the bearing is 0 and the offset is the
+    # absolute heading.
+    obs = _obs([], base_heading=math.radians(30.0))
+    assert math.degrees(math.atan2(obs[si], obs[ci])) == pytest.approx(30.0, abs=1e-4)
+
+    # Same geometry rotated 90 degrees: the target bearing is now +y, and a
+    # heading 30 degrees off it must produce the identical feature pair.
+    obs_rot = _obs(
+        [], target=(0.0, 20.0 * MM), base_heading=math.radians(120.0)
+    )
+    assert math.degrees(math.atan2(obs_rot[si], obs_rot[ci])) == pytest.approx(30.0, abs=1e-4)
+
+
+def test_base_heading_is_a_unit_vector_for_any_angle():
+    ci, si = GLOBAL_INDEX["base_heading_cos"], GLOBAL_INDEX["base_heading_sin"]
+    for deg in (-179.0, -90.0, -1.0, 0.0, 1.0, 90.0, 179.0, 359.0):
+        obs = _obs([], base_heading=math.radians(deg))
+        assert math.hypot(obs[ci], obs[si]) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_base_heading_survives_a_rigid_transform_of_the_whole_board():
+    """The frame's whole point: rotate board, head, target and heading together
+    and every feature must be unchanged."""
+    ci, si = GLOBAL_INDEX["base_heading_cos"], GLOBAL_INDEX["base_heading_sin"]
+    seg = _seg(5.0 * MM, 1.0 * MM, 15.0 * MM, 1.0 * MM)
+    base = _obs([seg], base_heading=math.radians(40.0))
+
+    theta = math.radians(37.0)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+
+    def rot(x, y):
+        return x * cos_t - y * sin_t, x * sin_t + y * cos_t
+
+    rx1, ry1 = rot(seg.x1, seg.y1)
+    rx2, ry2 = rot(seg.x2, seg.y2)
+    rt = rot(20.0 * MM, 0.0)
+    rotated = _obs(
+        [_seg(rx1, ry1, rx2, ry2)],
+        head=(0.0, 0.0),
+        target=rt,
+        base_heading=math.radians(40.0) + theta,
+    )
+
+    assert rotated[ci] == pytest.approx(base[ci], abs=1e-5)
+    assert rotated[si] == pytest.approx(base[si], abs=1e-5)
+    assert np.allclose(rotated, base, atol=1e-4)

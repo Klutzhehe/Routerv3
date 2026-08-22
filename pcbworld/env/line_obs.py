@@ -43,6 +43,29 @@ the greedy baseline rather than below it -- the property the CFP design
 wanted from its zero-init flat field, obtained here by choosing coordinates
 well instead of by architecture.
 
+## base_heading_cos / base_heading_sin
+
+The env does not always turn from the target bearing. While the head is
+colliding it turns from its OWN previous heading instead, so the trace
+contours along an obstacle rather than being yanked back into it. That makes
+the base heading part of the environment state -- and it was state the policy
+could not see, so on every board where a collision actually happened the
+agent was steering in a frame it had no way to observe. Worse, the turn noise
+stops being self-correcting there: off the target bearing it re-aims every
+step, but off its own previous heading it random-walks, and at sigma = 0.30
+(27 deg/step) the heading is uniform after ~44 of a 120-step budget.
+
+These two features are the fix: the unit vector of the base heading the NEXT
+action will turn from, expressed in this frame. Not colliding -> the base IS
+the target bearing -> (1, 0). Colliding -> the accumulated heading, and the
+policy can finally compute the turn that clears the obstacle.
+
+Storing the effective base rather than the raw previous heading is deliberate:
+the raw value plus head_collides is the same information, but it would make
+the network learn a conditional to recover the quantity that actually decides
+where the step lands. This is the minimal sufficient statistic for the
+action's effect, which is what an observation should carry.
+
 ## Two details that are bugs if skipped
 
   - Endpoint order is canonicalised AFTER the transform, so a segment's
@@ -58,6 +81,7 @@ well instead of by architecture.
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import numpy as np
 
@@ -79,8 +103,13 @@ GLOBAL_FEATURES: tuple[str, ...] = (
     "head_collides",
     "target_layer",
     "length_slack",       # / length_scale; 0 until the length-tuning stage
+    "base_heading_cos",   # see below -- the frame the NEXT action turns from
+    "base_heading_sin",
 )
 NUM_GLOBAL = len(GLOBAL_FEATURES)
+
+# Index lookup so callers and tests never hard-code a position.
+GLOBAL_INDEX: dict[str, int] = {name: i for i, name in enumerate(GLOBAL_FEATURES)}
 
 SEGMENT_FEATURES: tuple[str, ...] = (
     "x1", "y1", "x2", "y2",   # local frame, / length_scale
@@ -247,6 +276,7 @@ def build_observation(
     head_collides: bool,
     config: LineObsConfig,
     length_slack: float = 0.0,
+    base_heading: float | None = None,
 ) -> np.ndarray:
     """The flat observation vector: globals, then k_nearest segment rows.
 
@@ -268,6 +298,15 @@ def build_observation(
     obs[5] = float(bool(head_collides))
     obs[6] = float(target_layer)
     obs[7] = length_slack / scale
+
+    # The frame the next turn is applied from, as a unit vector in THIS frame.
+    # None means "the target bearing", which is +x here, i.e. (1, 0).
+    if base_heading is None:
+        obs[8], obs[9] = 1.0, 0.0
+    else:
+        bearing = math.atan2(target[1] - head[1], target[0] - head[0])
+        delta = base_heading - bearing
+        obs[8], obs[9] = math.cos(delta), math.sin(delta)
 
     if not segments:
         return obs

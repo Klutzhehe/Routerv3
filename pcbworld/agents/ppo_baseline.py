@@ -320,10 +320,8 @@ def train(env, cfg: PPOConfig | None = None) -> nn.Module:
         chk = torch.load(cfg.init_checkpoint, map_location=cfg.device, weights_only=False)
         if "policy_state_dict" in chk:
             policy.load_state_dict(chk["policy_state_dict"])
-        if rms is not None and chk.get("rms_mean") is not None:
-            rms.mean = np.array(chk["rms_mean"], dtype=np.float32)
-            rms.var = np.array(chk["rms_var"], dtype=np.float32)
-            rms.count = float(chk.get("rms_count", 1.0))
+        if rms is not None:
+            rms.load_from_checkpoint(chk)
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
 

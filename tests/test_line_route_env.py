@@ -24,7 +24,7 @@ fake_bridge.install()
 
 import pcbworld_pns_bridge as bridge  # noqa: E402
 
-from pcbworld.env.line_obs import NUM_GLOBAL, LineObsConfig  # noqa: E402
+from pcbworld.env.line_obs import GLOBAL_INDEX, NUM_GLOBAL, LineObsConfig  # noqa: E402
 from pcbworld.env.line_route_env import LineRouteEnv, RewardWeights  # noqa: E402
 
 MM = 1_000_000
@@ -318,7 +318,10 @@ def test_globals_report_progress_within_the_observation():
     start_dist = obs[0]
     obs, *_ = env.step(np.array([0.0], dtype=np.float32))
     assert obs[0] < start_dist
-    assert obs[NUM_GLOBAL - 1] == 0.0  # length_slack unused until the tuning stage
+    # By name: NUM_GLOBAL - 1 stopped being length_slack when the base-heading
+    # pair was appended, and base_heading_sin is also 0.0 here, so the old
+    # positional form kept passing while testing nothing.
+    assert obs[GLOBAL_INDEX["length_slack"]] == 0.0  # unused until the tuning stage
 
 
 def test_board_pool_support():
@@ -394,3 +397,131 @@ def test_length_matched_group_support():
 
 
 
+
+
+# -- the colliding regime ------------------------------------------------
+#
+# Everything below is about the branch step() takes when head_collides() is
+# true. It is the branch that decides multi-net boards -- an open board never
+# enters it, which is exactly why 2-3 net evaluation looked perfect while
+# 4+ net training sat at ~62% -- and until the base-heading pair was added to
+# the observation it turned on state the policy could not see.
+
+
+# One 0.5 mm step expressed in the observation's length_scale (10 mm) units.
+_ONE_STEP_IN_SCALE_UNITS = 500_000 / (10.0 * MM)
+
+
+class _AlwaysCollidingBridge(fake_bridge.FakePNSBridge):
+    def head_collides(self) -> bool:
+        return bool(self._routing_active)
+
+
+def _colliding_env(**kwargs) -> LineRouteEnv:
+    bridge.PNSBridge = lambda: _AlwaysCollidingBridge(nets=_NETS[:2])
+    kwargs.setdefault("obs_config", LineObsConfig(k_nearest=8, max_steps=40))
+    kwargs.setdefault("max_steps_per_net", 40)
+    return LineRouteEnv("fake_board.kicad_pcb", **kwargs)
+
+
+def _base_heading(obs):
+    return math.atan2(obs[GLOBAL_INDEX["base_heading_sin"]], obs[GLOBAL_INDEX["base_heading_cos"]])
+
+
+def test_base_heading_is_zero_while_not_colliding():
+    """Off the target bearing the env re-aims every step, so the base heading
+    IS the bearing and the offset is 0 -- which keeps a=0 walking at the pad."""
+    env = _one_net()
+    obs, _ = env.reset()
+    assert _base_heading(obs) == pytest.approx(0.0, abs=1e-6)
+    for a in (0.0, 0.4, -0.7):
+        obs, *_ = env.step(np.array([a], dtype=np.float32))
+        assert _base_heading(obs) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_observation_exposes_the_frame_the_next_turn_uses():
+    """The load-bearing test.
+
+    While colliding, step() turns from its own previous heading rather than
+    from the target bearing. If that heading is not in the observation the
+    policy is steering blind, and no amount of network capacity recovers it.
+    So: read the offset out of the observation, steer by exactly minus it, and
+    the head must end up moving straight at the pad -- strictly better than the
+    a=0 action that would be correct in the non-colliding frame.
+    """
+    from pcbworld.env.line_route_env import MAX_TURN_RAD
+
+    def _probe(action_from_obs):
+        env = _colliding_env()
+        obs, _ = env.reset()
+        obs, *_ = env.step(np.array([0.5], dtype=np.float32))  # veer off, now colliding
+        before = obs[0]
+        obs, *_ = env.step(np.array([action_from_obs(obs)], dtype=np.float32))
+        return before - obs[0]  # distance closed, in length_scale units
+
+    informed = _probe(lambda o: np.clip(-_base_heading(o) / MAX_TURN_RAD, -1.0, 1.0))
+    naive = _probe(lambda o: 0.0)
+
+    assert informed > naive, "the observation does not determine the turn that aims at the pad"
+    # Aiming correctly closes a full step of distance; a=0 cannot, because it
+    # keeps the 45-degree veer it inherited from _prev_heading.
+    assert informed == pytest.approx(_ONE_STEP_IN_SCALE_UNITS, rel=1e-3)
+
+
+def test_a_jammed_net_is_abandoned_after_max_collision_steps():
+    """Uncapped, a jammed net bled 0.5/step for its whole 120-step budget: -60,
+    91% of the failed net's return and 5.8x what a clean success paid. The cap
+    ends the net instead."""
+    env = _colliding_env(reward_weights=RewardWeights(max_collision_steps=5))
+    env.reset()
+
+    for i in range(4):
+        _, _, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
+        assert info["failed"] == [], f"gave up early at step {i + 1}"
+        assert info["collision_run"] == i + 1
+
+    _, _, _, _, info = env.step(np.array([0.0], dtype=np.float32))
+    assert info["failed"] == ["net_0"]
+    assert info["net_index"] == 1, "should have moved on to the next net"
+
+
+def test_the_collision_run_resets_when_the_head_gets_free():
+    """Consecutive, not cumulative: escaping and re-contacting elsewhere is
+    normal contour-following, not a jam."""
+
+    class _Intermittent(fake_bridge.FakePNSBridge):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.calls = 0
+
+        def head_collides(self) -> bool:
+            if not self._routing_active:
+                return False
+            self.calls += 1
+            return self.calls % 3 != 0  # collide, collide, free, repeat
+
+    bridge.PNSBridge = lambda: _Intermittent(nets=_NETS[:2])
+    env = LineRouteEnv(
+        "fake_board.kicad_pcb",
+        obs_config=LineObsConfig(k_nearest=8, max_steps=40),
+        max_steps_per_net=40,
+        reward_weights=RewardWeights(max_collision_steps=3),
+    )
+    env.reset()
+
+    for _ in range(12):
+        _, _, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
+        if terminated:
+            break
+        assert info["collision_run"] <= 2
+        assert info["failed"] == [], "a run that keeps breaking is not a jam"
+
+
+def test_capping_the_jam_keeps_success_worth_more_than_failure():
+    """The reward-shape claim, as arithmetic rather than as a comment."""
+    w = RewardWeights()
+    worst_jam = -(w.collision + w.step) * w.max_collision_steps - w.net_failed
+    assert abs(worst_jam) < w.net_done, (
+        f"a jammed net costs {worst_jam:.1f} against a success worth +{w.net_done:.1f}; "
+        "failure must not dominate the gradient"
+    )

@@ -12,6 +12,7 @@ import argparse
 import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import matplotlib
@@ -27,6 +28,18 @@ from pcbworld.agents.ppo_baseline import PPOConfig, collect_rollout, ppo_update,
 from pcbworld.env.line_obs import NUM_GLOBAL
 from pcbworld.env.line_route_env import LineRouteEnv
 from scripts.generate_curriculum_boards import generate_curriculum_dataset
+
+
+# Rollouts pooled into the headline completion number.
+#
+# A single rollout resolves ~10 nets, or about two boards. At n=10 the binomial
+# standard error on a 62% completion rate is 15.4 points -- and the observed
+# spread across the last 24 rollouts of the first curriculum run was 15.5, i.e.
+# the entire 33%-to-93% "oscillation" was sampling noise with nothing left over
+# to explain. Per-rollout completion cannot show learning at this scale, so the
+# headline number pools the last SMOOTH_WINDOW rollouts (~200 nets, ~4 points of
+# standard error) and the raw value is kept only as a faint trace on the plot.
+SMOOTH_WINDOW = 20
 
 
 def plot_live_curves(history: dict[str, list], output_path: str | Path | None = None):
@@ -45,13 +58,17 @@ def plot_live_curves(history: dict[str, list], output_path: str | Path | None = 
     ax.set_ylabel("Reward")
     ax.grid(True, alpha=0.3)
 
-    # 2. Net Completion Rate %
+    # 2. Net Completion Rate % -- raw is noise, the pooled line is the signal.
     ax = axes[0, 1]
-    ax.plot(steps, history["completion"], color="#2ca02c", lw=2, marker="s", markersize=3)
+    ax.plot(steps, history["completion"], color="#2ca02c", lw=1, alpha=0.25,
+            label="per rollout (~2 boards)")
+    ax.plot(steps, history["completion_smooth"], color="#2ca02c", lw=2.5,
+            label=f"pooled over {SMOOTH_WINDOW} rollouts")
     ax.set_title("Net Completion Rate (%)", fontsize=11, fontweight="bold")
     ax.set_xlabel("Steps")
     ax.set_ylabel("Completion %")
     ax.set_ylim(-5, 105)
+    ax.legend(fontsize=8, loc="lower right")
     ax.grid(True, alpha=0.3)
 
     # 3. Policy Loss
@@ -134,9 +151,12 @@ def train_curriculum_live(
         "steps": [],
         "reward": [],
         "completion": [],
+        "completion_smooth": [],
         "policy_loss": [],
         "value_loss": [],
     }
+    # (completed, failed) per rollout, pooled for the headline number.
+    completion_window: deque[tuple[int, int]] = deque(maxlen=SMOOTH_WINDOW)
 
     chk_base = Path(checkpoint_dir)
     chk_base.mkdir(parents=True, exist_ok=True)
@@ -199,11 +219,19 @@ def train_curriculum_live(
             failed = rollout_info["failed_nets"]
             comp_rate = (comp / (comp + failed) * 100.0) if (comp + failed) > 0 else 0.0
 
+            # Pooled completion over the last SMOOTH_WINDOW rollouts. Pool the
+            # COUNTS, not the rates: averaging the rates would weight a rollout
+            # that resolved 5 nets the same as one that resolved 15.
+            completion_window.append((comp, failed))
+            win_comp = sum(c for c, _ in completion_window)
+            win_total = sum(c + f for c, f in completion_window)
+            smooth_rate = (win_comp / win_total * 100.0) if win_total > 0 else 0.0
 
             # Record history for live plotting
             history["steps"].append(cumulative_steps)
             history["reward"].append(mean_reward if not np.isnan(mean_reward) else (history["reward"][-1] if history["reward"] else 0.0))
             history["completion"].append(comp_rate)
+            history["completion_smooth"].append(smooth_rate)
             history["policy_loss"].append(stats.get("policy_loss", 0.0))
             history["value_loss"].append(stats.get("value_loss", 0.0))
 
@@ -214,7 +242,10 @@ def train_curriculum_live(
             eta_sec = remaining_steps / max(1e-5, sps)
 
             short_stage = stage_name.split(":")[0].strip()
-            comp_str = f"Completion: {comp_rate:5.1f}% ({comp:2d}/{comp+failed:2d})"
+            comp_str = (
+                f"Completion(x{len(completion_window):2d}): {smooth_rate:5.1f}% "
+                f"({win_comp:3d}/{win_total:3d})  raw {comp_rate:5.1f}% ({comp:2d}/{comp+failed:2d})"
+            )
             loss_str = f"P-Loss: {stats.get('policy_loss', 0.0):.4f} | V-Loss: {stats.get('value_loss', 0.0):.4f}"
             timing_str = f"{sps:.1f} sps | ETA: {int(eta_sec//60):02d}m{int(eta_sec%60):02d}s"
 

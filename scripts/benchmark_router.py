@@ -233,10 +233,7 @@ def run_benchmark_suite(
         policy.load_state_dict(chk["policy_state_dict"])
         policy.eval()
         rms = RunningMeanStd()
-        if chk.get("rms_mean") is not None:
-            rms.mean = chk["rms_mean"]
-            rms.var = chk["rms_var"]
-            rms.count = chk["rms_count"]
+        rms.load_from_checkpoint(chk)
         print(f"Loaded policy checkpoint from {checkpoint_path}")
 
     results = []

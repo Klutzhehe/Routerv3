@@ -89,12 +89,33 @@ class RewardWeights:
     policy-invariant and automatically revisit-safe -- backtracking cannot be
     farmed for reward. A raw distance-travelled penalty would instead punish a
     legal detour around an obstacle more than the collision it avoids.
+
+    ## Why `collision` is capped in TIME, not just in size
+
+    `collision` is charged per step and the old budget was 120 steps, so a net
+    that jammed against an obstacle bled 0.5 x 120 = -60. Measured against a
+    clean success at +11.4, that made failure 5.8x the weight of success and
+    left 91% of a failed net's return sitting in the collision term. The
+    dominant gradient was "do not touch anything", and the cheapest policy
+    satisfying it is to wander in open copper (-6.2) rather than to route.
+
+    It compounds: while the head is jammed the router will not move it, so the
+    observation is frozen and the -0.5 accrues against a state the agent
+    cannot act its way out of. `max_collision_steps` ends the net after 16
+    CONSECUTIVE collision steps (8 mm of contact at a 0.5 mm step), which caps
+    the penalty near -13, keeps success (+26.4) the dominant term, and returns
+    the sample budget to boards where something is still learnable.
+
+    Consecutive rather than cumulative on purpose: the target is the jammed
+    state specifically, so escaping and re-contacting elsewhere resets it.
     """
 
     progress: float = 1.0
     step: float = 0.01          # gentle step cost so detours are viable
     collision: float = 0.5      # the Gate-B-validated per-step failure signal
-    net_done: float = 10.0
+    max_collision_steps: int = 16   # give up after this many CONSECUTIVE collision
+                                    # steps; see the note below
+    net_done: float = 25.0
     net_failed: float = 5.0
     detour: float = 0.5         # relaxed so going around obstacles is not penalized
     drc: float = 0.0            # per violation, once per episode; 0 = off
@@ -182,6 +203,7 @@ class LineRouteEnv(gym.Env):
         self._straight_len = 1.0
         self._routed_len = 0.0
         self._collides = False
+        self._collision_run = 0
         self._completed: list[str] = []
         self._failed: list[str] = []
 
@@ -305,6 +327,7 @@ class LineRouteEnv(gym.Env):
         self._routed_len = 0.0
         self._steps = 0
         self._collides = False
+        self._collision_run = 0
         self._blocking_nets = set()
         self._target_ref_length = 0.0
         self._prev_heading = math.atan2(self._target_xy[1] - self._start_xy[1], self._target_xy[0] - self._start_xy[0])
@@ -360,6 +383,7 @@ class LineRouteEnv(gym.Env):
         self._pos = (float(head.end_x), float(head.end_y))
         self._routed_len += moved
         self._collides = bool(self.bridge.head_collides())
+        self._collision_run = self._collision_run + 1 if self._collides else 0
         self._steps += 1
 
         if self._collides and hasattr(self.bridge, "get_head_obstacle"):
@@ -376,7 +400,8 @@ class LineRouteEnv(gym.Env):
         if dist <= self.snap_radius_nm:
             net_done = self._try_finish()
             reward += self.weights.net_done if net_done else 0.0
-        if not net_done and self._steps >= self.max_steps_per_net:
+        jammed = self._collision_run >= self.weights.max_collision_steps
+        if not net_done and (self._steps >= self.max_steps_per_net or jammed):
             # Check if rip-up can clear a blocking trace
             if self.enable_ripup and (self._ripup_count < self.max_ripups_per_episode) and self._blocking_nets:
                 victim_net = sorted(self._blocking_nets)[-1]
@@ -533,6 +558,10 @@ class LineRouteEnv(gym.Env):
             head_collides=self._collides,
             config=self.obs_config,
             length_slack=length_slack,
+            # Mirror step()'s own choice exactly: it turns from _prev_heading
+            # while colliding and from the target bearing otherwise. None means
+            # "the target bearing", which the obs frame already encodes as +x.
+            base_heading=self._prev_heading if self._collides else None,
         )
 
 
@@ -545,6 +574,7 @@ class LineRouteEnv(gym.Env):
             "failed": list(self._failed),
             "steps": self._steps,
             "collides": self._collides,
+            "collision_run": self._collision_run,
             "routed_length_nm": self._routed_len,
             "ripup_count": self._ripup_count,
             "ripups_performed": list(self._ripups_performed),

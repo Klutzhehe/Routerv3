@@ -87,3 +87,87 @@ def test_parameter_count_within_budget():
     policy = LineActorCritic(action_dim=1)
     num_params = sum(p.numel() for p in policy.parameters())
     assert 30_000 <= num_params <= 60_000, f"Param count {num_params} outside expected range"
+
+
+def test_rms_update_accepts_a_single_unbatched_sample():
+    """The trainer feeds one step at a time, as a bare (NUM_GLOBAL,) array.
+
+    Regression for the bug that flattened the first curriculum run: np.mean(x,
+    axis=0) on a 1-D array reduces across the FEATURES and returns a scalar, so
+    every global converged on one shared mean and one shared std. The original
+    test only ever passed a (100, NUM_GLOBAL) batch, which takes the correct
+    path, so the trainer's actual call signature went unexercised.
+    """
+    rng = np.random.default_rng(0)
+    # Deliberately mismatched per-feature scales -- feature i ~ N(i, 1).
+    batch = np.stack(
+        [rng.normal(loc=i, scale=1.0, size=4000) for i in range(NUM_GLOBAL)], axis=1
+    ).astype(np.float32)
+
+    rms = RunningMeanStd(shape=(NUM_GLOBAL,))
+    for sample in batch:
+        rms.update(sample)  # 1-D, exactly as collect_rollout() calls it
+
+    assert np.allclose(rms.mean, batch.mean(axis=0), atol=0.1)
+    assert np.allclose(np.sqrt(rms.var), batch.std(axis=0), atol=0.2)
+    # The bug's signature: every feature collapsing onto one shared statistic.
+    assert not np.allclose(rms.mean, rms.mean[0]), "per-feature means collapsed"
+
+
+def test_rms_matches_whether_fed_batched_or_one_at_a_time():
+    rng = np.random.default_rng(1)
+    data = rng.normal(size=(500, NUM_GLOBAL)).astype(np.float32) * [1, 2, 3, 4, 5, 6, 7, 8, 9, 10][:NUM_GLOBAL]
+
+    batched = RunningMeanStd(shape=(NUM_GLOBAL,))
+    batched.update(data)
+
+    streamed = RunningMeanStd(shape=(NUM_GLOBAL,))
+    for row in data:
+        streamed.update(row)
+
+    assert np.allclose(batched.mean, streamed.mean, atol=1e-3)
+    assert np.allclose(np.sqrt(batched.var), np.sqrt(streamed.var), atol=1e-2)
+
+
+def test_rms_rejects_a_genuinely_wrong_shape():
+    rms = RunningMeanStd(shape=(NUM_GLOBAL,))
+    with pytest.raises(ValueError):
+        rms.update(np.zeros((4, NUM_GLOBAL + 3), dtype=np.float32))
+
+
+def test_rms_normalize_clips_a_constant_feature():
+    """head_layer, target_layer and length_slack are identically 0 for a whole
+    stage, so their running variance decays toward 0. Without the clip, any
+    float wobble divided by that variance is an unbounded network input."""
+    rms = RunningMeanStd(shape=(NUM_GLOBAL,))
+    for _ in range(5000):
+        rms.update(np.zeros(NUM_GLOBAL, dtype=np.float32))
+
+    out = rms.normalize(np.full(NUM_GLOBAL, 1.0, dtype=np.float32))
+    assert np.all(np.abs(out) <= 10.0 + 1e-5)
+
+    out_t = rms.normalize(torch.full((NUM_GLOBAL,), 1.0))
+    assert torch.all(out_t.abs() <= 10.0 + 1e-5)
+
+
+def test_rms_refuses_stale_checkpoint_stats():
+    """NUM_GLOBAL went 8 -> 10 with the base-heading pair, so every pre-fix
+    checkpoint carries stats of the wrong length. They must be dropped, not
+    assigned."""
+    rms = RunningMeanStd(shape=(NUM_GLOBAL,))
+    stale = {
+        "rms_mean": np.arange(NUM_GLOBAL - 2, dtype=np.float32),
+        "rms_var": np.ones(NUM_GLOBAL - 2, dtype=np.float32),
+        "rms_count": 1234.0,
+    }
+    assert rms.load_from_checkpoint(stale) is False
+    assert rms.mean.shape == (NUM_GLOBAL,)
+    assert np.allclose(rms.mean, 0.0)
+
+    fresh = {
+        "rms_mean": np.arange(NUM_GLOBAL, dtype=np.float32),
+        "rms_var": np.ones(NUM_GLOBAL, dtype=np.float32),
+        "rms_count": 99.0,
+    }
+    assert rms.load_from_checkpoint(fresh) is True
+    assert np.allclose(rms.mean, np.arange(NUM_GLOBAL))

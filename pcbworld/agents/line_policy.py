@@ -29,7 +29,19 @@ from pcbworld.env.line_obs import NUM_GLOBAL, NUM_SEGMENT_FEATURES
 
 
 class RunningMeanStd:
-    """Tracks running mean and variance using Welford's algorithm."""
+    """Tracks running mean and variance using Welford's algorithm.
+
+    `update` takes a BATCH: shape (N, *shape). A single unbatched sample of
+    shape `shape` is accepted and promoted to (1, *shape) -- it has to be,
+    because the trainer feeds one step at a time and the un-promoted version
+    of this was silently wrong for the whole of the first curriculum run.
+    `np.mean(x, axis=0)` on a 1-D (8,) array reduces across the FEATURES and
+    returns a scalar, so all eight globals converged on one shared mean and
+    one shared std: head_collides (0/1) ended up shifted and scaled by
+    statistics dominated by dist_to_target (0-5), which is exactly the signal
+    the policy most needed to see. The old unit test passed a (100, 8) array
+    and so never exercised the shape the trainer actually used.
+    """
 
     def __init__(self, shape: tuple[int, ...] = (NUM_GLOBAL,), epsilon: float = 1e-4):
         self.mean = np.zeros(shape, dtype=np.float32)
@@ -37,10 +49,18 @@ class RunningMeanStd:
         self.count = epsilon
 
     def update(self, x: np.ndarray) -> None:
-        """Update running statistics with batch x (shape: (..., *shape))."""
+        """Update running statistics with batch x (shape: (N, *shape))."""
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim == len(self.mean.shape):
+            x = x[None, ...]
+        if x.shape[1:] != self.mean.shape:
+            raise ValueError(
+                f"RunningMeanStd expects trailing shape {self.mean.shape}, got {x.shape}"
+            )
+
         batch_mean = np.mean(x, axis=0)
         batch_var = np.var(x, axis=0)
-        batch_count = x.shape[0] if x.ndim > len(self.mean.shape) else 1.0
+        batch_count = x.shape[0]
 
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
@@ -55,13 +75,46 @@ class RunningMeanStd:
         self.var = new_var.astype(np.float32)
         self.count = tot_count
 
-    def normalize(self, x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
-        """Normalize x using current running statistics."""
+    def load_from_checkpoint(self, chk: dict) -> bool:
+        """Restore stats from a checkpoint dict, or refuse if they do not fit.
+
+        NUM_GLOBAL changed from 8 to 10 when base_heading_cos/sin were added,
+        so every checkpoint written before that carries 8-element stats. Silently
+        assigning them would leave `mean` and `var` a different length from the
+        slice they divide, and numpy would either raise somewhere far away or
+        broadcast something meaningless. Returns False and leaves the stats at
+        their identity values instead."""
+        if chk.get("rms_mean") is None:
+            return False
+        mean = np.asarray(chk["rms_mean"], dtype=np.float32)
+        if mean.shape != self.mean.shape:
+            print(
+                f"  [rms] checkpoint stats are {mean.shape}, this build needs "
+                f"{self.mean.shape} -- ignoring them and re-estimating from scratch."
+            )
+            return False
+        self.mean = mean
+        self.var = np.asarray(chk["rms_var"], dtype=np.float32)
+        self.count = float(chk.get("rms_count", 1.0))
+        return True
+
+    def normalize(
+        self, x: np.ndarray | torch.Tensor, clip: float = 10.0
+    ) -> np.ndarray | torch.Tensor:
+        """Normalize x using current running statistics, clipped to +/- `clip`.
+
+        The clip is not decoration. Several globals are constant for a whole
+        stage -- head_layer, target_layer and length_slack are identically 0
+        until the multi-layer and length-tuning stages -- so their running
+        variance decays toward 0 and the epsilon in the denominator is all
+        that stands between a float wobble and a six-figure input. 10.0 is the
+        usual VecNormalize default.
+        """
         if isinstance(x, torch.Tensor):
             mean = torch.as_tensor(self.mean, device=x.device, dtype=x.dtype)
             std = torch.as_tensor(np.sqrt(self.var + 1e-8), device=x.device, dtype=x.dtype)
-            return (x - mean) / std
-        return (x - self.mean) / np.sqrt(self.var + 1e-8)
+            return torch.clamp((x - mean) / std, -clip, clip)
+        return np.clip((x - self.mean) / np.sqrt(self.var + 1e-8), -clip, clip)
 
 
 class LineActorCritic(nn.Module):
