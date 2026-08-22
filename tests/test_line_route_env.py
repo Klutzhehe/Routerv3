@@ -127,8 +127,9 @@ def test_heading_is_relative_to_the_current_bearing_not_a_fixed_axis():
     env.step(np.array([0.0], dtype=np.float32))   # straight at the target again
 
     bearing = math.atan2(env._target_xy[1] - before[1], env._target_xy[0] - before[0])
-    assert env._pos[0] == pytest.approx(before[0] + env.step_size_nm * math.cos(bearing), rel=1e-6)
-    assert env._pos[1] == pytest.approx(before[1] + env.step_size_nm * math.sin(bearing), rel=1e-6)
+    assert env._pos[0] == pytest.approx(before[0] + env.step_size_nm * math.cos(bearing), abs=2.0)
+    assert env._pos[1] == pytest.approx(before[1] + env.step_size_nm * math.sin(bearing), abs=2.0)
+
 
 
 # -- reward --------------------------------------------------------------

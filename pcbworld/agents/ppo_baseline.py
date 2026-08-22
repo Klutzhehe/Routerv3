@@ -42,7 +42,9 @@ class PPOConfig:
     device: str = "cpu"
     checkpoint_interval: int = 5_000
     checkpoint_dir: str | None = None
+    init_checkpoint: str | None = None
     normalize_globals: bool = True
+
 
 
 class ActorCritic(nn.Module):
@@ -312,7 +314,18 @@ def train(env, cfg: PPOConfig | None = None) -> nn.Module:
         policy = ActorCritic(obs_dim, action_dim, cfg.hidden_size).to(cfg.device)
         rms = None
 
+    if cfg.init_checkpoint and os.path.isfile(cfg.init_checkpoint):
+        print(f"Loading initial weights from {cfg.init_checkpoint}...")
+        chk = torch.load(cfg.init_checkpoint, map_location=cfg.device, weights_only=False)
+        if "policy_state_dict" in chk:
+            policy.load_state_dict(chk["policy_state_dict"])
+        if rms is not None and chk.get("rms_mean") is not None:
+            rms.mean = np.array(chk["rms_mean"], dtype=np.float32)
+            rms.var = np.array(chk["rms_var"], dtype=np.float32)
+            rms.count = float(chk.get("rms_count", 1.0))
+
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
+
 
     obs, _info = env.reset()
     steps_done = 0
@@ -366,6 +379,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=5_000)
+    parser.add_argument("--init-checkpoint", type=str, default=None, help="Path to initial policy checkpoint to resume/transfer from")
     parser.add_argument("--enable-ripup", action="store_true", help="Enable rip-up and reroute for conflicting traces")
     parser.add_argument("--max-ripups", type=int, default=8, help="Max rip-up operations per episode")
     parser.add_argument("--use-legacy-env", action="store_true", help="Use PCBRouteEnv instead of LineRouteEnv")
@@ -391,7 +405,9 @@ def main() -> None:
         learning_rate=args.lr,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_interval=args.checkpoint_interval,
+        init_checkpoint=args.init_checkpoint,
     )
+
     train(env, cfg)
 
 
