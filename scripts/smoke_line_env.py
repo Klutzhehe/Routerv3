@@ -171,13 +171,46 @@ def run(board_path: str, num_nets: int, bridge_dir: str | None, seed: int) -> di
             "  against real geometry.\n"
         )
 
-    if r_done >= g_done:
+    # Does the action affect outcomes? Judge that on REWARD, which is what PPO
+    # actually follows, not on completion count.
+    #
+    # An earlier version compared completions alone and cried wolf on a real
+    # run: random routed 9/24 against greedy's 8/24 -- a one-net difference,
+    # well inside noise at n=24 -- while its reward was -330 against -177 and
+    # it collided on 34% of steps against 18%. The gradient was enormous and
+    # the completion counts could not see it. A coarse integer metric is the
+    # wrong instrument for "is there signal here".
+    g_reward, r_reward = greedy["total_reward"], random_["total_reward"]
+    g_coll = greedy["collision_steps"] / max(1, greedy["steps"])
+    r_coll = random_["collision_steps"] / max(1, random_["steps"])
+
+    print(
+        f"  reward     greedy {g_reward:8.2f}   random {r_reward:8.2f}\n"
+        f"  colliding  greedy {g_coll:8.1%}   random {r_coll:8.1%}\n"
+        f"  routed     greedy {g_done:5d}/{total}   random {r_done:5d}/{total}\n"
+    )
+
+    if g_reward <= r_reward:
         print(
-            f"  WARNING: random routed {r_done}/{total}, no worse than greedy. The action may not\n"
-            "  be affecting outcomes -- if so there is no gradient for PPO to follow.\n"
+            "  WARNING: random scores no worse than greedy ON REWARD. The action is not\n"
+            "  affecting the objective, so there is no gradient for PPO to follow. Fix this\n"
+            "  before booking GPU time.\n"
         )
     else:
-        print(f"  Random routed {r_done}/{total}, below greedy -- the action affects outcomes.\n")
+        print(
+            f"  The action affects the objective: greedy beats random by "
+            f"{g_reward - r_reward:.1f} reward.\n"
+        )
+        if r_done >= g_done:
+            print(
+                "  Worth knowing though: random matched or beat greedy on COMPLETIONS while\n"
+                "  losing badly on reward, so reward and the true objective are not perfectly\n"
+                "  aligned here. Straight-line is not the best completion strategy on a dense\n"
+                "  board -- wandering sometimes stumbles around an obstacle that a straight\n"
+                "  line cannot pass. That is headroom a policy can learn to exploit\n"
+                "  deliberately, but track COMPLETION RATE during training, not just reward,\n"
+                "  and reconsider the collision weight if the policy turns timid.\n"
+            )
 
     all_ms = [t * 1e3 for t in greedy["step_times"]]
     if all_ms:

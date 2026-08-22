@@ -68,19 +68,56 @@ def test_verdict_calls_a_zero_completion_greedy_run_broken(capsys, monkeypatch):
     assert "HEALTHY" not in out
 
 
-def test_verdict_warns_when_random_matches_greedy(capsys, monkeypatch):
-    """If the action does not change outcomes there is no gradient to follow,
-    which is worth saying before a GPU is booked."""
+def test_no_gradient_warning_is_judged_on_reward_not_completions(capsys, monkeypatch):
+    """Regression for a real false alarm. On a live 24-net board random routed
+    9/24 against greedy's 8/24 -- one net, well inside noise -- while scoring
+    -330 reward against -177 and colliding on 34% of steps against 18%. The
+    gradient was enormous; comparing completion counts could not see it. The
+    warning must fire on reward, and must NOT fire merely because a coarse
+    integer metric happened to tie."""
     import scripts.smoke_line_env as smoke
 
     _install_nets()
     monkeypatch.setattr(smoke, "_load_bridge", lambda d: bridge)
+
+    real_episode = smoke._run_episode
+
+    def scripted(env, policy, rng):
+        result = real_episode(env, policy, rng)
+        if policy == "greedy":
+            result["total_reward"] = -177.0
+            result["completed"] = ["net_0"]          # fewer completions...
+        else:
+            result["total_reward"] = -330.0          # ...but far worse reward
+            result["completed"] = ["net_0", "net_1"]
+        return result
+
+    monkeypatch.setattr(smoke, "_run_episode", scripted)
     smoke.run("fake.kicad_pcb", num_nets=2, bridge_dir=None, seed=0)
 
     out = capsys.readouterr().out
-    # The fake accepts everything, so random ties greedy -- exactly the case
-    # the warning exists for.
-    assert "WARNING" in out and "no worse than greedy" in out
+    assert "WARNING" not in out, "reward separates the policies; this is not a no-gradient case"
+    assert "not perfectly" in out, "the completion/reward misalignment should still be called out"
+
+
+def test_no_gradient_warning_fires_when_reward_really_ties(capsys, monkeypatch):
+    import scripts.smoke_line_env as smoke
+
+    _install_nets()
+    monkeypatch.setattr(smoke, "_load_bridge", lambda d: bridge)
+
+    real_episode = smoke._run_episode
+
+    def flat(env, policy, rng):
+        result = real_episode(env, policy, rng)
+        result["total_reward"] = -100.0
+        return result
+
+    monkeypatch.setattr(smoke, "_run_episode", flat)
+    smoke.run("fake.kicad_pcb", num_nets=2, bridge_dir=None, seed=0)
+
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "no gradient for PPO" in out
 
 
 def test_episode_asserts_on_a_non_finite_observation(monkeypatch):

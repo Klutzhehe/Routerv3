@@ -282,7 +282,7 @@ def test_other_nets_pads_appear_as_obstacles_and_own_pads_do_not():
     env = _make_env(net_order=["net_0", "net_1"])
     env.reset()
     own = {"net_0"}
-    kinds = {s.net for s in env._current_obstacles()}
+    kinds = {s.net for s in env._obstacles}
     assert "net_1" in kinds
     assert not (kinds & own), "the routed net's own pads must not be obstacles"
 
@@ -292,7 +292,7 @@ def test_unrouted_nets_appear_as_ghost_segments():
 
     env = _make_env(net_order=["net_0", "net_1"])
     env.reset()
-    ghosts = [s for s in env._current_obstacles() if s.kind == KIND_GHOST]
+    ghosts = [s for s in env._obstacles if s.kind == KIND_GHOST]
     assert [g.net for g in ghosts] == ["net_1"]
 
 

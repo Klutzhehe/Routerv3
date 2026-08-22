@@ -10,7 +10,7 @@ first for what the engine can actually do and what is measured vs assumed.
 |---|---|---|
 | Action space | **1-D heading**, fixed step | Smallest thing that can possibly learn. Upgrade path defined below. |
 | Timeline | **Open-ended** | Full curriculum through diff pairs, length tuning, rip-up, held-out eval. |
-| `switch_layer()` | **Debug before training** | 0-for-32 live. Two-layer routing raises the completion ceiling enough to be worth a session first. |
+| `switch_layer()` | **Investigated, then abandoned** | Two runs, both negative — no layer-change primitive works through this API. Stages 1–3 are single-layer. See Gate A. |
 | Net ordering | **Not learned** — fixed heuristic | Removes a combinatorial dimension. Revisit only on plateau. |
 | Board representation | **Line segments, not raster** | See below. |
 
@@ -132,9 +132,67 @@ per episode (multi-net stages only)
 
 The collision term is load-bearing and rests on an assumption Gate B measures.
 
-## Stage 0 — two gates, before any trainer is written
+## Stage 0 — COMPLETE. Both gates run; the env is validated on real geometry.
 
-### Gate A: why `switch_layer()` is 0-for-32 — BLOCKED, then unblocked
+| | Result |
+|---|---|
+| Gate B — dense per-step signal | **PASSED**, +1.00 separation (n=99) |
+| Gate B — waypoint fidelity | **PASSED**, 0.0000mm deviation |
+| Gate A — layer changing | **NEGATIVE**, closed. Single-layer it is |
+| Env smoke run | **HEALTHY** — greedy routed 8/24 against a predicted 9/24 |
+
+The smoke run is the one worth reading twice. Because `a = 0` means "walk
+straight at the target", the greedy policy *is* the straight-line router, and
+that router had already been measured independently at 9/24 on this board.
+Getting **8/24** confirms the observation frame, heading maths, snap/fix logic
+and net sequencing all line up against real geometry — one number covering the
+whole stack.
+
+Two things it also surfaced, both real:
+
+- **Reward and completion count are not perfectly aligned.** Random scored
+  −330 reward against greedy's −177 and collided on 34% of steps against 18%,
+  yet routed *9*/24 to greedy's 8/24. Straight-line is not the best completion
+  strategy on a dense board — wandering occasionally stumbles around an
+  obstacle a straight line cannot pass. That is headroom a policy can learn to
+  exploit deliberately, but **track completion rate during training, not just
+  reward**, and reconsider the collision weight if the policy turns timid.
+- **0.745ms/step, ~20× the 0.035ms budget.** The obstacle list was being
+  rebuilt every step — ~200 `Segment` allocations for pads and pending nets
+  before any numpy ran — when nothing in it changes within a net. Now cached
+  per net. Even unoptimised this was affordable (1e6 steps ≈ 12 min
+  single-threaded), so it was a throughput tax rather than a blocker.
+
+## The gates, as originally specified
+
+### Gate A: layer changing — CLOSED, negative. Train single-layer.
+
+**Two independent runs, both negative. Stop here.**
+
+- `switch_layer()` accepts only a *no-op* (switching to the layer the head
+  is already on) and refuses every real transition — at every candidate
+  `PCB_LAYER_ID`, with via sizes unset / 0.6-0.3 / 0.4-0.2, idle and
+  mid-route, from an SMD pad **and from a THT pad**. All four hypotheses
+  eliminated, including H2, which was the leading one.
+- `toggle_via_placement()` places a real committed via, but cannot
+  *continue* a route on the far side. Every `(force_finish, force_commit)`
+  combination was tried, both toggle orderings: a mid-route `fix()` with
+  `force_finish=False` is simply **rejected**, so the placer never reaches
+  the far layer. The two-hop route never finished and committed nothing.
+
+**Consequence: stages 1–3 are single-layer, as planned, and the 15/24 nets
+that same-layer routing cannot reach are a real ceiling rather than a
+missing feature.** Rip-up-and-reroute, not vias, is the lever for stage 3+.
+
+One protocol remains untested and is deliberately parked: chaining
+`start_route()` from a committed via on the far layer (route → toggle →
+`fix(True, True)` → commit → `start_route()` at the via, layer=B_Cu). It is
+not obviously going to work, and two sessions have already gone here.
+Revisit only if stage 3 plateaus.
+
+<details>
+<summary>How the first Gate A attempt failed (kept — it found a real bug)</summary>
+
 
 **First run segfaulted before answering anything.** Trial 1 completed
 (`switch_layer(2)` rejected); trial 2 crashed inside `start_route()`. Root
@@ -159,6 +217,8 @@ Two changes came out of it, and **both need one rebuild**:
 Known before either run: rejections are **position-independent** (15/15 at a
 straight-line midpoint in open board space, nowhere near a pad), which rules
 out local contention.
+
+</details>
 
 Implemented as `scripts/diagnose_layer_switch.py`.
 

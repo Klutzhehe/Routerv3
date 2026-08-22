@@ -149,6 +149,7 @@ class LineRouteEnv(gym.Env):
         self._net_index = 0
         self._static_segments: list = []   # refreshed once per net, not per step
         self._pad_geoms: list = []         # PadGeom, refreshed alongside
+        self._obstacles: list = []         # per-net obstacle set, not per-step
         self._route_active = False
         self._steps = 0
         self._pos = (0.0, 0.0)
@@ -268,6 +269,7 @@ class LineRouteEnv(gym.Env):
         self._route_active = bool(
             self.bridge.start_route(int(a.x), int(a.y), start_id, 0)
         )
+        self._rebuild_obstacles()
 
     def step(self, action):
         turn = float(np.clip(np.asarray(action).reshape(-1)[0], -1.0, 1.0)) * MAX_TURN_RAD
@@ -367,7 +369,20 @@ class LineRouteEnv(gym.Env):
         # 267ms -- affordable once per episode, never per step.
         return -self.weights.drc * len(self.bridge.run_drc())
 
-    def _current_obstacles(self) -> list:
+    def _rebuild_obstacles(self) -> None:
+        """Cache the obstacle list for the CURRENT net.
+
+        Nothing in it changes while a net is being routed: committed copper
+        only grows when a net finishes, pads never move, and the agent's own
+        in-progress head is not in get_board_geometry() until commit. So this
+        is per-net work that was being redone every step -- measured at
+        0.745ms/step against a ~0.035ms budget on a 24-net board, where the
+        per-step rebuild was allocating a Segment dataclass for every pad and
+        every pending net, ~200 objects, before any numpy ran.
+        """
+        self._obstacles = self._build_obstacles()
+
+    def _build_obstacles(self) -> list:
         net = self._nets[self._net_index] if self._net_index < len(self._nets) else ""
         segments = list(self._static_segments)
 
@@ -393,7 +408,7 @@ class LineRouteEnv(gym.Env):
         if self._net_index >= len(self._nets):
             return np.zeros(self.obs_config.flat_size, dtype=np.float32)
         return build_observation(
-            self._current_obstacles(),
+            self._obstacles,
             head=self._pos,
             target=self._target_xy,
             head_layer=0,
