@@ -134,12 +134,31 @@ The collision term is load-bearing and rests on an assumption Gate B measures.
 
 ## Stage 0 — two gates, before any trainer is written
 
-### Gate A: why `switch_layer()` is 0-for-32
+### Gate A: why `switch_layer()` is 0-for-32 — BLOCKED, then unblocked
 
-Two Colab rounds each tested **one** hypothesis and each cost a session. The
-next attempt tests all of them in one run. Known so far: rejections are
-**position-independent** (15/15 at a straight-line midpoint in open board
-space, nowhere near a pad), which rules out local contention.
+**First run segfaulted before answering anything.** Trial 1 completed
+(`switch_layer(2)` rejected); trial 2 crashed inside `start_route()`. Root
+cause found and fixed: `PNS_BRIDGE::LoadBoard()` tore its old world down in
+the wrong order — freeing the `BOARD` while the old interface and router
+still pointed at it, then freeing the interface while the old router still
+held it, so `~ROUTER()`'s `ClearWorld()` ran against two freed objects. A
+use-after-free that corrupts the heap, returns `true`, and crashes at a
+distance. The diagnostic was the first thing in this repo ever to call
+`LoadBoard()` twice on one bridge; the envs `reset()` between episodes and
+every other script loads exactly one board.
+
+Two changes came out of it, and **both need one rebuild**:
+- `pns_bridge.cpp` destroys router → interface → settings → board before
+  installing the new one (the same order `~PNS_BRIDGE()` already had, which
+  is why the destructor was always safe and only this path was not).
+- The diagnostic no longer depends on that path: **one `load_board()` per
+  board** instead of per trial, trials separated by `reset()`, every row
+  printed and flushed as it completes, and the THT board loaded last — so a
+  future crash costs one trial rather than the entire run.
+
+Known before either run: rejections are **position-independent** (15/15 at a
+straight-line midpoint in open board space, nowhere near a pad), which rules
+out local contention.
 
 Implemented as `scripts/diagnose_layer_switch.py`.
 
@@ -176,7 +195,63 @@ contention.
 Hypothesis 2 is the leading one: it is the only one that explains uniform
 position-independent failure *and* is consistent with 4 succeeding.
 
-### Gate B: `T_pns`, and whether the dense signal exists
+### Gate B: PASSED — measured, 24-net board, Colab
+
+**The dense per-step signal is real, and the separation is total:**
+
+| | collision fired | n |
+|---|---|---|
+| `fix()` **rejected** | **1.00** | 90 |
+| `fix()` **accepted** | **0.00** | 9 |
+
+Separation +1.00 across 99 attempts, with the signal first firing a mean of
+**1.9 pushes before** `fix()` was called. The `--no-collision-trace` control
+reproduced 9/24 direct successes with an identical failed-net list, so
+probing mid-route does not perturb the router and the correlation stands.
+
+**The 1-D heading action space and the per-step collision penalty are
+viable as specified.** No redesign needed.
+
+Per-call wall clock (ms), which changes the observation design:
+
+| call | mean | median | max | share |
+|---|---|---|---|---|
+| `run_drc` | 267.4 | 267.4 | 267.4 | **73.2%** |
+| `get_board_geometry` | 8.6 | **0.13** | 76.8 | 21.3% |
+| `push` | 0.027 | 0.024 | 0.124 | 1.7% |
+| `head_collides` | 0.004 | 0.003 | 0.022 | 0.2% |
+| `get_head_obstacle` | 0.004 | 0.003 | 0.010 | 0.2% |
+| `fix` / `start_route` | 0.007 / 0.009 | — | — | <0.5% |
+
+`T_pns`: mean 4.03ms, **median 0.86ms**, p90 1.03ms, max 77.69ms. The mean is
+dragged by a single 77ms outlier that coincides with `get_board_geometry`'s
+76.8ms max — one cold call, not the steady state. Colab gave **`nproc` = 2**.
+
+Three consequences:
+
+1. **Do not call `get_board_geometry()` every step.** Committed copper only
+   changes when a net *finishes*, so fetch the board once per net and rebuild
+   only the head-relative part per step. That takes a step from ~0.17ms to
+   ~0.035ms — the difference between the observation being the dominant cost
+   and being free.
+2. **`run_drc()` once per episode, never per step.** Already the design; the
+   measurement makes it non-negotiable at 73% of total time.
+3. **The script's own throughput verdict is stale.** It compares `T_pns`
+   against CFP's 14M-parameter GPU numbers (0.766 ms/board). This plan's
+   policy is ~35k parameters and CPU-resident, so the GPU-bound inequality no
+   longer applies. At ~0.035ms/step the env is not the constraint; `nproc`=2
+   caps parallelism at 1–2 workers, which is ample.
+
+Baseline established at the same time: **9/24 direct straight-push
+successes, 0/24 rescued** by the polyline and 1–2mm perpendicular detours.
+Read that as a weak baseline, not as a verdict on single-layer routing — pads
+are obstacles from the very first net (which is why `net_0` failed on an
+otherwise-empty board), and a 1–2mm detour cannot clear a 1mm pad plus 0.2mm
+clearance. An agent with free heading and 20+ steps has far more room.
+**9/24 is the number to beat.**
+
+<details>
+<summary>What the instrumentation measures (original spec)</summary>
 
 One run of `scripts/measure_waypoint_fidelity.py`, now instrumented to also
 answer:
@@ -199,18 +274,32 @@ answer:
 - **Waypoint fidelity under contention.** Deviation was ~0.7 µm on one
   unobstructed push. If PNS drags the head far from where it was told on a
   dense board, the action has no causal effect and nothing can learn.
+  *Measured: final-endpoint deviation mean 0.0000mm, max 0.0000mm across all
+  9 completed nets. Fidelity is exact; this risk is closed.*
+
+</details>
 
 ## Trainer
 
 PPO, extending `pcbworld/agents/ppo_baseline.py` (GAE and the clipped surrogate
 already work; it has never seen a real reward signal).
 
-- **8 worker processes**, one bridge each. Processes, never threads — hard
-  constraint 2.
+- **1–2 worker processes**, one bridge each (Colab reports `nproc` = 2 —
+  the original "8 workers" figure was written before that was known).
+  Processes, never threads — hard constraint 2. At ~0.035ms per env step
+  this is not a throughput problem.
 - **Pre-generate a board pool** (~200 seeds) as a separate process *before*
   training. Workers cannot generate boards themselves: `generate_board.py`
   needs system `pcbnew`, which can never share a process with the bridge —
   hard constraint 1. Workers sample from the pool.
+- **A worker switching boards depends on the `LoadBoard()` fix.** Calling
+  `load_board()` twice on one `PNS_BRIDGE` was a use-after-free that
+  segfaulted the process at a distance (it corrupted the heap, returned
+  true, and crashed inside the *next* `start_route()`). Fixed in
+  `pns_bridge.cpp` by tearing down router → interface → settings → board
+  before installing the new board, but **not yet re-verified in Colab**.
+  Until it is, a worker can only be trusted with one board per process —
+  which would mean process-per-board rather than a sampled pool.
 - Rollout 256 steps/worker, 4 epochs, minibatch 512, clip 0.2, γ 0.99,
   λ 0.95, entropy 0.01 decaying to 0.001.
 - Observation normalization (running mean/std) on the global vector only;
@@ -268,10 +357,12 @@ upgrade, not a regression.
 
 ## Risks
 
-| Risk | Signal | Mitigation |
+| Risk | Signal | Status |
 |---|---|---|
-| No dense signal (`head_collides` uninformative) | Gate B shows no separation | Action granularity changes before anything is built — this is why Gate B comes first |
-| `T_pns` too slow | Gate B | Smaller boards, shorter episodes, more workers; the policy is tiny, so we are env-bound by design |
-| Waypoint infidelity under contention | Gate B deviation histogram | `RM_MARK_OBSTACLES` is already the default, making `push()` a validator rather than a shover |
+| No dense signal (`head_collides` uninformative) | Gate B separation | **CLOSED** — +1.00 separation, n=99 |
+| `T_pns` too slow | Gate B | **CLOSED** — median 0.86ms/net, ~0.035ms/step |
+| Waypoint infidelity under contention | Gate B deviation | **CLOSED** — 0.0000mm mean and max |
+| `load_board()` unsafe to call twice | Gate A segfault | Fixed in C++, **awaiting rebuild**. Blocks the sampled board pool until verified |
 | Colab session death | — | Drive checkpointing every N updates |
+| Only 2 vCPUs | `nproc` = 2 | Accepted — at ~0.035ms/step, 1–2 workers is ample |
 | Stage 3 plateaus | Completion % flat vs B2 | Add step-length dim, then rip-up action, then reconsider learned net ordering |

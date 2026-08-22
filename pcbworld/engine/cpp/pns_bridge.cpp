@@ -267,6 +267,40 @@ bool PNS_BRIDGE::LoadBoard( const std::string& aPath )
     if( !raw )
         return false;
 
+    // Tear the old world down in REVERSE dependency order, before the new
+    // BOARD is installed. Getting this wrong is a use-after-free that does
+    // not crash here -- it corrupts the heap and crashes at a distance.
+    //
+    // Found for real: scripts/diagnose_layer_switch.py calls LoadBoard()
+    // once per trial, which is the first thing in this repo ever to call it
+    // twice on one PNS_BRIDGE (the envs reset() between episodes; every
+    // script loads exactly one board). The second call returned true, and
+    // the process then segfaulted inside the NEXT StartRoute().
+    //
+    // The old sequence was `m_board.reset(raw)` first, then replacing
+    // m_iface, then m_router -- so each assignment destroyed an object that
+    // something still alive pointed at:
+    //   1. resetting m_board freed the BOARD while the old iface still held
+    //      SetBoard(old) and the old router's world still held PNS::ITEMs
+    //      parented to that board's BOARD_ITEMs;
+    //   2. replacing m_iface freed the interface while the old router still
+    //      held SetInterface(old);
+    //   3. replacing m_router finally ran ~ROUTER(), whose ClearWorld()
+    //      tears the NODE down -- calling back into the interface freed in
+    //      (2) and touching parents freed in (1).
+    //
+    // Destroying router -> interface -> settings -> board is the same order
+    // the member declarations already give ~PNS_BRIDGE() (members die in
+    // reverse declaration order, and m_board is declared first), which is
+    // why the destructor was always safe and only this path was not.
+    m_router.reset();
+    m_iface.reset();
+    m_routingSettings.reset();
+    // These are PNS::ITEM* into the world just destroyed -- clear before
+    // anything can observe them dangling, not at the end of the function.
+    m_candidateItems.clear();
+    m_candidateIds.clear();
+
     m_board.reset( raw );
     m_board->BuildListOfNets();
     m_board->BuildConnectivity();
@@ -289,8 +323,10 @@ bool PNS_BRIDGE::LoadBoard( const std::string& aPath )
     m_router->ClearWorld();
     m_router->SyncWorld();
 
-    m_candidateItems.clear();
-    m_candidateIds.clear();
+    // (m_candidateItems/m_candidateIds were cleared above, before the old
+    // world was torn down -- deliberately moved there rather than left
+    // here, where they would only be cleared after something could already
+    // have observed them dangling.)
 
     return true;
 }

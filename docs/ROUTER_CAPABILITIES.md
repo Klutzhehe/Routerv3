@@ -83,6 +83,9 @@ rejection-sampled to a 3mm minimum spacing:
 - `--num-diff-pairs N` — pairs (`diffpair_<i>_P` / `_N`) with legs 1.0mm apart
 - `--num-length-matched-groups N --length-matched-group-size K` — groups
   (`lengthgrp_<g>_<member>`) to be routed to matching length
+- `--pad-type smd|tht` — SMD (F_Cu only, no drill; the default) or plated
+  through-hole (spans F_Cu **and** B_Cu, drilled). Verified against a local
+  KiCad 9.0 install: 4/4 THT pads span both layers, 0/4 SMD pads do
 
 Net *kind* is recovered purely from the name convention — there is no separate
 metadata channel.
@@ -109,29 +112,46 @@ has to be built around.
 
 1. **`push()` almost never says no.** Across 72 net-attempts in three Colab
    runs, `push()` rejected **zero** times. `fix()` then rejected **~67%** of
-   those same routes. Success is silent and failure is late: the useful
-   per-step signal is `head_collides()` / `get_head_obstacle()`, **not**
+   those same routes. Success is silent and failure is late. **Measured, and
+   the separation is total:** across 99 attempts, `head_collides()` fired on
+   **100%** of attempts whose `fix()` was later rejected (n=90) and **0%** of
+   those accepted (n=9), a mean of 1.9 pushes before the `fix()` call. A
+   `--no-collision-trace` control run reproduced the identical result, so
+   probing does not perturb the router. The useful per-step signal is
+   `head_collides()` / `get_head_obstacle()`, **not**
    `push()`'s return value.
-2. **~33% of nets route on a naive straight line** (7/24, 8/24, 8/24 across
-   three runs on a 24-net board). A retry ladder (polyline, then four
-   perpendicular detours) was written to handle the rest but has **never been
-   run against the real bridge**.
+2. **~37% of nets route on a naive straight line** (9/24, measured; earlier
+   runs with a buggier harness gave 7/24, 8/24, 8/24). The retry ladder
+   (polyline, then four perpendicular detours) has now run for real and
+   rescued **0/24** — the 1–2mm detours are too small to clear a 1mm pad plus
+   0.2mm clearance, and pads are obstacles from the very first net. Read 9/24
+   as a weak baseline, not as a ceiling on single-layer routing.
 3. **Layer hopping does not work.** `switch_layer()` is 0-for-32 against the
-   real bridge. Whatever the cause (via sizing was suspected, never
-   confirmed), **the system is effectively single-layer today.**
-4. **`T_pns` — the wall-clock cost of one net-route — has never been
-   measured.** `scripts/measure_waypoint_fidelity.py` measures it; that run
-   has not happened. Every throughput number in `docs/AI_ARCHITECTURE.md` is
-   built on an estimate, not an observation.
-5. **Length tuning leaves a residual.** A tune leg closed to within 0.2505mm
+   real bridge. **The system is effectively single-layer today.** The
+   diagnostic that would explain it (`scripts/diagnose_layer_switch.py`) has
+   not completed a run yet — its first attempt hit the `LoadBoard()` bug
+   below.
+4. **`LoadBoard()` twice on one bridge was a use-after-free.** It freed the
+   `BOARD` while the old interface and router still referenced it, corrupting
+   the heap and segfaulting inside the *next* `start_route()`. Fixed in
+   `pns_bridge.cpp` (destroy router → interface → settings → board first),
+   **not yet re-verified in Colab**. Until it is, treat one board per process
+   as the safe assumption. The envs are unaffected — they `reset()` between
+   episodes rather than reloading.
+5. **`T_pns` is measured: median 0.86ms per net** (mean 4.03ms, dragged by a
+   single cold 77ms outlier; p90 1.03ms), on a 24-net board with `nproc`=2.
+   Per call: `run_drc` 267ms (73% of all time — once per episode, never per
+   step), `get_board_geometry` 0.13ms median, `push` 0.027ms,
+   `head_collides` / `get_head_obstacle` 0.004ms each.
+6. **Length tuning leaves a residual.** A tune leg closed to within 0.2505mm
    of its reference, not to zero — real meander-granularity behavior. Treat
    "matched" as a tolerance, not an equality.
-6. **The LLM agent works but is far too slow to be the product.** First real
+7. **The LLM agent works but is far too slow to be the product.** First real
    run: **2/3 nets routed**, at **~9–62 seconds per step**, with one net
    costing **933s for 15 steps**. Later runs hit context-window overflow
    (fixed) and repetition collapse (fixed). Even perfectly healthy, ~10s per
    decision × ~20 decisions × 24 nets is over an hour per board.
-7. **Colab is the only proven build path** — KiCad 9.0.x compiled from source
+8. **Colab is the only proven build path** — KiCad 9.0.x compiled from source
    with the bridge wired in as an extra CMake target. The bridge is CPU-only.
 
 ---

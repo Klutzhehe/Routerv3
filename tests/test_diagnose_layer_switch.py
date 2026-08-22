@@ -70,15 +70,27 @@ class DiagnosticBridge:
         self.via_drill: int | None = None
         self.switch_calls: list[int] = []
         self.pos = (0, 0)
+        # Ordered log of the calls whose SEQUENCE is load-bearing: the
+        # unset-via sweep is only honest if nothing set a via size first,
+        # and reset() cannot undo that (see the script's module docstring).
+        self.call_log: list[str] = []
 
     # -- setup ----------------------------------------------------------
     def load_board(self, path):
+        self.call_log.append("load_board")
         self.pad_type = "tht" if "tht" in path else "smd"
         # Mirrors the real LoadBoard(): a brand-new PNS::ROUTER, so via
-        # sizes reset. The "vias_unset" trial depends on this being true.
+        # sizes revert. Only this call clears them -- reset() does not.
         self.via_diameter = self.via_drill = None
         self.layer, self.active, self.head_vias = 0, False, []
         return True
+
+    def reset(self):
+        # Mirrors PNS_BRIDGE::Reset(): strips committed copper and drops any
+        # in-progress route, but deliberately does NOT touch via sizes.
+        self.call_log.append("reset")
+        self.active, self.head_vias = False, []
+        self.committed_vias = []
 
     def set_mode(self, mode):
         pass
@@ -90,6 +102,7 @@ class DiagnosticBridge:
         pass
 
     def set_via_diameter(self, d):
+        self.call_log.append("set_via_diameter")
         self.via_diameter = d
 
     def set_via_drill(self, d):
@@ -115,6 +128,7 @@ class DiagnosticBridge:
         return True
 
     def switch_layer(self, layer):
+        self.call_log.append(f"switch_layer({layer})")
         self.switch_calls.append(layer)
         if self.rule == "only_layer_2":
             accepted = layer == 2
@@ -207,29 +221,58 @@ def test_layer_id_sweep_finds_the_real_constant_and_later_trials_adopt_it():
     close that gap itself rather than trusting a default."""
     from scripts.diagnose_layer_switch import run
 
-    bridge = _install("only_layer_2")
+    _install("only_layer_2")
     results = _named(run("smd.kicad_pcb", tht_board=None, bridge_dir=None))
 
-    assert results["sweep_layer_2"].accepted
-    assert not results["sweep_layer_1"].accepted
-    # Every post-sweep switch trial must have adopted 2, not the (1) default.
-    assert results["vias_060_030"].accepted, "later trials did not adopt the accepted layer id"
-    assert results["vias_unset"].accepted
+    assert results["sweep_set_layer_2"].accepted
+    assert not results["sweep_set_layer_1"].accepted
+    # Post-sweep trials must have adopted 2, which is also LAYER_ID_SWEEP[0]
+    # here -- vias_040_020 accepting proves the adopted value reached them.
+    assert results["vias_040_020"].accepted, "later trials did not adopt the accepted layer id"
 
 
-def test_via_sizes_reset_between_trials_so_vias_unset_is_honest():
-    """load_board() constructs a new PNS::ROUTER, which is the only reason
-    the 'never set via sizes' trial means anything -- otherwise an earlier
-    trial's set_via_diameter() would leak into it and H1 could never be
-    tested at all."""
-    from scripts.diagnose_layer_switch import _prepare, run
+def test_the_unset_via_sweep_runs_before_anything_sets_a_via_size():
+    """The H1 test only means something if 'via sizes were never configured'
+    is literally true when that sweep runs. reset() does not undo a via-size
+    setting -- only a fresh load_board() does -- so this is guaranteed by
+    trial ORDER alone, which makes it worth pinning down."""
+    from scripts.diagnose_layer_switch import LAYER_ID_SWEEP, run
 
     bridge = _install("reject_all")
     run("smd.kicad_pcb", tht_board=None, bridge_dir=None)
 
-    module = sys.modules["pcbworld_pns_bridge"]
-    _prepare(bridge, module, "smd.kicad_pcb", via_sizes=None)
-    assert bridge.via_diameter is None and bridge.via_drill is None
+    first_set = bridge.call_log.index("set_via_diameter")
+    unset_sweep_switches = [
+        i
+        for i, call in enumerate(bridge.call_log)
+        if call.startswith("switch_layer") and i < first_set
+    ]
+    assert len(unset_sweep_switches) == len(LAYER_ID_SWEEP), (
+        "the whole unset sweep must complete before any set_via_diameter() call; "
+        f"got {len(unset_sweep_switches)} of {len(LAYER_ID_SWEEP)}"
+    )
+
+
+def test_only_one_load_board_per_distinct_board():
+    """load_board() twice on one PNS_BRIDGE segfaulted a whole Colab run --
+    a use-after-free in LoadBoard's teardown order, since fixed in
+    pns_bridge.cpp. Trials are separated by reset() instead, so the fixed
+    path is exercised once per board rather than once per trial."""
+    from scripts.diagnose_layer_switch import run
+
+    bridge = _install("reject_all")
+    run("smd.kicad_pcb", tht_board="tht.kicad_pcb", bridge_dir=None)
+
+    assert bridge.call_log.count("load_board") == 2, bridge.call_log.count("load_board")
+    assert bridge.call_log.count("reset") > 2, "trials should be separated by reset()"
+
+
+def test_the_tht_trial_runs_last_so_the_second_load_board_risks_least():
+    from scripts.diagnose_layer_switch import run
+
+    _install("reject_all")
+    results = run("smd.kicad_pcb", tht_board="tht.kicad_pcb", bridge_dir=None)
+    assert results[-1].name == "tht_start"
 
 
 def test_a_trial_that_raises_is_recorded_not_fatal():
@@ -261,7 +304,7 @@ def test_readback_disagreement_is_visible_when_the_return_value_lies():
     _install("lies")
     results = _named(run("smd.kicad_pcb", tht_board=None, bridge_dir=None))
 
-    trial = results["vias_060_030"]
+    trial = results["sweep_set_layer_2"]
     assert trial.accepted is False
     assert trial.layer_changed, "layer readback should disagree with the return value"
 
@@ -274,7 +317,7 @@ def test_verdict_confirms_h2_when_tht_succeeds_and_smd_fails():
 
     _install("h2")
     results = _named(run("smd.kicad_pcb", tht_board="tht.kicad_pcb", bridge_dir=None))
-    lines = _verdict(results, back_layer=1, tht_tested=True)
+    lines = _verdict(results, back_layer=2, tht_tested=True)
 
     # Match on "H2 ... CONFIRMED" specifically: the same-layer control line
     # also mentions H2 (by name, as a hypothesis it leaves alive), so a bare
@@ -284,12 +327,14 @@ def test_verdict_confirms_h2_when_tht_succeeds_and_smd_fails():
     assert "--pad-type tht" in confirmed[0] or "toggle_via_placement" in confirmed[0]
 
 
-def test_verdict_kills_h1_when_all_three_via_configs_behave_identically():
+def test_verdict_kills_h1_when_the_two_sweeps_are_identical():
+    """The H1 test is the pairwise diff between the unset-via sweep and the
+    configured-via sweep, at every candidate layer id -- not one guessed id."""
     from scripts.diagnose_layer_switch import run, _verdict
 
     _install("reject_all")
     results = _named(run("smd.kicad_pcb", tht_board=None, bridge_dir=None))
-    lines = _verdict(results, back_layer=1, tht_tested=False)
+    lines = _verdict(results, back_layer=2, tht_tested=False)
 
     assert any("H1 (via size) DEAD" in line for line in lines), lines
 
@@ -302,7 +347,7 @@ def test_verdict_reports_structural_refusal_when_the_same_layer_noop_is_rejected
 
     _install("reject_all")
     results = _named(run("smd.kicad_pcb", tht_board=None, bridge_dir=None))
-    lines = _verdict(results, back_layer=1, tht_tested=False)
+    lines = _verdict(results, back_layer=2, tht_tested=False)
 
     control = [line for line in lines if line.startswith("CONTROL")]
     assert control and "REJECTED" in control[0]
@@ -314,7 +359,7 @@ def test_verdict_confirms_h4_when_toggle_via_commits_real_copper():
 
     _install("h4")
     results = _named(run("smd.kicad_pcb", tht_board=None, bridge_dir=None))
-    lines = _verdict(results, back_layer=1, tht_tested=False)
+    lines = _verdict(results, back_layer=2, tht_tested=False)
 
     h4 = [line for line in lines if "H4 CONFIRMED" in line]
     assert h4, lines
@@ -328,7 +373,7 @@ def test_verdict_says_h2_untested_and_recommends_single_layer_when_nothing_works
 
     _install("reject_all")
     results = _named(run("smd.kicad_pcb", tht_board=None, bridge_dir=None))
-    lines = _verdict(results, back_layer=1, tht_tested=False)
+    lines = _verdict(results, back_layer=2, tht_tested=False)
 
     assert any("H2 UNTESTED" in line for line in lines), lines
     assert any("NO PRIMITIVE WORKED" in line for line in lines), lines
@@ -339,6 +384,6 @@ def test_verdict_does_not_declare_a_dead_end_when_something_did_work():
 
     _install("h4")
     results = _named(run("smd.kicad_pcb", tht_board=None, bridge_dir=None))
-    lines = _verdict(results, back_layer=1, tht_tested=False)
+    lines = _verdict(results, back_layer=2, tht_tested=False)
 
     assert not any("NO PRIMITIVE WORKED" in line for line in lines), lines

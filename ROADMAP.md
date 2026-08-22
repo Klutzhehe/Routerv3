@@ -303,8 +303,35 @@ raster structurally cannot represent it. Unrouted nets are lines too (a
 straight pad-to-pad "ghost" segment), which is most of what CFP's reserve
 plane existed to provide, for one one-hot bit.
 
-**Two gates before any trainer is written** (both need one Colab run, and
-both are now implemented and locally tested):
+**Gate results (first Colab run):**
+
+- **Gate B PASSED, decisively.** `head_collides()` fired on **100%** of
+  attempts whose `fix()` was later rejected (n=90) and **0%** of those
+  accepted (n=9) — separation +1.00 across 99 attempts, firing a mean 1.9
+  pushes before the `fix()` call. The `--no-collision-trace` control
+  reproduced the identical 9/24 result, so the probe does not perturb the
+  router. The 1-D heading action space and per-step collision penalty are
+  viable as specified. `T_pns` median **0.86ms/net**; `run_drc` is 267ms
+  (73% of all time — once per episode, never per step); `get_board_geometry`
+  0.13ms median, and should be fetched once per *net* rather than per step,
+  since committed copper only changes when a net finishes. Colab gave
+  `nproc`=2. Waypoint fidelity: **0.0000mm** deviation, mean and max.
+  Baseline to beat: **9/24 direct, 0/24 rescued**.
+- **Gate A blocked on a real bug, now fixed.** The diagnostic segfaulted on
+  its second trial. Root cause: `PNS_BRIDGE::LoadBoard()` freed the `BOARD`
+  while the old interface and router still pointed at it, then freed the
+  interface while the old router still held it — so `~ROUTER()`'s
+  `ClearWorld()` ran against two freed objects. A use-after-free that
+  returns `true` and crashes at a distance, inside the *next*
+  `start_route()`. This diagnostic was the first thing here ever to call
+  `LoadBoard()` twice on one bridge. Fixed by destroying router → interface
+  → settings → board first; the diagnostic additionally now loads one board
+  per *board* (not per trial), separates trials with `reset()`, prints every
+  row as it completes, and loads the THT board last. **Needs a rebuild, then
+  a re-run.**
+
+**Two gates before any trainer is written** (both implemented and locally
+tested):
 
 1. **Gate A — why `switch_layer()` is 0-for-32.**
    `scripts/diagnose_layer_switch.py` tests four hypotheses plus two

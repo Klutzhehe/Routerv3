@@ -19,9 +19,7 @@ What is already known and should not be re-derived:
   H1  Via size was never configured. switch_layer() places a real via
       internally; with no legal via geometry the refusal would be uniform
       and position-independent, matching the data. A fix (set 0.6mm/0.3mm)
-      is already committed in dc9164e but was NEVER RE-RUN -- so this is
-      both the cheapest hypothesis to test and the one with an untested
-      fix already sitting in the tree.
+      is already committed in dc9164e but was NEVER RE-RUN.
 
   H2  LINE_PLACER::SetLayer() refuses unless the route's START ITEM spans
       the layer being switched to. generate_board.py pads are
@@ -47,27 +45,47 @@ What is already known and should not be re-derived:
     being refused structurally, before any geometry is considered, and
     knocks out H1 and H2 together.
 
-  - LAYER-ID SWEEP: a wrong PCB_LAYER_ID constant is INDISTINGUISHABLE
-    from a structural rejection -- both are just `False`. KiCad 9
-    renumbered PCB_LAYER_ID: measured against the local KiCad 9.0 install,
-    F_Cu=0 but B_Cu=**2**, not the pre-9 31 and not the 1 that parts of
-    this repo's env code informally treat as "the other layer". This
-    process cannot ask pcbnew for it directly -- importing the system
-    pcbnew module here would crash the process (docs/performance.md, hard
-    constraint 1) -- and scripts/measure_layer_hop_rescue.py takes
-    --back-layer as a required argument, so nothing in the tree records
-    which value the historical 0-for-32 runs actually passed. The sweep
-    settles it: it tries each candidate and, if any is accepted, uses that
-    one for every later trial automatically.
+  - LAYER-ID SWEEP, RUN TWICE: a wrong PCB_LAYER_ID constant is
+    INDISTINGUISHABLE from a structural rejection -- both are just `False`.
+    KiCad 9 renumbered PCB_LAYER_ID: measured against the local KiCad 9.0
+    install, F_Cu=0 but B_Cu=**2**, not the pre-9 31 and not the 1 that
+    parts of this repo's env code informally treat as "the other layer".
+    Nothing in the tree records which value the historical 0-for-32 runs
+    passed (measure_layer_hop_rescue.py takes --back-layer as a required
+    argument). The sweep settles it. Running it twice -- once before any
+    via size is set, once after -- makes it the H1 test as well, at every
+    candidate id at once rather than at one guessed id.
+
+## Structure: why this does not just call load_board() per trial
+
+It used to, and that segfaulted the whole run on trial 2 -- the first thing
+in this repo ever to call LoadBoard() twice on one PNS_BRIDGE (the envs
+reset() between episodes; every other script loads exactly one board). That
+was a real use-after-free in LoadBoard's teardown order, now fixed in
+pns_bridge.cpp -- see the comment there. This script keeps the structural
+lesson anyway:
+
+  - **One load_board() per BOARD**, not per trial: trials are separated by
+    stop_routing() + reset(), which is Colab-verified (ROADMAP item 2).
+    Board 2 (THT) is loaded last, so if that path ever breaks again it
+    costs one trial rather than everything.
+  - **Every trial's row prints as it completes**, flushed, never batched
+    at the end. A crash then loses only the crashed trial, and `tee` keeps
+    the rest.
+  - **Trial ORDER is load-bearing.** reset() does not reset Sizes(): via
+    diameter/drill survive it, and only a new ROUTER clears them. So the
+    "vias never configured" sweep MUST run before anything calls
+    set_via_diameter(), and the copper-committing toggle trial runs last on
+    its board. Do not reorder these without reading this paragraph.
 
 Bridge-only, like every script here that touches pcbworld_pns_bridge: never
 import pcbnew in this process.
 
 Usage (after notebooks/00_setup.ipynb has built the bridge):
-    python3 pcbworld/data/generate_board.py smd.kicad_pcb --num-nets 1 --seed 0
-    python3 pcbworld/data/generate_board.py tht.kicad_pcb --num-nets 1 --seed 0 \
+    python3 pcbworld/data/generate_board.py smd1.kicad_pcb --num-nets 1 --seed 0
+    python3 pcbworld/data/generate_board.py tht1.kicad_pcb --num-nets 1 --seed 0 \
         --pad-type tht
-    python3 scripts/diagnose_layer_switch.py smd.kicad_pcb --tht-board tht.kicad_pcb
+    python3 scripts/diagnose_layer_switch.py smd1.kicad_pcb --tht-board tht1.kicad_pcb
 
 The --tht-board argument is what tests H2. Without it the script still runs
 and reports everything else, but says plainly that H2 was left untested --
@@ -85,18 +103,12 @@ from scripts.measure_waypoint_fidelity import MM, SNAP_RADIUS_NM, _load_bridge, 
 TRACK_WIDTH_NM = 250_000
 
 # Back-copper PCB_LAYER_ID candidates, most likely first (the first entry is
-# also the fallback if none is accepted).
-#
-# 2 is MEASURED, not guessed: `pcbnew.B_Cu` printed 2 against the local
-# KiCad 9.0 install (F_Cu=0, B_Cu=2 -- KiCad 9 renumbered PCB_LAYER_ID so
-# copper layers are no longer contiguous from 0). 31 is the pre-9 value and
-# 1 is what parts of this repo's env code have informally treated as "the
-# other layer" (fake_bridge.py's toggle flips 0<->1). The sweep still runs
-# all three because the Colab build is a different point release (9.0.8/
-# 9.0.9) than the install this was measured on, and because a wrong
-# constant and a structural refusal are the same `False`.
+# also the fallback if none is accepted). 2 is MEASURED: `pcbnew.B_Cu`
+# printed 2 against the local KiCad 9.0 install. 31 is the pre-9 value; 1 is
+# what fake_bridge.py's toggle informally assumes.
 LAYER_ID_SWEEP = (2, 1, 31)
 FRONT_LAYER = 0
+DEFAULT_VIA_SIZES = (600_000, 300_000)
 
 
 @dataclasses.dataclass
@@ -144,24 +156,25 @@ def _head_snapshot(bridge) -> tuple[bool | None, int | None, int | None]:
     return head.active, head.layer, len(head.vias)
 
 
-def _prepare(bridge, module, board_path: str, via_sizes: tuple[int, int] | None) -> None:
-    """Fresh router state for one trial.
-
-    load_board() constructs a BRAND NEW PNS::ROUTER (pns_bridge.cpp's
-    LoadBoard, confirmed by reading it -- not assumed), which is what makes
-    the "via sizes never set" trial honest: Sizes() genuinely resets here,
-    so a set_via_diameter() call from an earlier trial cannot leak into a
-    later one. Everything else the router needs must therefore be re-applied
-    after every load, which is why this is one function rather than setup
-    done once at the top.
-    """
+def _load_board(bridge, module, board_path: str) -> None:
+    """One fresh board. Every router setting must be re-applied here:
+    LoadBoard() constructs a brand-new PNS::ROUTER, so mode, collision mode,
+    track width and via sizes all revert."""
     assert bridge.load_board(board_path), f"load_board failed: {board_path}"
     bridge.set_mode(module.MODE_ROUTE_SINGLE)
     bridge.set_collision_mode(module.RM_MARK_OBSTACLES)
     bridge.set_track_width(TRACK_WIDTH_NM)
-    if via_sizes is not None:
-        bridge.set_via_diameter(via_sizes[0])
-        bridge.set_via_drill(via_sizes[1])
+
+
+def _between_trials(bridge) -> None:
+    """Separates trials on the SAME loaded board. Drops any in-progress
+    route and strips committed copper, leaving footprints/pads intact.
+
+    Deliberately not load_board(): see the module docstring. Note this does
+    NOT reset Sizes() -- via diameter/drill set by an earlier trial survive,
+    which is why trial order matters."""
+    bridge.stop_routing()
+    bridge.reset()
 
 
 def _first_net_pads(bridge) -> tuple[str, tuple[int, int], tuple[int, int]]:
@@ -194,8 +207,6 @@ def _open_route(bridge, start_xy, target_xy, push_to_midpoint: bool) -> list[str
 
 def _trial_switch(
     bridge,
-    module,
-    board_path: str,
     name: str,
     hypothesis: str,
     target_layer: int,
@@ -203,17 +214,27 @@ def _trial_switch(
     start_route: bool = True,
     push_to_midpoint: bool = True,
 ) -> TrialResult:
-    via_desc = "unset" if via_sizes is None else f"{via_sizes[0] / MM:.2f}/{via_sizes[1] / MM:.2f}mm"
+    """One switch_layer() trial against an ALREADY-LOADED board.
+
+    `via_sizes=None` means "do not call set_via_diameter/drill in this
+    trial" -- NOT "the router has no via sizes". Only a fresh load_board()
+    can achieve the latter, so a trial that needs genuinely-unset sizes must
+    be sequenced before any trial that sets them (module docstring).
+    """
+    via_desc = "not set here" if via_sizes is None else f"{via_sizes[0] / MM:.2f}/{via_sizes[1] / MM:.2f}mm"
+    state = "mid-route" if start_route and push_to_midpoint else "pre-push" if start_route else "idle"
     result = TrialResult(
         name=name,
         hypothesis=hypothesis,
-        config=f"layer={target_layer} vias={via_desc} "
-        f"{'mid-route' if start_route and push_to_midpoint else 'pre-push' if start_route else 'idle'}",
+        config=f"layer={target_layer} vias={via_desc} {state}",
     )
     try:
-        _prepare(bridge, module, board_path, via_sizes)
-        _, start_xy, target_xy = _first_net_pads(bridge)
+        _between_trials(bridge)
+        if via_sizes is not None:
+            bridge.set_via_diameter(via_sizes[0])
+            bridge.set_via_drill(via_sizes[1])
 
+        _, start_xy, target_xy = _first_net_pads(bridge)
         if start_route:
             result.notes.extend(_open_route(bridge, start_xy, target_xy, push_to_midpoint))
 
@@ -227,19 +248,24 @@ def _trial_switch(
     return result
 
 
-def _trial_toggle_via(bridge, module, board_path: str, via_sizes: tuple[int, int]) -> TrialResult:
+def _trial_toggle_via(bridge, via_sizes: tuple[int, int]) -> TrialResult:
     """H4: the GUI changes layer mid-route by placing a via. Walks the whole
     sequence and snapshots the head at each stage, because it isn't known
     which step materializes the via -- toggle_via_placement() itself, or the
     next push() (several PNS placers only attach pending geometry on the
-    following Move())."""
+    following Move()).
+
+    Commits copper when it succeeds, so this runs LAST on its board."""
     result = TrialResult(
         name="toggle_via_placement",
         hypothesis="H4",
         config=f"vias={via_sizes[0] / MM:.2f}/{via_sizes[1] / MM:.2f}mm mid-route",
     )
     try:
-        _prepare(bridge, module, board_path, via_sizes)
+        _between_trials(bridge)
+        bridge.set_via_diameter(via_sizes[0])
+        bridge.set_via_drill(via_sizes[1])
+
         net, start_xy, target_xy = _first_net_pads(bridge)
         result.notes.extend(_open_route(bridge, start_xy, target_xy, push_to_midpoint=True))
 
@@ -279,6 +305,27 @@ def _trial_toggle_via(bridge, module, board_path: str, via_sizes: tuple[int, int
     return result
 
 
+def _print_header() -> None:
+    print(f"{'trial':<24} {'H':<6} {'accepted':<9} {'layer':<12} {'head vias':<11} {'config'}")
+    print("-" * 104, flush=True)
+
+
+def _print_row(r: TrialResult) -> None:
+    """Printed the instant a trial finishes, never batched at the end -- a
+    segfault mid-run then costs one trial's row instead of the whole log."""
+    if r.error:
+        print(f"{r.name:<24} {r.hypothesis:<6} {'ERROR':<9} {r.error}", flush=True)
+    else:
+        layers = f"{r.layer_before}->{r.layer_after}"
+        vias = f"{r.head_vias_before}->{r.head_vias_after}"
+        print(
+            f"{r.name:<24} {r.hypothesis:<6} {str(r.accepted):<9} {layers:<12} {vias:<11} {r.config}",
+            flush=True,
+        )
+    for note in r.notes:
+        print(f"    [{r.name}] {note}", flush=True)
+
+
 def _verdict(results: dict[str, TrialResult], back_layer: int, tht_tested: bool) -> list[str]:
     """Maps the observed pattern onto which hypotheses survive.
 
@@ -287,23 +334,45 @@ def _verdict(results: dict[str, TrialResult], back_layer: int, tht_tested: bool)
     be IN the output, not derived afterwards from a table of booleans.
     """
     lines: list[str] = []
+    ref = f"sweep_set_layer_{back_layer}"
 
     def ok(name: str) -> bool:
         r = results.get(name)
         return bool(r and r.error is None and r.accepted)
 
-    sweep_hits = [lid for lid in LAYER_ID_SWEEP if ok(f"sweep_layer_{lid}")]
-    if sweep_hits:
+    hits = [lid for lid in LAYER_ID_SWEEP if ok(f"sweep_set_layer_{lid}") or ok(f"sweep_unset_layer_{lid}")]
+    if hits:
         lines.append(
-            f"LAYER ID: switch_layer() ACCEPTED layer id(s) {sweep_hits} -- so at least some of "
-            f"the historical 0-for-32 may have been a wrong PCB_LAYER_ID constant, not a "
-            f"structural refusal. Use {sweep_hits[0]} as the back-copper id."
+            f"LAYER ID: switch_layer() ACCEPTED layer id(s) {hits} -- so at least some of the "
+            f"historical 0-for-32 may have been a wrong PCB_LAYER_ID constant, not a structural "
+            f"refusal. Use {hits[0]} as the back-copper id."
         )
     else:
         lines.append(
-            f"LAYER ID: no id in {list(LAYER_ID_SWEEP)} was accepted, so the refusal is NOT a "
-            f"wrong-constant artifact. That whole class of explanation is now ruled out."
+            f"LAYER ID: no id in {list(LAYER_ID_SWEEP)} was accepted, with or without via sizes "
+            f"set, so the refusal is NOT a wrong-constant artifact. That class of explanation is "
+            f"ruled out."
         )
+
+    # H1: the same sweep, with and without via sizes configured.
+    pairs = [
+        (lid, results.get(f"sweep_unset_layer_{lid}"), results.get(f"sweep_set_layer_{lid}"))
+        for lid in LAYER_ID_SWEEP
+    ]
+    comparable = [(lid, u, s) for lid, u, s in pairs if u and s and u.error is None and s.error is None]
+    if comparable:
+        differing = [lid for lid, u, s in comparable if u.accepted != s.accepted]
+        if not differing:
+            lines.append(
+                f"H1 (via size) DEAD: at every candidate layer id {[lid for lid, _, _ in comparable]}, "
+                f"configuring 0.6/0.3mm produced the IDENTICAL result to never setting a via size at "
+                f"all. dc9164e's committed fix does not change the outcome."
+            )
+        else:
+            lines.append(
+                f"H1 (via size) LIVE: setting via sizes changed the result at layer id(s) "
+                f"{differing}."
+            )
 
     noop = results.get("same_layer_noop")
     if noop and noop.error is None:
@@ -320,22 +389,7 @@ def _verdict(results: dict[str, TrialResult], back_layer: int, tht_tested: bool)
                 "together and points hard at H3/H4."
             )
 
-    via_trials = [results.get(n) for n in ("vias_060_030", "vias_040_020", "vias_unset")]
-    via_trials = [t for t in via_trials if t and t.error is None]
-    if len(via_trials) == 3:
-        outcomes = {t.accepted for t in via_trials}
-        if len(outcomes) == 1 and not outcomes.pop():
-            lines.append(
-                "H1 (via size) DEAD: 0.6/0.3mm, 0.4/0.2mm, and never-set all produced the "
-                "identical rejection. dc9164e's committed fix does not change the outcome."
-            )
-        else:
-            lines.append(
-                "H1 (via size) LIVE: the three via configurations did NOT behave identically -- "
-                + ", ".join(f"{t.name}={t.accepted}" for t in via_trials)
-            )
-
-    idle, mid = results.get("idle_switch"), results.get("vias_060_030")
+    idle, mid = results.get("idle_switch"), results.get(ref)
     if idle and mid and idle.error is None and mid.error is None:
         if idle.accepted and not mid.accepted:
             lines.append(
@@ -346,7 +400,7 @@ def _verdict(results: dict[str, TrialResult], back_layer: int, tht_tested: bool)
             lines.append("H3: rejected in BOTH idle and mid-route -- state is not the discriminator.")
 
     if tht_tested:
-        tht, smd = results.get("tht_start"), results.get("vias_060_030")
+        tht, smd = results.get("tht_start"), results.get(ref)
         if tht and smd and tht.error is None and smd.error is None:
             if tht.accepted and not smd.accepted:
                 lines.append(
@@ -412,89 +466,83 @@ def run(board_path: str, tht_board: str | None, bridge_dir: str | None) -> list[
 
     results: list[TrialResult] = []
 
-    # The sweep runs FIRST so every later trial can use whichever id is real,
-    # instead of inheriting a guess.
+    def record(result: TrialResult) -> TrialResult:
+        results.append(result)
+        _print_row(result)
+        return result
+
+    _load_board(bridge, module, board_path)
+    _print_header()
+
+    # Sweep 1 -- BEFORE any set_via_diameter/drill call in this process, so
+    # "via sizes were never configured" is literally true here. This must
+    # stay first; reset() does not undo a via-size setting.
     for layer_id in LAYER_ID_SWEEP:
-        results.append(
+        record(
             _trial_switch(
-                bridge, module, board_path,
-                name=f"sweep_layer_{layer_id}",
-                hypothesis="layer-id control",
-                target_layer=layer_id,
-                via_sizes=(600_000, 300_000),
+                bridge, name=f"sweep_unset_layer_{layer_id}", hypothesis="H1",
+                target_layer=layer_id, via_sizes=None,
             )
         )
 
-    accepted_ids = [r for r in results if r.accepted]
-    back_layer = int(accepted_ids[0].name.rsplit("_", 1)[1]) if accepted_ids else LAYER_ID_SWEEP[0]
-    if accepted_ids:
-        print(f"-> layer-id sweep accepted {back_layer}; using it for the remaining trials\n")
-    else:
-        print(f"-> layer-id sweep accepted nothing; using {back_layer} for the remaining trials\n")
+    # Sweep 2 -- identical, with via sizes configured. The pairwise diff
+    # against sweep 1 is the H1 test, at every candidate id rather than one.
+    for layer_id in LAYER_ID_SWEEP:
+        record(
+            _trial_switch(
+                bridge, name=f"sweep_set_layer_{layer_id}", hypothesis="H1",
+                target_layer=layer_id, via_sizes=DEFAULT_VIA_SIZES,
+            )
+        )
 
-    results.append(
+    accepted = [r for r in results if r.accepted]
+    back_layer = int(accepted[0].name.rsplit("_", 1)[1]) if accepted else LAYER_ID_SWEEP[0]
+    print(
+        f"\n-> back layer for the remaining trials: {back_layer}"
+        f"{' (accepted by the sweep)' if accepted else ' (nothing accepted; using the measured KiCad 9 B_Cu)'}\n",
+        flush=True,
+    )
+
+    record(
         _trial_switch(
-            bridge, module, board_path, name="same_layer_noop", hypothesis="control",
-            target_layer=FRONT_LAYER, via_sizes=(600_000, 300_000),
+            bridge, name="same_layer_noop", hypothesis="control",
+            target_layer=FRONT_LAYER, via_sizes=DEFAULT_VIA_SIZES,
         )
     )
-    results.append(
+    record(
         _trial_switch(
-            bridge, module, board_path, name="idle_switch", hypothesis="H3",
-            target_layer=back_layer, via_sizes=(600_000, 300_000), start_route=False,
-            push_to_midpoint=False,
+            bridge, name="idle_switch", hypothesis="H3", target_layer=back_layer,
+            via_sizes=DEFAULT_VIA_SIZES, start_route=False, push_to_midpoint=False,
         )
     )
-    results.append(
+    record(
         _trial_switch(
-            bridge, module, board_path, name="before_first_push", hypothesis="H3",
-            target_layer=back_layer, via_sizes=(600_000, 300_000), push_to_midpoint=False,
+            bridge, name="before_first_push", hypothesis="H3", target_layer=back_layer,
+            via_sizes=DEFAULT_VIA_SIZES, push_to_midpoint=False,
         )
     )
-    results.append(
+    record(
         _trial_switch(
-            bridge, module, board_path, name="vias_060_030", hypothesis="H1",
-            target_layer=back_layer, via_sizes=(600_000, 300_000),
+            bridge, name="vias_040_020", hypothesis="H1", target_layer=back_layer,
+            via_sizes=(400_000, 200_000),
         )
     )
-    results.append(
-        _trial_switch(
-            bridge, module, board_path, name="vias_040_020", hypothesis="H1",
-            target_layer=back_layer, via_sizes=(400_000, 200_000),
-        )
-    )
-    results.append(
-        _trial_switch(
-            bridge, module, board_path, name="vias_unset", hypothesis="H1",
-            target_layer=back_layer, via_sizes=None,
-        )
-    )
+    # Commits copper, so it goes last on this board.
+    record(_trial_toggle_via(bridge, DEFAULT_VIA_SIZES))
+
+    # Second (and only other) load_board(), deliberately last: this is the
+    # path that segfaulted before the LoadBoard teardown-order fix, so if it
+    # ever regresses it costs one trial rather than the whole run.
     if tht_board:
-        results.append(
+        _load_board(bridge, module, tht_board)
+        record(
             _trial_switch(
-                bridge, module, tht_board, name="tht_start", hypothesis="H2",
-                target_layer=back_layer, via_sizes=(600_000, 300_000),
+                bridge, name="tht_start", hypothesis="H2", target_layer=back_layer,
+                via_sizes=DEFAULT_VIA_SIZES,
             )
         )
-    results.append(_trial_toggle_via(bridge, module, board_path, (600_000, 300_000)))
 
-    print(f"{'trial':<22} {'H':<5} {'accepted':<9} {'layer':<12} {'head vias':<11} {'config'}")
-    print("-" * 100)
-    for r in results:
-        if r.error:
-            print(f"{r.name:<22} {r.hypothesis:<5} {'ERROR':<9} {r.error}")
-            continue
-        layers = f"{r.layer_before}->{r.layer_after}"
-        vias = f"{r.head_vias_before}->{r.head_vias_after}"
-        print(
-            f"{r.name:<22} {r.hypothesis:<5} {str(r.accepted):<9} {layers:<12} {vias:<11} {r.config}"
-        )
-
-    for r in results:
-        for note in r.notes:
-            print(f"    [{r.name}] {note}")
-
-    print(f"\n{'=' * 100}\nVERDICT\n{'=' * 100}")
+    print(f"\n{'=' * 104}\nVERDICT\n{'=' * 104}")
     by_name = {r.name: r for r in results}
     for line in _verdict(by_name, back_layer, tht_tested=bool(tht_board)):
         print(f"  {line}\n")
@@ -511,7 +559,7 @@ def run(board_path: str, tht_board: str | None, bridge_dir: str | None) -> list[
                 f"    {r.name}: returned {r.accepted} but layer went "
                 f"{r.layer_before}->{r.layer_after}"
             )
-    print("=" * 100)
+    print("=" * 104)
 
     return results
 
