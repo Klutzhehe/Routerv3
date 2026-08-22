@@ -338,13 +338,15 @@ class LineRouteEnv(gym.Env):
         bearing = math.atan2(dy, dx) if (dx or dy) else 0.0
         heading = bearing + turn
 
+        prev_dist = math.hypot(dx, dy)
         goal = (
             self._pos[0] + self.step_size_nm * math.cos(heading),
             self._pos[1] + self.step_size_nm * math.sin(heading),
         )
 
-        prev_dist = math.hypot(dx, dy)
         self.bridge.push(int(goal[0]), int(goal[1]), -1)
+
+
 
         # Read the head back rather than trusting the requested point: push()
         # is ROUTER::Move(), which may not land exactly where it was told, and
