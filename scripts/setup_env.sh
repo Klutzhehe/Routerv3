@@ -70,12 +70,30 @@ if [ ! -f build/CMakeCache.txt ] || [ "$RESTORED_FROM_CACHE" = "1" ]; then
   if [ "$RESTORED_FROM_CACHE" = "1" ] && [ -f build/CMakeCache.txt ]; then
     echo "cache was restored from Drive this run -- its recorded toolchain paths may be stale in this runtime (already happened once: a Python-version change in Colab's base image broke a cached cmake path). Forcing a reconfigure rather than trusting it."
   fi
+  # PYBIND11_FINDPYTHON=ON + an explicit Python3_EXECUTABLE: hit for real
+  # on a Colab runtime with multiple Pythons installed (system python3 ->
+  # 3.13, but /usr/include/python3.12 also present from an older image
+  # layer) -- pybind11 v2.9.2 (installed here via `pip install pybind11`,
+  # predates FindPython being the default) resolves its module's include
+  # dirs via CMake's legacy, deprecated FindPythonLibs, which is known to
+  # pick a DIFFERENT Python than the one actually in use when more than
+  # one coexists on a system: `CMake Error ... pybind11::module includes
+  # non-existent path "/usr/include/python3.12"`, even though python3 -m
+  # pybind11 --cmakedir (used just above for PYBIND11_CMAKE_DIR) already
+  # resolved correctly via the SAME python3. PYBIND11_FINDPYTHON=ON
+  # switches pybind11 onto CMake's modern find_package(Python3) path,
+  # which is far more consistent about honoring a pinned executable;
+  # Python3_EXECUTABLE removes the remaining ambiguity outright. Low risk
+  # to carry even if this pybind11 version doesn't read the flag -- CMake
+  # silently ignores an unused -D cache variable rather than failing.
   cmake -S . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DKICAD_BUILD_QA_TESTS=OFF \
     -DKICAD_SCRIPTING_WXPYTHON=OFF \
     -DKICAD_BUILD_I18N=OFF \
     -DKICAD_USE_CMAKE_FINDPROTOBUF=ON \
+    -DPYBIND11_FINDPYTHON=ON \
+    -DPython3_EXECUTABLE="$(command -v python3)" \
     -Dpybind11_DIR="$PYBIND11_CMAKE_DIR"
 else
   echo "build/CMakeCache.txt already exists from this same session -- skipping configure (rm -rf build to force a clean reconfigure)"

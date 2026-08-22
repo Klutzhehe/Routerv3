@@ -77,6 +77,30 @@ way; see `docs/engine_access.md` / `docs/performance.md` for the full
    legitimate same-session-retry case (re-running after an earlier
    failure, same runtime, safe to skip) is unaffected, since that case
    never sets the flag.
+   **Forcing that reconfigure surfaced a second, independent Python-
+   detection bug**, not caused by the fix above: `pybind11::module`
+   includes `/usr/include/python3.12` in its `INTERFACE_INCLUDE_DIRECTORIES`
+   — a path that doesn't exist on a Colab runtime whose `python3` resolves
+   to 3.13. This repo's own `pcbworld/engine/cpp/CMakeLists.txt` does
+   nothing beyond `find_package(pybind11 CONFIG REQUIRED)`; every bit of
+   Python-version resolution happens inside pybind11's own imported CMake
+   config. The pip-installed pybind11 here is v2.9.2, old enough to
+   predate `PYBIND11_FINDPYTHON` defaulting on, so it resolves headers via
+   CMake's legacy, deprecated `FindPythonLibs` module — a module with a
+   well-known failure mode of picking a *different* Python than the one
+   actually in use when more than one coexists on a system (exactly what
+   happened: `python3 -m pybind11 --cmakedir`, used earlier in the same
+   script, already resolved correctly via the same `python3`).
+   `setup_env.sh` now passes `-DPYBIND11_FINDPYTHON=ON` (switches pybind11
+   onto CMake's modern, more consistent `find_package(Python3)` path) and
+   `-DPython3_EXECUTABLE="$(command -v python3)"` (removes the remaining
+   ambiguity outright). This is the standard, documented fix for this
+   class of pybind11/CMake bug, not something root-caused against this
+   repo's own source the way the C++ binding issues above were — if it
+   doesn't fully resolve it, the next fallback is hardcoding
+   `-DPython3_INCLUDE_DIR`/`-DPython3_LIBRARY` from
+   `python3 -c "import sysconfig; ..."` directly, bypassing CMake's Python
+   detection entirely, not yet attempted.
 4. **`ROUTER::LoadSettings()` must be called before any routing call.**
    `PNS::ROUTER`'s constructor leaves `m_settings = nullptr`; the first
    real routing call dereferences it unguarded. `PNS_BRIDGE::LoadBoard()`
