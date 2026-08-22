@@ -191,11 +191,12 @@ def train_curriculum_live(
             stage_steps += cfg.rollout_steps
             cumulative_steps += cfg.rollout_steps
 
-            episodes = rollout_info["episodes"]
-            mean_reward = float(np.mean([ep["reward"] for ep in episodes])) if episodes else float("nan")
+            episode_rewards = rollout_info["episode_rewards"]
+            mean_reward = float(np.mean(episode_rewards)) if episode_rewards else float("nan")
             comp = rollout_info["completed_nets"]
             failed = rollout_info["failed_nets"]
             comp_rate = (comp / (comp + failed) * 100.0) if (comp + failed) > 0 else 0.0
+
 
             # Record history for live plotting
             history["steps"].append(cumulative_steps)
