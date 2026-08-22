@@ -75,9 +75,10 @@ class LineActorCritic(nn.Module):
         seg_hidden_dim: int = 64,
         global_hidden_dim: int = 64,
         trunk_hidden_dim: int = 128,
-        initial_log_std: float = 0.0,
+        initial_log_std: float = -1.2,
     ):
         super().__init__()
+
         self.num_global = num_global
         self.num_segment_features = num_segment_features
         self.action_dim = action_dim

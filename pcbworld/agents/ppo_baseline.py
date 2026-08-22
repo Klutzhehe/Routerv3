@@ -35,9 +35,10 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     value_coef: float = 0.5
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.001
     learning_rate: float = 3e-4
     max_grad_norm: float = 0.5
+
     hidden_size: int = 64
     device: str = "cpu"
     checkpoint_interval: int = 5_000

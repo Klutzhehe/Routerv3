@@ -95,27 +95,28 @@ def train_curriculum_live(
 
     stages = [
         {
-            "name": "Stage 1: Basics (2-4 Nets, Single Obstacles)",
+            "name": "Stage 1: Basics (4-6 Nets, Real Obstacles)",
             "board_dir": str(stage1_dir),
             "timesteps": 80_000,
             "enable_ripup": False,
             "max_ripups": 0,
         },
         {
-            "name": "Stage 2: Corridors (5-8 Nets, Crossing Traffic)",
+            "name": "Stage 2: Corridors (7-10 Nets, Dense Traffic)",
             "board_dir": str(stage2_dir),
             "timesteps": 60_000,
             "enable_ripup": False,
             "max_ripups": 0,
         },
         {
-            "name": "Stage 3: Full Production (Mixed Signals & Rip-Up)",
+            "name": "Stage 3: Full Production (8 Plain Nets + Diff Pairs & Length Groups)",
             "board_dir": str(stage3_dir),
             "timesteps": 100_000,
             "enable_ripup": True,
             "max_ripups": 6,
         },
     ]
+
 
     if stage_limit is not None:
         stages = stages[:stage_limit]
