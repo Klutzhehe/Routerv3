@@ -21,6 +21,28 @@ from training.evaluation import evaluate_policy
 from pcbworld.environment import PCBRouterEnv
 from models.router_policy import PCBRouterNet
 
+# One new axis of difficulty per stage. enable_layer_via stays False through
+# stage 3 -- board_generator.py sets tgt_layer = src_layer for these stages,
+# so the correct answer is "never touch layer/via", and exposing that
+# dimension before the core skill exists just gives the policy a free way to
+# fail (measured: ~75% of steps toggled it in an undertrained eval, before it
+# was disabled). Multi-net (stage 3) and via/layer (stage 4) are kept
+# separate for the same reason: stacking two unvalidated axes at once is how
+# a failure stops being attributable to either one.
+#
+# Module-level (not inside main()) so scripts/render_episode.py can share it
+# instead of re-declaring a second copy that quietly drifts out of sync.
+STAGE_CONFIG = {
+    1: dict(num_nets=1, num_obstacles=0, enable_layer_via=False),
+    2: dict(num_nets=1, num_obstacles=6, enable_layer_via=False),
+    3: dict(num_nets=4, num_obstacles=6, enable_layer_via=False),
+    4: dict(num_nets=4, num_obstacles=6, enable_layer_via=True),
+}
+
+
+def action_dim_for_stage(stage_cfg: dict) -> int:
+    return 96 if stage_cfg["enable_layer_via"] else 24
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train AI PCB Router Platform (PCBRouterNet)")
@@ -33,23 +55,8 @@ def main():
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # One new axis of difficulty per stage. enable_layer_via stays False
-    # through stage 3 -- board_generator.py sets tgt_layer = src_layer for
-    # these stages, so the correct answer is "never touch layer/via", and
-    # exposing that dimension before the core skill exists just gives the
-    # policy a free way to fail (measured: ~75% of steps toggled it in an
-    # undertrained eval, before it was disabled). Multi-net (stage 3) and
-    # via/layer (stage 4) are kept separate for the same reason: stacking
-    # two unvalidated axes at once is how a failure stops being
-    # attributable to either one.
-    STAGE_CONFIG = {
-        1: dict(num_nets=1, num_obstacles=0, enable_layer_via=False),
-        2: dict(num_nets=1, num_obstacles=6, enable_layer_via=False),
-        3: dict(num_nets=4, num_obstacles=6, enable_layer_via=False),
-        4: dict(num_nets=4, num_obstacles=6, enable_layer_via=True),
-    }
     stage_cfg = STAGE_CONFIG[args.stage]
-    action_dim = 96 if stage_cfg["enable_layer_via"] else 24
+    action_dim = action_dim_for_stage(stage_cfg)
 
     if args.eval_only:
         print(f"Loading checkpoint from: {args.checkpoint}")
