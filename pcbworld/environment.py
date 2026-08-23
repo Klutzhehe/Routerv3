@@ -237,6 +237,13 @@ class PCBRouterEnv(gym.Env):
         is_bend = (self.head_prev_dir is not None) and (self.head_prev_dir != dir_idx)
         self.head_prev_dir = dir_idx
 
+        # Compute heading alignment toward target pad
+        dx_tgt = target.x - prev_x
+        dy_tgt = target.y - prev_y
+        tgt_norm = math.hypot(dx_tgt, dy_tgt)
+        act_norm = math.hypot(dir_x, dir_y)
+        heading_alignment = float((dx_tgt * dir_x + dy_tgt * dir_y) / (tgt_norm * act_norm)) if (tgt_norm > 1e-4 and act_norm > 1e-4) else 0.0
+
         # Congestion overlap penalty
         cong_overlap = 0.0
         if self._congestion_cache is not None and not out_of_bounds:
@@ -247,6 +254,7 @@ class PCBRouterEnv(gym.Env):
             prev_dist=prev_dist,
             curr_dist=curr_dist,
             step_len=step_len,
+            heading_alignment=heading_alignment,
             is_connected=is_connected,
             is_collided=is_collided,
             is_bend=is_bend,

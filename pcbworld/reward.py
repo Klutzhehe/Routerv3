@@ -20,9 +20,10 @@ class RewardCalculator:
     def __init__(
         self,
         connect_bonus: float = 1000.0,
-        collision_penalty: float = 100.0,
-        dist_scale: float = 10.0,
-        length_penalty_scale: float = 0.05,
+        collision_penalty: float = 50.0,
+        dist_scale: float = 15.0,
+        align_scale: float = 5.0,
+        length_penalty_scale: float = 0.02,
         bend_penalty: float = 0.5,
         via_penalty: float = 5.0,
         congestion_penalty_scale: float = 2.0,
@@ -30,6 +31,7 @@ class RewardCalculator:
         self.connect_bonus = connect_bonus
         self.collision_penalty = collision_penalty
         self.dist_scale = dist_scale
+        self.align_scale = align_scale
         self.length_penalty_scale = length_penalty_scale
         self.bend_penalty = bend_penalty
         self.via_penalty = via_penalty
@@ -40,6 +42,7 @@ class RewardCalculator:
         prev_dist: float,
         curr_dist: float,
         step_len: float,
+        heading_alignment: float,
         is_connected: bool,
         is_collided: bool,
         is_bend: bool,
@@ -64,21 +67,25 @@ class RewardCalculator:
         dist_reward = delta_dist * self.dist_scale
         reward_breakdown["dist"] = dist_reward
 
-        # 2. Step length cost
+        # 2. Heading alignment toward target pad
+        align_reward = self.align_scale * heading_alignment
+        reward_breakdown["align"] = align_reward
+
+        # 3. Step length cost
         length_cost = -self.length_penalty_scale * step_len
         reward_breakdown["length"] = length_cost
 
-        # 3. Bend penalty
+        # 4. Bend penalty
         bend_cost = -self.bend_penalty if is_bend else 0.0
         reward_breakdown["bend"] = bend_cost
 
-        # 4. Via penalty
+        # 5. Via penalty
         via_cost = -self.via_penalty if is_via else 0.0
         reward_breakdown["via"] = via_cost
 
-        # 5. Congestion penalty
+        # 6. Congestion penalty
         cong_cost = -self.congestion_penalty_scale * congestion_overlap
         reward_breakdown["congestion"] = cong_cost
 
-        total_reward = dist_reward + length_cost + bend_cost + via_cost + cong_cost
+        total_reward = dist_reward + align_reward + length_cost + bend_cost + via_cost + cong_cost
         return total_reward, reward_breakdown
