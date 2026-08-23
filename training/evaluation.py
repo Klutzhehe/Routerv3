@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from pcbworld.environment import PCBRouterEnv
-from models.router_policy import PCBRouterNet
+from models.router_policy import PCBRouterNet, select_deterministic_action
 
 
 def evaluate_policy(
@@ -59,14 +59,25 @@ def evaluate_policy(
                 net.target_pad.y - net.source_pad.y,
             )
 
+        # Rejected-action-avoidance state: reset whenever the head actually
+        # moves. See select_deterministic_action's docstring -- plain argmax
+        # retries an identical rejected move forever.
+        forbidden: set[int] = set()
+        prev_head = env.head_x, env.head_y
         while not done:
             obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=dev).unsqueeze(0)
             with torch.no_grad():
                 dist, _ = model(obs_t)
-                action = int(torch.argmax(dist.logits).item())
+                action = select_deterministic_action(dist, forbidden)
 
             obs_np, reward, term, trunc, step_info = env.step(action)
             done = term or trunc
+            new_head = env.head_x, env.head_y
+            if new_head == prev_head:
+                forbidden.add(action)
+            else:
+                forbidden = set()
+            prev_head = new_head
 
         completed_nets += step_info.get("completed_nets", 0)
         total_nets += step_info.get("total_nets", 0)

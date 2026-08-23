@@ -7,9 +7,11 @@ that capped the step budget independently of training and evaluate_policy
 
 Also settles sampling-vs-mode questions cheaply: --stochastic renders one
 sampled rollout (what training's collect loop does, dist.sample()); the
-default is deterministic argmax, the SAME action selection evaluate_policy
-uses. If a route zigzags under --stochastic but not by default, that was
-sampling noise from rendering the wrong action mode, not a policy bug.
+default is deterministic action selection, the SAME select_deterministic_action
+evaluate_policy uses (argmax, but skipping actions already rejected at the
+current position -- plain argmax repeats an identical rejected move forever).
+If a route zigzags under --stochastic but not by default, that was sampling
+noise from rendering the wrong action mode, not a policy bug.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import torch
 
 from pcbworld.environment import PCBRouterEnv
 from pcbworld.renderer import render_grid_board
-from models.router_policy import PCBRouterNet
+from models.router_policy import PCBRouterNet, select_deterministic_action
 from scripts.train_ai_router import STAGE_CONFIG, action_dim_for_stage
 
 
@@ -54,13 +56,19 @@ def main():
     obs_np, info = env.reset(seed=args.seed)
 
     done = False
+    forbidden: set[int] = set()
+    prev_head = env.head_x, env.head_y
     while not done:
         obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device_str).unsqueeze(0)
         with torch.no_grad():
             dist, _ = model(obs_t)
-            action = int(dist.sample().item()) if args.stochastic else int(torch.argmax(dist.logits).item())
+            action = int(dist.sample().item()) if args.stochastic else select_deterministic_action(dist, forbidden)
         obs_np, reward, term, trunc, info = env.step(action)
         done = term or trunc
+        new_head = env.head_x, env.head_y
+        if not args.stochastic:
+            forbidden = forbidden | {action} if new_head == prev_head else set()
+        prev_head = new_head
 
     print(f"completed_nets={info['completed_nets']}/{info['total_nets']}  "
           f"failed_nets={info['failed_nets']}  wirelength={info['total_wirelength']:.1f}  "

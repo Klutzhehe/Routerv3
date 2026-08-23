@@ -135,3 +135,31 @@ class PCBRouterNet(nn.Module):
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         return action, log_prob, entropy, value
+
+
+def select_deterministic_action(dist: Categorical, forbidden: set[int]) -> int:
+    """argmax, but skipping actions already tried and rejected at the
+    CURRENT position since the last successful move.
+
+    Plain argmax retries the identical action forever once a move is
+    rejected: a rejected move barely changes the observation (only the
+    Channel-9 rejection marker's intensity ticks up), so nothing shifts
+    which action wins the argmax. Measured directly on 5/5 boards that got
+    stuck: the deterministic policy picked the exact same action 6 times in
+    a row before max_consecutive_collisions gave up on the net -- the
+    collision-retry budget PCBRouterEnv provides is real for a STOCHASTIC
+    policy (training's sampling naturally varies), but structurally inert
+    for a deterministic one. `forbidden` is the caller's job to maintain:
+    add the action just rejected, clear it the instant a move succeeds.
+
+    Training's rollout collection deliberately does NOT use this -- it
+    would decouple the sampled action from dist.log_prob(action), corrupting
+    the PPO ratio between collection and update. This is for deterministic
+    evaluation/deployment only, where there is no log-prob to keep
+    consistent.
+    """
+    logits = dist.logits.squeeze(0) if dist.logits.dim() > 1 else dist.logits
+    for idx in torch.argsort(logits, descending=True).tolist():
+        if idx not in forbidden:
+            return idx
+    return int(torch.argmax(logits).item())  # every action forbidden; shouldn't happen
