@@ -60,8 +60,20 @@ class PCBRouterNet(nn.Module):
             nn.Linear(128, 1),
         )
 
-        # Initialize policy head near zero to prevent violent initial divergence
-        nn.init.orthogonal_(self.policy_head[-1].weight, gain=0.01)
+        # Initialize policy head near zero to prevent violent initial divergence.
+        # gain=0.01 (not smaller) matters here in a way it wouldn't without
+        # the bias below: measured directly, gain=0.01 made the weight-driven
+        # logit contribution std=0.0017 -- ~1200x smaller than the +2.0 bias
+        # that used to sit on top of it. Two genuinely different boards then
+        # produced final-logit differences of ~0.0004, so the deterministic
+        # policy was, in effect, ALWAYS the fixed bias regardless of what the
+        # encoder learned: gradient descent would have had to grow this
+        # layer's weights by three orders of magnitude to compete, which
+        # ~1000-1500 minibatch updates measurably did not do (an untrained
+        # random model and four independently-trained checkpoints all scored
+        # 37/50 on the same fixed eval boards). gain=0.1 puts the
+        # weight-driven contribution within reach of training instead.
+        nn.init.orthogonal_(self.policy_head[-1].weight, gain=0.1)
         nn.init.constant_(self.policy_head[-1].bias, 0.0)
 
         # Bias the dir_idx == 0 actions ("toward the target", or around
@@ -71,14 +83,15 @@ class PCBRouterNet(nn.Module):
         # mean-zero-action trick: instead of an untrained policy sampling
         # uniformly over 8 board-pose-dependent directions, it starts
         # already preferring the one direction that generalizes across
-        # every board. +2.0 logit ~= e^2 higher relative weight, soft
-        # enough that every other action stays reachable.
+        # every board. +0.5 logit ~= e^0.5 ~= 1.65x relative weight -- a
+        # real nudge, not the +2.0 (~7.4x, dominating ~51% of initial mass
+        # on 3/24 actions) that made this un-overcomable in the first place.
         with torch.no_grad():
             bias = self.policy_head[-1].bias
             if action_dim == 24:      # dir_idx*3 + dist_idx
-                bias[0:3] += 2.0
+                bias[0:3] += 0.5
             elif action_dim == 96:    # dir_idx*12 + dist_idx*4 + layer*2 + via
-                bias[0:12] += 2.0
+                bias[0:12] += 0.5
 
     def forward(
         self,
