@@ -33,7 +33,7 @@ DIR_VECTORS = [
     (-1, -1),  # 7: North-West
 ]
 
-DIST_STEPS = [1, 2, 4]  # 0: 1 grid, 1: 2 grids, 2: 4 grids
+DIST_STEPS = [2, 4, 8]  # Step distances for fast grid traversal
 
 
 class PCBRouterEnv(gym.Env):
@@ -46,7 +46,9 @@ class PCBRouterEnv(gym.Env):
         num_obstacles: int = 0,
         num_layers: int = 2,
         max_steps_per_net: int = 150,
-        snap_radius: int = 6,
+        snap_radius: int = 8,
+        min_pad_dist: int = 20,
+        max_pad_dist: Optional[int] = None,
         seed: Optional[int] = None,
         reward_calculator: Optional[RewardCalculator] = None,
     ):
@@ -57,6 +59,8 @@ class PCBRouterEnv(gym.Env):
         self.num_layers = num_layers
         self.max_steps_per_net = max_steps_per_net
         self.snap_radius = snap_radius
+        self.min_pad_dist = min_pad_dist
+        self.max_pad_dist = max_pad_dist
 
         self.reward_calc = reward_calculator or RewardCalculator()
 
@@ -119,6 +123,8 @@ class PCBRouterEnv(gym.Env):
             num_nets=self.num_nets,
             num_obstacles=self.num_obstacles,
             num_layers=self.num_layers,
+            min_pad_dist=self.min_pad_dist,
+            max_pad_dist=self.max_pad_dist,
             seed=board_seed,
         )
 

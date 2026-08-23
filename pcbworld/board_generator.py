@@ -60,7 +60,8 @@ def generate_random_board(
     num_nets: int = 1,
     num_obstacles: int = 0,
     num_layers: int = 2,
-    min_pad_dist: int = 30,
+    min_pad_dist: int = 20,
+    max_pad_dist: Optional[int] = None,
     margin: int = 16,
     pad_radius: int = 4,
     trace_width: int = 2,
@@ -120,7 +121,8 @@ def generate_random_board(
             tx = random.randint(margin, grid_size - margin)
             ty = random.randint(margin, grid_size - margin)
 
-            if math.hypot(sx - tx, sy - ty) < min_pad_dist:
+            pad_dist = math.hypot(sx - tx, sy - ty)
+            if pad_dist < min_pad_dist or (max_pad_dist is not None and pad_dist > max_pad_dist):
                 continue
 
             if is_valid_pad_pos(sx, sy, src_layer) and is_valid_pad_pos(tx, ty, tgt_layer):

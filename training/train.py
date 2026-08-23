@@ -138,6 +138,14 @@ def train_single_net_policy(
                 if len(episode_reward_window) > 40:
                     episode_reward_window.pop(0)
 
+                # Progressive Distance Curriculum
+                if global_step < 8_000:
+                    env.max_pad_dist = 50
+                elif global_step < 18_000:
+                    env.max_pad_dist = 100
+                else:
+                    env.max_pad_dist = None
+
                 curr_ep_reward = 0.0
                 next_obs_np, step_info = env.reset()
 
