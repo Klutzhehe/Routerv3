@@ -236,6 +236,9 @@ class LineRouteEnv(gym.Env):
         self._failure_reasons: dict[str, str] = {}
         self._failure_progress: dict[str, float] = {}
         self._failure_travel: dict[str, float] = {}
+        self._fix_refusals: dict[str, dict] = {}
+        self._collisions_this_net = 0
+        self._min_dist_nm = float("inf")
         self._start_ok = False
         self._start_pad_id = -1
         self._target_pad_id_ok = False
@@ -346,6 +349,7 @@ class LineRouteEnv(gym.Env):
         self._failure_reasons = {}
         self._failure_progress = {}
         self._failure_travel = {}
+        self._fix_refusals = {}
         self._closest_approach_nm = {}
         self._ripup_count = 0
         self._blocking_nets = set()
@@ -457,6 +461,7 @@ class LineRouteEnv(gym.Env):
         # worth giving up on, and `moved` is what distinguishes the two.
         stuck = self._collides and moved < 0.25 * self.step_size_nm
         self._collision_run = self._collision_run + 1 if stuck else 0
+        self._collisions_this_net += int(self._collides)
         self._steps += 1
 
         if self._collides and hasattr(self.bridge, "get_head_obstacle"):
@@ -472,8 +477,22 @@ class LineRouteEnv(gym.Env):
 
         net_done = False
         if dist <= self.snap_radius_nm:
-            net_done = self._try_finish()
-            reward += self.weights.net_done if net_done else 0.0
+            finished = self._try_finish()
+            # The net is OVER either way. _try_finish() calls stop_routing() on
+            # a refusal, so nothing can move or succeed afterwards -- but this
+            # used to leave net_done False, and the episode then spent the rest
+            # of the budget re-calling fix() on a dead route (101 times on a
+            # 120-step net), appending the net to _failed once per step, and
+            # finally letting _abandon() OVERWRITE the recorded reason with
+            # "out_of_steps".
+            #
+            # That is why the first failure breakdown read 100% "never reached
+            # the pad" and 0% "fix() refused" while the per-net diagnostic
+            # showed those same heads closing 99% of the distance. Both were
+            # measuring the same nets; the reason was being overwritten before
+            # anyone could see it.
+            net_done = True
+            reward += self.weights.net_done if finished else -self.weights.net_failed
         jammed = self._collision_run >= self.weights.max_collision_steps
         if not net_done and (self._steps >= self.max_steps_per_net or jammed):
             # Check if rip-up can clear a blocking trace
@@ -563,6 +582,21 @@ class LineRouteEnv(gym.Env):
             self.bridge.stop_routing()
             self._failed.append(net)
             self._failure_reasons[net] = "fix_rejected"
+            self._failure_progress[net] = 1.0 - min(
+                1.0, self._min_dist_nm / max(1.0, self._straight_len)
+            )
+            self._failure_travel[net] = self._routed_len
+            # WHY fix() refused is now the whole question, so capture the state
+            # it refused in rather than only the fact of it.
+            self._fix_refusals[net] = {
+                "dist_nm": math.hypot(
+                    self._target_xy[0] - self._pos[0], self._target_xy[1] - self._pos[1]
+                ),
+                "colliding_at_fix": bool(self._collides),
+                "collision_steps": self._collisions_this_net,
+                "steps": self._steps,
+                "detour_ratio": self._routed_len / max(1.0, self._straight_len),
+            }
             if net.startswith("diffpair_") and net.endswith("_P"):
                 self._failed.append(net[:-2] + "_N")
         self._route_active = False
@@ -699,6 +733,7 @@ class LineRouteEnv(gym.Env):
             "failure_reasons": dict(self._failure_reasons),
             "failure_progress": dict(self._failure_progress),
             "failure_travel_nm": dict(self._failure_travel),
+            "fix_refusals": dict(self._fix_refusals),
             "route_started": self._start_ok,
             "start_pad_id": self._start_pad_id,
             "target_pad_id": self._target_id,

@@ -768,3 +768,69 @@ def test_a_refused_start_is_not_filed_as_a_navigation_failure():
             break
     assert info["failure_reasons"]["net_0"] == "route_never_started"
     assert info["failure_progress"]["net_0"] == pytest.approx(0.0)
+
+
+class _RefusesFix(fake_bridge.FakePNSBridge):
+    calls = 0
+
+    def fix(self, x, y, item_id=-1, force_finish=False, force_commit=False):
+        _RefusesFix.calls += 1
+        return False
+
+
+def test_a_refused_fix_ends_the_net_instead_of_burning_the_budget():
+    """Regression for the bug that hid the real failure mode.
+
+    _try_finish() calls stop_routing() when fix() refuses, so nothing can move
+    or succeed afterwards -- but it left net_done False. The episode then spent
+    the rest of the budget re-calling fix() on a dead route (101 times on a
+    120-step net), appending the net to _failed once per step, and finally let
+    _abandon() OVERWRITE the recorded reason with "out_of_steps".
+
+    That is why the failure breakdown read 100% "never reached the pad" and 0%
+    "fix() refused", while the per-net diagnostic showed those same heads
+    closing 99% of the distance to the target. Both described the same nets.
+    """
+    _RefusesFix.calls = 0
+    bridge.PNSBridge = lambda: _RefusesFix(nets=_NETS[:2])
+    env = LineRouteEnv(
+        "fake_board.kicad_pcb",
+        obs_config=LineObsConfig(k_nearest=8, max_steps=120),
+        max_steps_per_net=120,
+    )
+    env.reset()
+
+    info, steps = None, 0
+    for _ in range(200):
+        _, _, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
+        steps += 1
+        if terminated:
+            break
+
+    assert info["failure_reasons"]["net_0"] == "fix_rejected", "reason was overwritten"
+    assert info["failed"] == ["net_0"], f"net recorded {len(info['failed'])} times"
+    assert _RefusesFix.calls == 1, f"fix() retried on a dead route {_RefusesFix.calls} times"
+    assert steps < 60, f"burned {steps} steps on a net that was already resolved"
+
+
+def test_a_refused_fix_records_the_state_it_was_refused_in():
+    """WHY fix() refuses is the open question, so the refusal carries context."""
+    _RefusesFix.calls = 0
+    bridge.PNSBridge = lambda: _RefusesFix(nets=_NETS[:2])
+    env = LineRouteEnv(
+        "fake_board.kicad_pcb",
+        obs_config=LineObsConfig(k_nearest=8, max_steps=120),
+        max_steps_per_net=120,
+    )
+    env.reset()
+    info = None
+    for _ in range(200):
+        _, _, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
+        if terminated:
+            break
+
+    detail = info["fix_refusals"]["net_0"]
+    assert detail["dist_nm"] <= env.snap_radius_nm
+    assert detail["steps"] > 0
+    assert "colliding_at_fix" in detail and "collision_steps" in detail
+    assert detail["detour_ratio"] >= 1.0

@@ -84,11 +84,13 @@ def diagnose_board(board_path: str, max_steps_per_net: int = 120) -> list[dict]:
     reasons = info.get("failure_reasons", {})
     progress = info.get("failure_progress", {})
     travel = info.get("failure_travel_nm", {})
+    refusals = info.get("fix_refusals", {})
     for r in rows:
         r["completed"] = r["net"] in completed
         r["reason"] = reasons.get(r["net"], "" if r["completed"] else "unknown")
         r["progress"] = progress.get(r["net"], 1.0 if r["completed"] else float("nan"))
         r["travel_mm"] = travel.get(r["net"], float("nan")) / MM
+        r["refusal"] = refusals.get(r["net"])
     return rows
 
 
@@ -154,6 +156,24 @@ def main() -> None:
         print(f"    budget allows            {args.max_steps_per_net * 0.5:5.1f} mm")
         stalled = int(np.sum(trav < 1.0))
         print(f"    barely moved at all (<1 mm travelled)  {stalled} of {len(moved)}")
+
+    refused = [r for r in failed if r["reason"] == "fix_rejected"]
+    if refused:
+        d = [r["refusal"] for r in refused]
+        print()
+        print("  fix()-REFUSED nets -- the state PNS refused them in:")
+        print(f"    distance from the pad   median {np.median([x['dist_nm'] for x in d]) / 1000:6.1f} um"
+              f"   (snap radius 400.0 um)")
+        coll = sum(1 for x in d if x["colliding_at_fix"])
+        print(f"    head colliding AT the fix() call        {coll:4d} of {len(d)}"
+              f"  ({coll / len(d) * 100:5.1f}%)")
+        print(f"    collision steps during the net, median  "
+              f"{np.median([x['collision_steps'] for x in d]):6.1f}")
+        print(f"    detour ratio at refusal, median         "
+              f"{np.median([x['detour_ratio'] for x in d]):6.2f}x")
+        clean = sum(1 for x in d if x["collision_steps"] == 0)
+        print(f"    refused with ZERO collisions all net    {clean:4d} of {len(d)}"
+              f"  ({clean / len(d) * 100:5.1f}%)  <- if high, refusal is not about clearance")
 
     print()
     lengths_ok = np.array([r["straight_mm"] for r in done], dtype=float)
