@@ -255,7 +255,28 @@ class PCBRouterEnv(gym.Env):
         return math.cos(angle), math.sin(angle)
 
     def _update_congestion_cache(self):
-        unrouted = [net for net in self.board.nets if net.net_id not in self.completed_nets]
+        """Demand heatmap for space OTHER nets will need -- not this one.
+
+        Measured: with the active net included in `unrouted`, its own
+        heatmap peaks at ~0.99-1.0 directly on its OWN straight-line
+        corridor (it demands the space it is about to walk through, same as
+        every other unrouted net would) and reads lower just off to the
+        side. congestion_penalty_scale then charges MORE for staying on the
+        direct path to the target than for weaving off it -- a real,
+        measured incentive to zigzag, not a training artifact. Matches
+        docs/AI_ARCHITECTURE.md's reserve-plane rule: this signal is for
+        space LATER nets will need, and must not tax the net currently
+        being routed for occupying its own path.
+        """
+        active_id = (
+            self.board.nets[self.current_net_idx].net_id
+            if self.current_net_idx < len(self.board.nets)
+            else None
+        )
+        unrouted = [
+            net for net in self.board.nets
+            if net.net_id not in self.completed_nets and net.net_id != active_id
+        ]
         obs_mask = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         for obs in self.board.obstacles:
             obs_mask[obs.y1:obs.y2, obs.x1:obs.x2] = 1.0
