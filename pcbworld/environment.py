@@ -1,0 +1,392 @@
+"""Gymnasium-Compatible PCB Routing Grid Environment (PCBRouterEnv).
+
+Implements sequential multi-net growth on a 10-channel 256x256 spatial grid:
+- 10-channel spatial observation space (Box(0.0, 1.0, (10, 256, 256), float32))
+- 96 discrete actions per net growth step (8 directions x 3 distances x 2 layers x 2 vias)
+- Fast line-raster collision & clearance checks
+- Decoupled from external push/shove heuristics
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Optional, Tuple, Dict, Any, List
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+
+from pcbworld.board_generator import BoardState, generate_random_board, NetSpec, Pad, Obstacle
+from pcbworld.congestion import compute_net_demand_heatmap, compute_distance_field, compute_clearance_field
+from pcbworld.reward import RewardCalculator
+
+
+# Direction vectors: (dx, dy) in grid space
+# 0: N, 1: NE, 2: E, 3: SE, 4: S, 5: SW, 6: W, 7: NW
+DIR_VECTORS = [
+    (0, -1),   # 0: North
+    (1, -1),   # 1: North-East
+    (1, 0),    # 2: East
+    (1, 1),    # 3: South-East
+    (0, 1),    # 4: South
+    (-1, 1),   # 5: South-West
+    (-1, 0),   # 6: West
+    (-1, -1),  # 7: North-West
+]
+
+DIST_STEPS = [1, 2, 4]  # 0: 1 grid, 1: 2 grids, 2: 4 grids
+
+
+class PCBRouterEnv(gym.Env):
+    metadata = {"render_modes": ["human", "rgb_array"]}
+
+    def __init__(
+        self,
+        grid_size: int = 256,
+        num_nets: int = 1,
+        num_obstacles: int = 0,
+        num_layers: int = 2,
+        max_steps_per_net: int = 150,
+        snap_radius: int = 6,
+        seed: Optional[int] = None,
+        reward_calculator: Optional[RewardCalculator] = None,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.num_nets = num_nets
+        self.num_obstacles = num_obstacles
+        self.num_layers = num_layers
+        self.max_steps_per_net = max_steps_per_net
+        self.snap_radius = snap_radius
+
+        self.reward_calc = reward_calculator or RewardCalculator()
+
+        # Observation Space: (10, H, W) float32 tensor
+        self.observation_space = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(10, grid_size, grid_size),
+            dtype=np.float32,
+        )
+
+        # Action Space: 96 Discrete Actions
+        # 8 directions * 3 step distances * 2 layer changes * 2 via flags = 96
+        self.action_space = spaces.Discrete(96)
+
+        self.board: Optional[BoardState] = None
+        self.current_net_idx: int = 0
+        self.head_x: int = 0
+        self.head_y: int = 0
+        self.head_layer: int = 0
+        self.head_prev_dir: Optional[int] = None
+
+        self.steps_taken_current_net: int = 0
+        self.total_steps: int = 0
+        self.completed_nets: List[int] = []
+        self.failed_nets: List[int] = []
+
+        self.wirelength_per_net: Dict[int, float] = {}
+        self.vias_per_net: Dict[int, int] = {}
+
+        self._obs_cache: Optional[np.ndarray] = None
+        self._congestion_cache: Optional[np.ndarray] = None
+        self._clearance_cache: Optional[np.ndarray] = None
+
+        if seed is not None:
+            self.reset(seed=seed)
+
+    def decode_action(self, action: int) -> Tuple[int, int, int, int]:
+        """Decode discrete action [0..95] into (dir_idx, dist_idx, layer_change, via_flag)."""
+        # action = dir * 12 + dist * 4 + layer * 2 + via
+        via_flag = action % 2
+        rem = action // 2
+        layer_change = rem % 2
+        rem = rem // 2
+        dist_idx = rem % 3
+        dir_idx = rem // 3
+        return dir_idx, dist_idx, layer_change, via_flag
+
+    def reset(
+        self,
+        *,
+        seed: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        super().reset(seed=seed)
+
+        board_seed = seed if seed is not None else np.random.randint(0, 1_000_000)
+        self.board = generate_random_board(
+            grid_size=self.grid_size,
+            num_nets=self.num_nets,
+            num_obstacles=self.num_obstacles,
+            num_layers=self.num_layers,
+            seed=board_seed,
+        )
+
+        self.current_net_idx = 0
+        self.completed_nets = []
+        self.failed_nets = []
+        self.wirelength_per_net = {net.net_id: 0.0 for net in self.board.nets}
+        self.vias_per_net = {net.net_id: 0 for net in self.board.nets}
+        self.total_steps = 0
+
+        self._init_current_net()
+        self._precompute_static_caches()
+
+        obs = self._build_observation()
+        info = self._get_info()
+        return obs, info
+
+    def _init_current_net(self):
+        """Initialize head for the active unrouted net."""
+        if self.current_net_idx < len(self.board.nets):
+            active_net = self.board.nets[self.current_net_idx]
+            self.head_x = active_net.source_pad.x
+            self.head_y = active_net.source_pad.y
+            self.head_layer = active_net.source_pad.layer
+            self.head_prev_dir = None
+            self.steps_taken_current_net = 0
+
+    def _precompute_static_caches(self):
+        """Precompute obstacle masks, clearance field, and initial congestion."""
+        # 1. Obstacle grid
+        obs_grid = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        for obs in self.board.obstacles:
+            x1 = max(0, obs.x1)
+            x2 = min(self.grid_size, obs.x2)
+            y1 = max(0, obs.y1)
+            y2 = min(self.grid_size, obs.y2)
+            obs_grid[y1:y2, x1:x2] = 1.0
+
+        self._clearance_cache = compute_clearance_field(self.grid_size, obs_grid)
+        self._update_congestion_cache()
+
+    def _update_congestion_cache(self):
+        unrouted = [net for net in self.board.nets if net.net_id not in self.completed_nets]
+        obs_mask = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        for obs in self.board.obstacles:
+            obs_mask[obs.y1:obs.y2, obs.x1:obs.x2] = 1.0
+        self._congestion_cache = compute_net_demand_heatmap(self.grid_size, unrouted, obs_mask)
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        dir_idx, dist_idx, layer_change, via_flag = self.decode_action(action)
+        step_dist = DIST_STEPS[dist_idx]
+        dir_x, dir_y = DIR_VECTORS[dir_idx]
+
+        active_net = self.board.nets[self.current_net_idx]
+        target = active_net.target_pad
+
+        prev_x, prev_y, prev_layer = self.head_x, self.head_y, self.head_layer
+        prev_dist = math.hypot(prev_x - target.x, prev_y - target.y)
+
+        # 1. Execute via / layer change
+        is_via = False
+        if via_flag == 1 or layer_change == 1:
+            new_layer = 1 - prev_layer  # Switch between Layer 0 and Layer 1
+            is_via = True
+            self.head_layer = new_layer
+            self.vias_per_net[active_net.net_id] += 1
+
+        # 2. Compute new head coordinate
+        new_x = prev_x + dir_x * step_dist
+        new_y = prev_y + dir_y * step_dist
+
+        step_len = math.hypot(new_x - prev_x, new_y - prev_y)
+        self.steps_taken_current_net += 1
+        self.total_steps += 1
+
+        # 3. Check for boundary collision
+        out_of_bounds = (
+            new_x < 0 or new_x >= self.grid_size or new_y < 0 or new_y >= self.grid_size
+        )
+
+        # 4. Check obstacle and copper collision along raster line
+        is_collided = out_of_bounds
+        if not is_collided:
+            is_collided = self._check_line_collision(
+                prev_x, prev_y, new_x, new_y, self.head_layer, active_net.net_id
+            )
+
+        # 5. Check if target pad reached
+        curr_dist = math.hypot(new_x - target.x, new_y - target.y)
+        is_connected = False
+
+        if not is_collided:
+            # Draw line segment into copper grid
+            self._rasterize_line(
+                prev_x, prev_y, new_x, new_y, self.head_layer, active_net.net_id
+            )
+            self.head_x = new_x
+            self.head_y = new_y
+            self.wirelength_per_net[active_net.net_id] += step_len
+
+            if curr_dist <= self.snap_radius and (self.head_layer == target.layer):
+                is_connected = True
+                # Connect directly to target pad center
+                self._rasterize_line(
+                    self.head_x, self.head_y, target.x, target.y, target.layer, active_net.net_id
+                )
+                self.completed_nets.append(active_net.net_id)
+
+        # Check bend
+        is_bend = (self.head_prev_dir is not None) and (self.head_prev_dir != dir_idx)
+        self.head_prev_dir = dir_idx
+
+        # Congestion overlap penalty
+        cong_overlap = 0.0
+        if self._congestion_cache is not None and not out_of_bounds:
+            cong_overlap = float(self._congestion_cache[new_y, new_x])
+
+        # Compute Step Reward
+        reward, _breakdown = self.reward_calc.compute_step_reward(
+            prev_dist=prev_dist,
+            curr_dist=curr_dist,
+            step_len=step_len,
+            is_connected=is_connected,
+            is_collided=is_collided,
+            is_bend=is_bend,
+            is_via=is_via,
+            congestion_overlap=cong_overlap,
+        )
+
+        # Transition / Termination logic
+        net_timeout = self.steps_taken_current_net >= self.max_steps_per_net
+        net_done = is_connected or is_collided or net_timeout
+
+        if net_done and not is_connected:
+            self.failed_nets.append(active_net.net_id)
+
+        terminated = False
+        truncated = False
+
+        if net_done:
+            self.current_net_idx += 1
+            if self.current_net_idx < len(self.board.nets):
+                self._init_current_net()
+                self._update_congestion_cache()
+            else:
+                terminated = True
+
+        obs = self._build_observation()
+        info = self._get_info()
+        return obs, reward, terminated, truncated, info
+
+    def _check_line_collision(
+        self, x0: int, y0: int, x1: int, y1: int, layer: int, net_id: int
+    ) -> bool:
+        """Bresenham line raster check for obstacle & foreign copper collisions."""
+        points = self._get_line_points(x0, y0, x1, y1)
+        for px, py in points:
+            if px < 0 or px >= self.grid_size or py < 0 or py >= self.grid_size:
+                return True
+            # Check obstacles
+            for obs in self.board.obstacles:
+                if (obs.layer == -1 or obs.layer == layer) and (
+                    obs.x1 <= px <= obs.x2 and obs.y1 <= py <= obs.y2
+                ):
+                    return True
+            # Check foreign copper
+            existing_net = self.board.copper_grid[layer, py, px]
+            if existing_net != 0 and existing_net != net_id:
+                return True
+            # Check foreign pads
+            for net in self.board.nets:
+                if net.net_id != net_id:
+                    for pad in [net.source_pad, net.target_pad]:
+                        if pad.layer == layer and math.hypot(px - pad.x, py - pad.y) <= pad.radius:
+                            return True
+        return False
+
+    def _rasterize_line(self, x0: int, y0: int, x1: int, y1: int, layer: int, net_id: int):
+        points = self._get_line_points(x0, y0, x1, y1)
+        for px, py in points:
+            if 0 <= px < self.grid_size and 0 <= py < self.grid_size:
+                self.board.copper_grid[layer, py, px] = net_id
+
+    def _get_line_points(self, x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
+        """Bresenham's line algorithm."""
+        points = []
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+
+        x, y = x0, y0
+        while True:
+            points.append((x, y))
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+        return points
+
+    def _build_observation(self) -> np.ndarray:
+        """Construct the (10, 256, 256) spatial observation tensor."""
+        obs = np.zeros((10, self.grid_size, self.grid_size), dtype=np.float32)
+
+        active_net = None
+        if self.current_net_idx < len(self.board.nets):
+            active_net = self.board.nets[self.current_net_idx]
+
+        # Channel 0: Existing copper (binary/normalized)
+        obs[0] = (self.board.copper_grid[self.head_layer] > 0).astype(np.float32)
+
+        # Channel 1: Obstacles
+        for obs_rect in self.board.obstacles:
+            if obs_rect.layer == -1 or obs_rect.layer == self.head_layer:
+                obs[1, obs_rect.y1:obs_rect.y2, obs_rect.x1:obs_rect.x2] = 1.0
+
+        # Channel 2: Pads (Source & Target)
+        for net in self.board.nets:
+            for pad in [net.source_pad, net.target_pad]:
+                if pad.layer == self.head_layer:
+                    y_coords, x_coords = np.ogrid[:self.grid_size, :self.grid_size]
+                    mask = (x_coords - pad.x) ** 2 + (y_coords - pad.y) ** 2 <= pad.radius ** 2
+                    obs[2, mask] = 1.0
+
+        # Channel 3: Current Routing Head (Gaussian spot)
+        if 0 <= self.head_x < self.grid_size and 0 <= self.head_y < self.grid_size:
+            y_coords, x_coords = np.ogrid[:self.grid_size, :self.grid_size]
+            dist_sq = (x_coords - self.head_x) ** 2 + (y_coords - self.head_y) ** 2
+            obs[3] = np.exp(-0.5 * dist_sq / 16.0).astype(np.float32)
+
+        # Channel 4: Unrouted net demand heatmap
+        if self._congestion_cache is not None:
+            obs[4] = self._congestion_cache
+
+        # Channel 5: Critical net importance
+        if active_net is not None:
+            obs[5].fill(float(active_net.importance))
+
+        # Channel 6: Clearance cost field
+        if self._clearance_cache is not None:
+            obs[6] = self._clearance_cache
+
+        # Channel 7: Distance to destination target pad
+        if active_net is not None:
+            obs[7] = compute_distance_field(self.grid_size, active_net.target_pad.x, active_net.target_pad.y)
+
+        # Channel 8: Layer occupancy (1.0 on top layer, 0.0 on bottom)
+        obs[8].fill(1.0 if self.head_layer == 0 else 0.0)
+
+        # Channel 9: Future congestion estimate
+        if self._congestion_cache is not None:
+            obs[9] = self._congestion_cache
+
+        return obs
+
+    def _get_info(self) -> Dict[str, Any]:
+        return {
+            "completed_nets": len(self.completed_nets),
+            "failed_nets": len(self.failed_nets),
+            "total_nets": len(self.board.nets) if self.board else 0,
+            "completion_rate": (len(self.completed_nets) / len(self.board.nets)) if self.board and len(self.board.nets) > 0 else 0.0,
+            "head_pos": (self.head_x, self.head_y, self.head_layer),
+            "vias": sum(self.vias_per_net.values()),
+            "total_wirelength": sum(self.wirelength_per_net.values()),
+        }
