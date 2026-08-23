@@ -583,10 +583,15 @@ def test_the_collision_charge_is_levied_once_not_per_step():
         _, r, _, _, info = env.step(np.array([0.0], dtype=np.float32))
         assert info["collides"]
         charges.append(r)
-    # first step pays the contact charge, the rest do not
-    assert charges[0] < charges[1] - 1.0, (
-        f"first contact {charges[0]:+.3f} should cost far more than the steps "
-        f"after it ({charges[1]:+.3f}); the charge is still per-step"
+    # First step pays the contact charge, the rest do not. Threshold derived
+    # from the weight rather than hard-coded, so retuning it does not silently
+    # turn this into a test of nothing.
+    w = RewardWeights()
+    gap = charges[1] - charges[0]
+    assert gap > 0.5 * w.collision, (
+        f"first contact {charges[0]:+.3f} vs the step after {charges[1]:+.3f} "
+        f"differ by {gap:+.3f}, well under the {w.collision} contact charge; "
+        "it is still being levied per step"
     )
 
 

@@ -319,3 +319,21 @@ def test_clearance_features_land_in_the_observation():
     tight = _obs([], clearance_now=-50.0 * MM, clearance_ahead=-0.02 * MM)
     assert tight[ci] == pytest.approx(-1.0)
     assert tight[ca] == pytest.approx(-0.002)
+
+
+def test_geodesic_direction_is_relative_to_the_target_bearing():
+    """Like base_heading, it is the TURN to make, not a compass heading, so it
+    survives rotating the whole board."""
+    import math as _m
+
+    ci, si = GLOBAL_INDEX["geo_dir_cos"], GLOBAL_INDEX["geo_dir_sin"]
+
+    obs = _obs([], geodesic_direction=_m.radians(35.0))
+    assert _m.degrees(_m.atan2(obs[si], obs[ci])) == pytest.approx(35.0, abs=1e-4)
+
+    rotated = _obs([], target=(0.0, 20.0 * MM), geodesic_direction=_m.radians(125.0))
+    assert _m.degrees(_m.atan2(rotated[si], rotated[ci])) == pytest.approx(35.0, abs=1e-4)
+
+    # no field -> the best guess is the target bearing, which is +x here
+    assert _obs([])[ci] == pytest.approx(1.0)
+    assert _obs([])[si] == pytest.approx(0.0)

@@ -133,7 +133,7 @@ class RewardWeights:
 
     progress: float = 1.0
     step: float = 0.01          # gentle step cost so detours are viable
-    collision: float = 2.0      # charged ONCE, on first contact -- see below
+    collision: float = 0.5      # charged ONCE, on first contact -- see below
     max_collision_steps: int = 16   # give up after this many CONSECUTIVE collision
                                     # steps; see the note below
     net_done: float = 25.0
@@ -591,6 +591,14 @@ class LineRouteEnv(gym.Env):
             self._pos[1] + self.step_size_nm * math.sin(base),
         )
 
+    def _geodesic_direction(self):
+        """Which way the obstacle-free route leaves the head, or None."""
+        if self._field is None:
+            return None
+        return self._field.descent_direction(
+            self._pos[0], self._pos[1], self.step_size_nm
+        )
+
     def _geodesic_dist(self, pos: tuple[float, float]) -> float:
         if self._field is not None:
             c = self._field.cost_to_go(pos[0], pos[1])
@@ -810,6 +818,7 @@ class LineRouteEnv(gym.Env):
             geodesic_dist=self._geodesic_dist(self._pos),
             clearance_now=self._clearance_at(self._pos),
             clearance_ahead=self._clearance_at(self._step_ahead()),
+            geodesic_direction=self._geodesic_direction(),
         )
 
 

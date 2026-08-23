@@ -43,6 +43,18 @@ the greedy baseline rather than below it -- the property the CFP design
 wanted from its zero-init flat field, obtained here by choosing coordinates
 well instead of by architecture.
 
+## geo_dir_cos / geo_dir_sin
+
+The other half of clearance. Clearance says where NOT to go; this says which
+way the obstacle-free route leaves from here. A policy given only the first
+learns avoidance and not re-convergence -- measured, with clearance alone
+fix() refusals fell 44 -> 9 while 39 nets began timing out at a median 20.8%
+of the distance covered, steering away from copper and never coming back.
+
+Expressed relative to the target bearing, so it is the turn to make rather
+than a compass heading, and it survives the same rigid transforms the rest of
+the frame does.
+
 ## clearance_now / clearance_ahead
 
 The one signal the policy never had. `head_collides()` reports contact that
@@ -129,6 +141,8 @@ GLOBAL_FEATURES: tuple[str, ...] = (
     "geodesic_dist",      # shortest OBSTACLE-FREE distance / length_scale
     "clearance_now",      # gap to nearest copper AT the head / length_scale
     "clearance_ahead",    # the same one step along the base heading
+    "geo_dir_cos",        # heading of steepest descent, in THIS frame
+    "geo_dir_sin",
 )
 NUM_GLOBAL = len(GLOBAL_FEATURES)
 
@@ -336,6 +350,7 @@ def build_observation(
     geodesic_dist: float | None = None,
     clearance_now: float | None = None,
     clearance_ahead: float | None = None,
+    geodesic_direction: float | None = None,
 ) -> np.ndarray:
     """The flat observation vector: globals, then k_nearest segment rows.
 
@@ -378,6 +393,16 @@ def build_observation(
     # to a few length scales so an empty board does not emit a huge number.
     for i, v in ((11, clearance_now), (12, clearance_ahead)):
         obs[i] = 3.0 if v is None or not np.isfinite(v) else float(np.clip(v / scale, -1.0, 3.0))
+
+    # Which way the obstacle-free route leaves from here, in this frame.
+    # None means "no field", and with no field the best guess is the target
+    # bearing, which is +x here -- the same convention base_heading uses.
+    if geodesic_direction is None:
+        obs[13], obs[14] = 1.0, 0.0
+    else:
+        bearing = math.atan2(target[1] - head[1], target[0] - head[0])
+        gd = geodesic_direction - bearing
+        obs[13], obs[14] = math.cos(gd), math.sin(gd)
 
     if not segments:
         return obs
