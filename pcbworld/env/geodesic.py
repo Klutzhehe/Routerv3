@@ -75,16 +75,47 @@ class GeodesicConfig:
     a cell without the potential changing, which reintroduces the flat spots
     this is meant to remove.
 
-    `inflation_nm` is added to each obstacle's own half-width, so it carries
-    only the routed track's half-width plus the design clearance -- what has
-    to fit between the trace centre and the obstacle edge.
+    `inflation_nm` is added to each obstacle's own half-width. It is NOT just
+    the legal clearance, and that distinction is the difference between a plan
+    that can be followed and one that cannot.
+
+    The legal minimum is 325 um: the routed track's half-width (125) plus the
+    design clearance (200). A plan drawn at exactly that threads corridors
+    where the correct path is legal and every path beside it is not -- and the
+    head does not follow the correct path. It moves in fixed 0.5 mm steps at a
+    continuous heading, chosen by one-step lookahead on a discretised field, so
+    it tracks the plan with up to about half a step of error. Following a
+    minimum-clearance plan imperfectly means touching copper, and PNS then
+    refuses to commit the whole route.
+
+    That is not a hypothesis. Measured on 25 Colab boards, 44 of 45 failures
+    were fix() refusals, 100% of them colliding at the call, 100% against
+    ANOTHER net's copper, 0% near either pad -- the head arriving dirty after
+    a 0.99x (i.e. dead straight) route. Reproduced in simulation and swept:
+
+        inflation | blocked nets committed clean | projected overall
+          325 um  |            21.7%             |      59.5%   <- as shipped
+          450 um  |            35.7%             |      66.8%
+          600 um  |            65.2%             |      82.0%
+          700 um  |            69.6%             |      84.2%   <- peak
+          800 um  |            66.2%             |      82.5%
+         1000 um  |            64.3%             |      81.5%
+
+    So the margin is legal clearance PLUS the follower's tracking error, and
+    700 um is roughly 325 + 0.75 of a step. Past the peak the plan turns down
+    corridors that are genuinely passable and reachability starts costing more
+    than the cleanliness buys.
+
+    Grid resolution is NOT the lever here -- 250 um and 125 um cells scored
+    worse at the same margin, because a finer grid is better at finding the
+    tight gap the head then fails to thread.
 
     `max_cells_per_axis` is a guard, not a tuning knob. It caps the work on a
     board far larger than the curriculum's 35 mm, at the cost of resolution.
     """
 
     cell_nm: float = 500_000.0
-    inflation_nm: float = 325_000.0   # 0.25mm track / 2 + 0.2mm clearance
+    inflation_nm: float = 700_000.0   # 325um legal + ~375um follow margin
     max_cells_per_axis: int = 256
     margin_nm: float = 2.0 * MM
 

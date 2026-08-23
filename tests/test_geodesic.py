@@ -279,3 +279,38 @@ def test_the_oracle_steers_around_a_blocker_and_comes_back():
     assert max(ys) > 10.5 * MM, "should have moved clear of the blocker's row"
     assert min(turns) < -0.1, "should turn back toward the pad once past the blocker"
     assert all(abs(t) <= 1.0 for t in turns), "must stay inside the action limit"
+
+
+def test_the_plan_leaves_room_for_an_imperfect_follower():
+    """The margin is legal clearance PLUS tracking error, not clearance alone.
+
+    A plan drawn at the 325 um legal minimum threads corridors where the
+    correct path is legal and everything beside it is not. The head moves in
+    fixed 0.5 mm steps at a continuous heading chosen by one-step lookahead on
+    a discretised field, so it tracks that plan with up to half a step of
+    error -- and PNS refuses to commit a route that touched copper anywhere.
+    On Colab that was 44 of 45 failures: refused, colliding, against another
+    net's copper, after a dead-straight 0.99x route.
+    """
+    assert GeodesicConfig().inflation_nm >= 600_000, (
+        "the default margin is back at (or near) the legal minimum; a plan that "
+        "tight cannot be followed by a 0.5mm-step head"
+    )
+
+    # A corridor that is legal but only just: two pads leaving a gap a little
+    # over the legal clearance. The default plan must decline to route through
+    # it rather than send the head down a gap it cannot hold a line in.
+    gap_half = 0.40 * MM
+    pinch = [_pad(10 * MM, +gap_half + 0.5 * MM, size=1.0 * MM),
+             _pad(10 * MM, -gap_half - 0.5 * MM, size=1.0 * MM)]
+    tight = GeodesicField.build(
+        pinch, head=(0.0, 0.0), target=(20.0 * MM, 0.0),
+        config=GeodesicConfig(inflation_nm=325_000.0),
+    )
+    default = _field(pinch)
+
+    straight = 20.0 * MM
+    assert tight.cost_to_go(0.0, 0.0) < straight * 1.10, "minimum-clearance plan should take the pinch"
+    assert default.cost_to_go(0.0, 0.0) > tight.cost_to_go(0.0, 0.0), (
+        "the default plan should route around a gap it cannot be followed through"
+    )
