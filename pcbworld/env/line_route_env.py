@@ -159,6 +159,8 @@ class LineRouteEnv(gym.Env):
         reward_weights: RewardWeights | None = None,
         step_size_nm: int = 500_000,
         track_width_nm: int = 250_000,
+        via_diameter_nm: int = 600_000,
+        via_drill_nm: int = 300_000,
         snap_radius_nm: int = 400_000,
         max_steps_per_net: int = 100,
         gamma: float = 0.99,
@@ -192,6 +194,8 @@ class LineRouteEnv(gym.Env):
         self.weights = reward_weights or RewardWeights()
         self.step_size_nm = step_size_nm
         self.track_width_nm = track_width_nm
+        self.via_diameter_nm = via_diameter_nm
+        self.via_drill_nm = via_drill_nm
         self.snap_radius_nm = snap_radius_nm
         self.max_steps_per_net = max_steps_per_net
         self.gamma = gamma
@@ -341,6 +345,15 @@ class LineRouteEnv(gym.Env):
         # other traces aside to accommodate the agent.
         self.bridge.set_collision_mode(self._module.RM_MARK_OBSTACLES)
         self.bridge.set_track_width(self.track_width_nm)
+        # Inert until the action space can request a layer change, but wrong to
+        # leave unset: switch_layer() places a real via internally, and with no
+        # via size configured the real bridge rejected it 15/15 times at open
+        # board space nowhere near a pad (see scripts/measure_layer_hop_rescue.py,
+        # which cost a Colab round to that exact omission). pcb_route_env and
+        # diff_pair_route_env, both Colab-verified, always set these before
+        # routing; this env was the one that did not.
+        self.bridge.set_via_diameter(self.via_diameter_nm)
+        self.bridge.set_via_drill(self.via_drill_nm)
 
         self._nets = self._discover_nets()
         assert self._nets, "no routable two-pad 'net_*' nets on this board"
