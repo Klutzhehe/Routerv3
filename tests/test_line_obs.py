@@ -17,6 +17,7 @@ import pytest
 
 from pcbworld.env.line_obs import (
     GLOBAL_INDEX,
+    KIND_EDGE,
     KIND_GHOST,
     KIND_PAD,
     KIND_TRACK,
@@ -272,3 +273,49 @@ def test_base_heading_survives_a_rigid_transform_of_the_whole_board():
     assert rotated[ci] == pytest.approx(base[ci], abs=1e-5)
     assert rotated[si] == pytest.approx(base[si], abs=1e-5)
     assert np.allclose(rotated, base, atol=1e-4)
+
+
+# -- clearance -----------------------------------------------------------
+
+
+def test_clearance_measures_room_to_the_obstacle_edge_not_its_centre():
+    """Each obstacle's half-width is subtracted, so this is the room a trace
+    centre actually has."""
+    from pcbworld.env.line_obs import nearest_obstacle_gap
+
+    pad = _seg(10 * MM, 0.0, 10 * MM, 0.0, kind=KIND_PAD, width=2.0 * MM)
+    # 5mm from the centre of a 2mm-wide pad leaves 4mm to its edge
+    assert nearest_obstacle_gap(5 * MM, 0.0, [pad]) == pytest.approx(4.0 * MM, rel=1e-6)
+    # inside the footprint reads negative
+    assert nearest_obstacle_gap(10.5 * MM, 0.0, [pad]) < 0.0
+
+
+def test_clearance_ignores_ghosts_and_edges():
+    """A ghost is a plan, not copper -- reporting contact with one would warn
+    about something that does not exist."""
+    from pcbworld.env.line_obs import nearest_obstacle_gap
+
+    ghost = _seg(1 * MM, 0.0, 1 * MM, 5 * MM, kind=KIND_GHOST, width=0.25 * MM)
+    edge = _seg(0.0, 0.0, 0.0, 30 * MM, kind=KIND_EDGE, width=0.1 * MM)
+    assert not np.isfinite(nearest_obstacle_gap(5 * MM, 0.0, [ghost, edge]))
+
+    real = _seg(6 * MM, -5 * MM, 6 * MM, 5 * MM, kind=KIND_TRACK, width=0.25 * MM)
+    assert np.isfinite(nearest_obstacle_gap(5 * MM, 0.0, [ghost, edge, real]))
+
+
+def test_clearance_features_land_in_the_observation():
+    ci = GLOBAL_INDEX["clearance_now"]
+    ca = GLOBAL_INDEX["clearance_ahead"]
+
+    obs = _obs([], clearance_now=2.0 * MM, clearance_ahead=0.1 * MM)
+    assert obs[ci] == pytest.approx(0.2)     # 2mm / 10mm length_scale
+    assert obs[ca] == pytest.approx(0.01)
+
+    # an empty board reports "plenty of room" rather than a huge number
+    wide = _obs([], clearance_now=float("inf"), clearance_ahead=None)
+    assert wide[ci] == 3.0 and wide[ca] == 3.0
+
+    # inside copper reads negative, and stays bounded
+    tight = _obs([], clearance_now=-50.0 * MM, clearance_ahead=-0.02 * MM)
+    assert tight[ci] == pytest.approx(-1.0)
+    assert tight[ca] == pytest.approx(-0.002)

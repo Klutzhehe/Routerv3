@@ -43,6 +43,19 @@ the greedy baseline rather than below it -- the property the CFP design
 wanted from its zero-init flat field, obtained here by choosing coordinates
 well instead of by architecture.
 
+## clearance_now / clearance_ahead
+
+The one signal the policy never had. `head_collides()` reports contact that
+has already happened, and by then the route is lost -- fix() refuses it, and
+measured on 25 Colab boards that accounts for 44 of 45 failures. The moment
+that decides a net is the FIRST contact, which lands at a median gap of
+-20 um: exactly when the head clips copper, with no warning beforehand.
+
+The 32 segment rows do carry the geometry to work this out, but only through
+a masked mean/max pool, which is a hard way to recover "how much room is left
+in the direction I am about to move". These give it directly, and
+`clearance_ahead` makes it a one-step lookahead rather than a report.
+
 ## geodesic_dist
 
 `dist_to_target` is the straight line. The reward's potential is the shortest
@@ -114,6 +127,8 @@ GLOBAL_FEATURES: tuple[str, ...] = (
     "base_heading_cos",   # see below -- the frame the NEXT action turns from
     "base_heading_sin",
     "geodesic_dist",      # shortest OBSTACLE-FREE distance / length_scale
+    "clearance_now",      # gap to nearest copper AT the head / length_scale
+    "clearance_ahead",    # the same one step along the base heading
 )
 NUM_GLOBAL = len(GLOBAL_FEATURES)
 
@@ -245,6 +260,38 @@ def point_segment_distance(
     return np.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
 
+def nearest_obstacle_gap(
+    px: float, py: float, segments: list[Segment], *, ignore_kinds=(KIND_EDGE, KIND_GHOST)
+) -> float:
+    """Gap from a point to the nearest obstacle EDGE, in the caller's units.
+
+    Each obstacle's own half-width is subtracted, so this is the room a trace
+    centre has. Negative means the point is inside the footprint.
+
+    This is the signal the policy never had. `head_collides()` reports contact
+    that has ALREADY happened -- measured on 25 Colab boards, the first
+    collision lands at a median gap of -20 um, i.e. exactly when the head
+    clips copper, and by then the route is lost and fix() will refuse it. The
+    obstacle list predicts that moment to within 20 um, so the same list can
+    say how close the head is BEFORE it happens.
+
+    Ghosts are excluded because they are not copper -- an unrouted net is a
+    plan, and counting it here would report contact with something that does
+    not exist. Edges are excluded because the board outline is a boundary, not
+    an obstacle to keep clear of by the same margin.
+    """
+    usable = [s for s in segments if s.kind not in ignore_kinds]
+    if not usable:
+        return float("inf")
+    n = len(usable)
+    x1 = np.fromiter((s.x1 for s in usable), dtype=np.float64, count=n)
+    y1 = np.fromiter((s.y1 for s in usable), dtype=np.float64, count=n)
+    x2 = np.fromiter((s.x2 for s in usable), dtype=np.float64, count=n)
+    y2 = np.fromiter((s.y2 for s in usable), dtype=np.float64, count=n)
+    w = np.fromiter((s.width for s in usable), dtype=np.float64, count=n)
+    return float((point_segment_distance(px, py, x1, y1, x2, y2) - w / 2.0).min())
+
+
 def _local_frame(
     head: tuple[float, float], target: tuple[float, float]
 ) -> tuple[float, float, float, float]:
@@ -287,6 +334,8 @@ def build_observation(
     length_slack: float = 0.0,
     base_heading: float | None = None,
     geodesic_dist: float | None = None,
+    clearance_now: float | None = None,
+    clearance_ahead: float | None = None,
 ) -> np.ndarray:
     """The flat observation vector: globals, then k_nearest segment rows.
 
@@ -324,6 +373,11 @@ def build_observation(
     # that from a feature that ignores the obstacles. None means no field was
     # built, in which case the two coincide by definition.
     obs[10] = (dist if geodesic_dist is None else geodesic_dist) / scale
+
+    # Room left before the head clips copper, now and one step ahead. Clipped
+    # to a few length scales so an empty board does not emit a huge number.
+    for i, v in ((11, clearance_now), (12, clearance_ahead)):
+        obs[i] = 3.0 if v is None or not np.isfinite(v) else float(np.clip(v / scale, -1.0, 3.0))
 
     if not segments:
         return obs

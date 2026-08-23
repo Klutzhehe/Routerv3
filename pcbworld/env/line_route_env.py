@@ -70,6 +70,7 @@ from gymnasium import spaces
 from pcbworld.env.geodesic import GeodesicConfig, GeodesicField
 from pcbworld.env.line_obs import (
     KIND_PAD,
+    nearest_obstacle_gap,
     MM,
     LineObsConfig,
     board_segments,
@@ -132,7 +133,7 @@ class RewardWeights:
 
     progress: float = 1.0
     step: float = 0.01          # gentle step cost so detours are viable
-    collision: float = 0.15     # the Gate-B-validated per-step failure signal
+    collision: float = 2.0      # charged ONCE, on first contact -- see below
     max_collision_steps: int = 16   # give up after this many CONSECUTIVE collision
                                     # steps; see the note below
     net_done: float = 25.0
@@ -438,6 +439,7 @@ class LineRouteEnv(gym.Env):
         self._prev_heading = heading
 
         prev_pos = self._pos
+        was_colliding = self._collides
         goal = (
             self._pos[0] + self.step_size_nm * math.cos(heading),
             self._pos[1] + self.step_size_nm * math.sin(heading),
@@ -488,7 +490,14 @@ class LineRouteEnv(gym.Env):
         dist = math.hypot(self._target_xy[0] - self._pos[0], self._target_xy[1] - self._pos[1])
         self._min_dist_nm = min(self._min_dist_nm, dist)
         reward = self._shaping(prev_pos, self._pos) - self.weights.step
-        if self._collides:
+        # Charged on the TRANSITION into contact, not on every step after it.
+        # Measured: once a route clips copper, head_collides() stays true on
+        # 86.2% of the remaining steps, so a per-step charge spends almost all
+        # of its weight punishing a mistake that already happened -- and the
+        # net is lost at that first contact regardless, because fix() refuses
+        # a route that touched anything. One clear marker at the moment that
+        # decides the net beats thirty diffuse ones afterwards.
+        if self._collides and not was_colliding:
             reward -= self.weights.collision
 
         net_done = False
@@ -561,6 +570,26 @@ class LineRouteEnv(gym.Env):
         fixed for the duration and the telescoping stays honest."""
         d = self._geodesic_dist(pos)
         return -self.weights.progress * d / self.obs_config.length_scale
+
+    def _clearance_at(self, pos) -> float:
+        """Room before the head clips copper at `pos`."""
+        return nearest_obstacle_gap(pos[0], pos[1], self._obstacles)
+
+    def _step_ahead(self) -> tuple[float, float]:
+        """Where the head lands next if the policy does nothing (a = 0).
+
+        Deliberately the a=0 landing point rather than a per-action lookahead:
+        it is the same base heading step() will use, so the feature answers
+        "will going straight clip something", which is the question a=0 keeps
+        getting wrong."""
+        bearing = math.atan2(
+            self._target_xy[1] - self._pos[1], self._target_xy[0] - self._pos[0]
+        )
+        base = self._prev_heading if self._collides else bearing
+        return (
+            self._pos[0] + self.step_size_nm * math.cos(base),
+            self._pos[1] + self.step_size_nm * math.sin(base),
+        )
 
     def _geodesic_dist(self, pos: tuple[float, float]) -> float:
         if self._field is not None:
@@ -779,6 +808,8 @@ class LineRouteEnv(gym.Env):
             # "the target bearing", which the obs frame already encodes as +x.
             base_heading=self._prev_heading if self._collides else None,
             geodesic_dist=self._geodesic_dist(self._pos),
+            clearance_now=self._clearance_at(self._pos),
+            clearance_ahead=self._clearance_at(self._step_ahead()),
         )
 
 
