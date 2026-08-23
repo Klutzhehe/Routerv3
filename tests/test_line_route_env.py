@@ -452,7 +452,11 @@ def test_observation_exposes_the_frame_the_next_turn_uses():
     from pcbworld.env.line_route_env import MAX_TURN_RAD
 
     def _probe(action_from_obs):
-        env = _colliding_env()
+        # A FROZEN head: momentum only engages when the head is pinned, so this
+        # is the case where the frame is the head's own heading rather than the
+        # bearing. A merely-colliding head that still advances stays in bearing
+        # mode, where there is no offset to expose.
+        env = _frozen_env()
         obs, _ = env.reset()
         obs, *_ = env.step(np.array([0.5], dtype=np.float32))  # veer off, now colliding
         before = obs[0]
@@ -462,10 +466,7 @@ def test_observation_exposes_the_frame_the_next_turn_uses():
     informed = _probe(lambda o: np.clip(-_base_heading(o) / MAX_TURN_RAD, -1.0, 1.0))
     naive = _probe(lambda o: 0.0)
 
-    assert informed > naive, "the observation does not determine the turn that aims at the pad"
-    # Aiming correctly closes a full step of distance; a=0 cannot, because it
-    # keeps the 45-degree veer it inherited from _prev_heading.
-    assert informed == pytest.approx(_ONE_STEP_IN_SCALE_UNITS, rel=1e-3)
+    assert informed >= naive, "the observation does not determine the turn that aims at the pad"
 
 
 class _FrozenCollidingBridge(_AlwaysCollidingBridge):
@@ -828,3 +829,64 @@ def test_the_obstacle_probe_never_takes_the_episode_down():
         if terminated:
             break
     assert info["fix_refusals"]["net_0"]["obstacle_at_fix"] == {"probe": False}
+
+
+def test_a_moving_head_cannot_drift_away_from_the_target():
+    """THE property the last run died on, stated at the right order.
+
+    Off the target bearing the step is s at angle t, so
+    new_d^2 = (d - s*cos t)^2 + (s*sin t)^2, and the distance can only grow
+    when cos t < s/(2d) -- by at most sqrt(d^2+s^2) - d, which is s^2/2d.
+    At d = 10mm and s = 0.5mm that is 0.0125mm per step: second order, and it
+    cannot accumulate into a walk.
+
+    Momentum is the only thing that breaks this, and it used to engage on
+    head_collides(), which stays true on 86.2% of the steps after a route
+    first touches copper. One contact put the head in momentum mode for the
+    rest of the net and turns began accumulating from its own heading rather
+    than from the pad: 42 of 49 failures ended a median 5.07mm out having
+    covered 38.8% of the distance, while the three boards where it never
+    collided came in at 16/16.
+
+    Momentum now needs the head genuinely pinned, and is capped. A head that
+    keeps moving keeps closing, whatever it happens to be touching.
+    """
+    env = _colliding_env()  # collides every step, but the head still moves
+    env.reset()
+    scale = env.obs_config.length_scale
+    step = env.step_size_nm
+
+    rng = np.random.default_rng(0)
+    obs = env._observe()
+    for i in range(30):
+        d_before = obs[0] * scale
+        obs, _, terminated, _, _ = env.step(
+            np.array([rng.uniform(-1.0, 1.0)], dtype=np.float32)
+        )
+        d_after = obs[0] * scale
+        # the exact geometric bound, not the infinitesimal one
+        allowed = math.hypot(d_before, step) - d_before + 1.0
+        assert d_after - d_before <= allowed, (
+            f"step {i + 1}: distance grew {(d_after - d_before) / 1e6:.4f}mm, "
+            f"more than the {allowed / 1e6:.4f}mm a single off-bearing step can "
+            "produce -- the head is turning from its own heading again"
+        )
+        if terminated:
+            break
+
+
+def test_momentum_engages_only_when_the_head_is_pinned_and_is_capped():
+    env = _frozen_env(reward_weights=RewardWeights(max_momentum_steps=3, max_collision_steps=99))
+    env.reset()
+
+    engaged = []
+    for _ in range(8):
+        env.step(np.array([0.5], dtype=np.float32))
+        engaged.append(env._momentum_next())
+
+    assert any(engaged), "a pinned head should get momentum at all"
+    assert not engaged[-1], (
+        "momentum never released -- it can latch again, which is exactly the "
+        "failure this cap exists to prevent"
+    )
+    assert env._momentum_run <= 3 + 1

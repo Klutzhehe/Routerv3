@@ -136,6 +136,9 @@ class RewardWeights:
     collision: float = 0.5      # charged ONCE, on first contact -- see below
     max_collision_steps: int = 16   # give up after this many CONSECUTIVE collision
                                     # steps; see the note below
+    max_momentum_steps: int = 8     # cap on turning from the head's own heading
+                                    # instead of the target bearing -- 4mm of
+                                    # contouring, then the frame snaps back
     net_done: float = 25.0
     net_failed: float = 5.0
     detour: float = 0.5         # relaxed so going around obstacles is not penalized
@@ -231,6 +234,8 @@ class LineRouteEnv(gym.Env):
         self._routed_len = 0.0
         self._collides = False
         self._collision_run = 0
+        self._stuck = False
+        self._momentum_run = 0
         self._field: GeodesicField | None = None
         self._completed: list[str] = []
         self._failed: list[str] = []
@@ -389,6 +394,8 @@ class LineRouteEnv(gym.Env):
         self._steps = 0
         self._collides = False
         self._collision_run = 0
+        self._stuck = False
+        self._momentum_run = 0
         self._min_dist_nm = math.hypot(
             self._target_xy[0] - self._start_xy[0], self._target_xy[1] - self._start_xy[1]
         )
@@ -432,9 +439,11 @@ class LineRouteEnv(gym.Env):
         dy = self._target_xy[1] - self._pos[1]
         bearing = math.atan2(dy, dx) if (dx or dy) else 0.0
 
-        # When colliding against an obstacle, maintain heading momentum so turns
-        # contour along the obstacle perimeter rather than getting pulled straight back into it.
-        base_heading = self._prev_heading if self._collides else bearing
+        # Momentum, but bounded and keyed off being STUCK rather than off
+        # head_collides(). See _momentum_next(); this is the single decision
+        # that separated a clean sweep from a collapse on 25 boards.
+        engaged = self._momentum_next()
+        base_heading = self._prev_heading if engaged else bearing
         heading = base_heading + turn
         self._prev_heading = heading
 
@@ -475,6 +484,8 @@ class LineRouteEnv(gym.Env):
         # this is supposed to make affordable. A frozen head is the thing
         # worth giving up on, and `moved` is what distinguishes the two.
         stuck = self._collides and moved < 0.25 * self.step_size_nm
+        self._stuck = stuck
+        self._momentum_run = self._momentum_run + 1 if engaged else 0
         self._collision_run = self._collision_run + 1 if stuck else 0
         self._collisions_this_net += int(self._collides)
         self._steps += 1
@@ -570,6 +581,35 @@ class LineRouteEnv(gym.Env):
         fixed for the duration and the telescoping stays honest."""
         d = self._geodesic_dist(pos)
         return -self.weights.progress * d / self.obs_config.length_scale
+
+    def _momentum_next(self) -> bool:
+        """Will the NEXT step turn from _prev_heading rather than the bearing?
+
+        This used to be `self._collides`, and that one condition cost the run.
+        head_collides() stays true on 86.2% of the steps after a route first
+        touches copper, so a single contact put the head in momentum mode for
+        the rest of the net: turns stopped being measured from the target and
+        started accumulating, which is a random walk.
+
+        The consequence is visible per board. Over 25 boards the trained policy
+        swept every net on the three boards where it never collided (16/16) and
+        managed 59/108 everywhere else -- a cliff, not a gradient.
+
+        And the mechanism is geometric rather than correlational. Off the
+        bearing a step of s at angle t gives
+        new_d^2 = (d - s*cos t)^2 + (s*sin t)^2, so the distance can only grow
+        when cos t < s/(2d), and then by at most s^2/2d -- 0.0125 mm per step
+        at d = 10 mm. Second order, and it cannot accumulate into a walk. Yet
+        42 of 49 failures ended a median 5.07 mm out having covered 38.8% of
+        the distance. Bearing mode cannot produce that; momentum mode can.
+
+        So momentum now requires the head to be genuinely pinned -- colliding
+        AND not advancing -- which the Colab measurement says is rare, since a
+        colliding head still moves a full 0.5 mm step. And it is capped, so it
+        can never latch: after `max_momentum_steps` the frame snaps back to the
+        bearing and the non-divergence guarantee returns.
+        """
+        return self._stuck and self._momentum_run < self.weights.max_momentum_steps
 
     def _clearance_at(self, pos) -> float:
         """Room before the head clips copper at `pos`."""
@@ -814,7 +854,7 @@ class LineRouteEnv(gym.Env):
             # Mirror step()'s own choice exactly: it turns from _prev_heading
             # while colliding and from the target bearing otherwise. None means
             # "the target bearing", which the obs frame already encodes as +x.
-            base_heading=self._prev_heading if self._collides else None,
+            base_heading=self._prev_heading if self._momentum_next() else None,
             geodesic_dist=self._geodesic_dist(self._pos),
             clearance_now=self._clearance_at(self._pos),
             clearance_ahead=self._clearance_at(self._step_ahead()),
