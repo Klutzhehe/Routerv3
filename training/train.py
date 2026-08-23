@@ -47,6 +47,7 @@ def train_single_net_policy(
     num_nets: int = 1,
     num_obstacles: int = 0,
     enable_layer_via: bool = True,
+    max_steps_per_net: int = 120,
     checkpoint_dir: str = "/content/drive/MyDrive/pcb_ai_router/checkpoints",
     device_str: Optional[str] = None,
     plot_interval: int = 1024,
@@ -73,7 +74,7 @@ def train_single_net_policy(
         grid_size=256,
         num_nets=num_nets,
         num_obstacles=num_obstacles,
-        max_steps_per_net=120,
+        max_steps_per_net=max_steps_per_net,
         snap_radius=6,
         enable_layer_via=enable_layer_via,
     )
@@ -104,10 +105,16 @@ def train_single_net_policy(
         "completion_rate": [],
         "policy_loss": [],
         "value_loss": [],
+        "steps_to_complete": [],
     }
 
     completed_window: List[float] = []
     episode_reward_window: List[float] = []
+    # Steps used by SUCCESSFUL episodes only -- a failed/timed-out episode's
+    # step count is the budget, not a measure of efficiency, and would just
+    # flatten this into max_steps_per_net regardless of how the policy is
+    # actually doing.
+    steps_to_complete_window: List[float] = []
     curr_ep_reward = 0.0
     global_step = 0
     start_time = time.time()
@@ -169,6 +176,10 @@ def train_single_net_policy(
                     completed_window.pop(0)
                 if len(episode_reward_window) > 40:
                     episode_reward_window.pop(0)
+                if is_comp:
+                    steps_to_complete_window.append(float(step_info.get("total_steps", 0)))
+                    if len(steps_to_complete_window) > 40:
+                        steps_to_complete_window.pop(0)
 
                 # Progressive Distance Curriculum, gated on measured success
                 dist_curriculum_window.append(is_comp)
@@ -245,6 +256,7 @@ def train_single_net_policy(
         # -------------------------------------------------------------
         avg_comp = float(np.mean(completed_window) * 100.0) if completed_window else 0.0
         avg_rew = float(np.mean(episode_reward_window)) if episode_reward_window else 0.0
+        avg_steps_to_complete = float(np.mean(steps_to_complete_window)) if steps_to_complete_window else 0.0
         elapsed = time.time() - start_time
         fps = int(global_step / max(1e-3, elapsed))
         p_loss = total_p_loss / max(1, num_updates)
@@ -255,13 +267,16 @@ def train_single_net_policy(
         history["completion_rate"].append(avg_comp)
         history["policy_loss"].append(p_loss)
         history["value_loss"].append(v_loss)
+        history["steps_to_complete"].append(avg_steps_to_complete)
 
         # Print live stream
         progress_pct = (global_step / total_timesteps) * 100.0
+        steps_to_complete_str = f"{avg_steps_to_complete:5.1f}" if steps_to_complete_window else "  n/a"
         status_line = (
             f"[{progress_pct:5.1f}%] Step {global_step:>6d}/{total_timesteps} | "
             f"Success: {avg_comp:5.1f}% | "
             f"Reward: {avg_rew:6.1f} | "
+            f"Steps/net: {steps_to_complete_str} | "
             f"Loss: [π={p_loss:6.3f}, V={v_loss:6.3f}] | "
             f"Speed: {fps:>4d} steps/s"
         )
@@ -292,7 +307,7 @@ def plot_learning_curves(history: Dict[str, List[float]], save_path: Path):
     if len(history["steps"]) < 2:
         return
     steps = history["steps"]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5), dpi=110)
+    fig, axes = plt.subplots(1, 4, figsize=(24, 5), dpi=110)
     fig.patch.set_facecolor("#101216")
 
     for ax in axes:
@@ -323,6 +338,14 @@ def plot_learning_curves(history: Dict[str, List[float]], save_path: Path):
     axes[2].set_xlabel("Training Steps", color="#8b949e")
     axes[2].legend(facecolor="#181b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8)
     axes[2].grid(True, alpha=0.15)
+
+    # 4. Steps to complete (successful episodes only -- a failed episode's
+    # step count is just the budget, not an efficiency signal)
+    axes[3].plot(steps, history["steps_to_complete"], color="#00bbff", lw=2.2)
+    axes[3].set_title("Steps to Complete (successful nets)", color="#e6edf3", fontsize=11, fontweight="bold")
+    axes[3].set_xlabel("Training Steps", color="#8b949e")
+    axes[3].set_ylim(bottom=0)
+    axes[3].grid(True, alpha=0.15)
 
     plt.tight_layout()
     fig.savefig(save_path, facecolor=fig.get_facecolor(), bbox_inches="tight", dpi=110)

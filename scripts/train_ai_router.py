@@ -48,6 +48,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train AI PCB Router Platform (PCBRouterNet)")
     parser.add_argument("--timesteps", type=int, default=30_000, help="Total training steps")
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3, 4], help="Curriculum stage (1=single net, 2=+obstacles, 3=+multinet, 4=+via/layer)")
+    parser.add_argument("--max-steps", type=int, default=120, help="Per-net step budget (max_steps_per_net) -- how many moves the head gets to reach one target before that net times out. Applies to both training and the post-training eval, so they stay comparable.")
     parser.add_argument("--checkpoint-dir", type=str, default="/content/drive/MyDrive/pcb_ai_router/checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--eval-only", action="store_true", help="Run evaluation only")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint for evaluation")
@@ -65,25 +66,26 @@ def main():
             chk = torch.load(args.checkpoint, map_location=device_str, weights_only=False)
             model.load_state_dict(chk["model_state_dict"])
         model.to(device_str)
-        evaluate_policy(model, num_eval_episodes=50, device=device_str, **stage_cfg)
+        evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, device=device_str, **stage_cfg)
         return
 
     print("=" * 80)
     print(f"   STARTING MILESTONE {args.stage}: AI PCB ROUTER PLATFORM TRAINING")
     print(f"   Architecture: 10-Channel Grid + CNN-Transformer Policy (PCBRouterNet)")
-    print(f"   Stage config: {stage_cfg}")
+    print(f"   Stage config: {stage_cfg}  |  max_steps_per_net: {args.max_steps}")
     print(f"   Device: {device_str.upper()} | Steps: {args.timesteps:,}")
     print("=" * 80)
 
     model = train_single_net_policy(
         total_timesteps=args.timesteps,
+        max_steps_per_net=args.max_steps,
         checkpoint_dir=args.checkpoint_dir,
         device_str=device_str,
         **stage_cfg,
     )
 
     print("\nRunning post-training benchmark evaluation...")
-    evaluate_policy(model, num_eval_episodes=50, device=device_str, **stage_cfg)
+    evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, device=device_str, **stage_cfg)
 
 
 if __name__ == "__main__":

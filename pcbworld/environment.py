@@ -566,4 +566,5 @@ class PCBRouterEnv(gym.Env):
             "head_pos": (self.head_x, self.head_y, self.head_layer),
             "vias": sum(self.vias_per_net.values()),
             "total_wirelength": sum(self.wirelength_per_net.values()),
+            "total_steps": self.total_steps,
         }
