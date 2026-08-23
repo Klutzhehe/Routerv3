@@ -40,6 +40,7 @@ class PCBRouterEnv(gym.Env):
         reward_calculator: Optional[RewardCalculator] = None,
         enable_layer_via: bool = True,
         max_consecutive_collisions: Optional[int] = None,
+        max_net_restarts: int = 0,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -65,6 +66,17 @@ class PCBRouterEnv(gym.Env):
             if max_consecutive_collisions is not None
             else (96 if enable_layer_via else 24)
         )
+        # On jam (max_consecutive_collisions exhausted), wipe this net's
+        # progress and retry it from its source pad instead of abandoning it
+        # outright -- see _restart_current_net(). Retrying single steps from
+        # the SAME stuck position (above) only searches alternatives at that
+        # one point; if every local option from there is bad, exhausting
+        # them cannot help, because they are all evaluated from inside the
+        # same trap. Restarting is a bounded, well-defined form of "back up
+        # and try a different path" without needing per-step undo history.
+        # Default 0 (disabled) -- opt in explicitly; existing behavior stays
+        # unchanged unless requested.
+        self.max_net_restarts = max_net_restarts
         # board_generator.py sets tgt_layer = src_layer for these stages, and
         # the head starts on the source pad's layer -- so a policy that never
         # touches via/layer is already correctly aligned, and every toggle
@@ -105,6 +117,11 @@ class PCBRouterEnv(gym.Env):
         # anything not in THIS observation is invisible to it, no matter how
         # informative the reward gradient eventually is. See Channel 9.
         self._last_rejected_pos: Optional[Tuple[int, int]] = None
+        # Cells this net's head has already passed through, this attempt --
+        # reset on a genuinely new net AND on a restart, so a restart isn't
+        # penalized for the path the FAILED attempt already took.
+        self._visited_cells: set = set()
+        self.net_restart_count: int = 0
         self.total_steps: int = 0
         self.completed_nets: List[int] = []
         self.failed_nets: List[int] = []
@@ -190,6 +207,29 @@ class PCBRouterEnv(gym.Env):
             self.steps_taken_current_net = 0
             self.collision_run = 0
             self._last_rejected_pos = None
+            self._visited_cells = {(self.head_x, self.head_y)}
+            self.net_restart_count = 0
+
+    def _restart_current_net(self):
+        """Wipe THIS net's progress and try it again from its source pad.
+
+        Deliberately does NOT touch steps_taken_current_net or
+        net_restart_count -- those are what bound how many restarts a net
+        gets before max_steps_per_net or max_net_restarts ends it for real,
+        same overall budget, just a fresh attempt within it.
+        """
+        active_net = self.board.nets[self.current_net_idx]
+        for layer_grid in self.board.copper_grid:
+            layer_grid[layer_grid == active_net.net_id] = 0
+        self.wirelength_per_net[active_net.net_id] = 0.0
+        self.vias_per_net[active_net.net_id] = 0
+        self.head_x = active_net.source_pad.x
+        self.head_y = active_net.source_pad.y
+        self.head_layer = active_net.source_pad.layer
+        self.head_prev_dir = None
+        self.collision_run = 0
+        self._last_rejected_pos = None
+        self._visited_cells = {(self.head_x, self.head_y)}
 
     def _precompute_static_caches(self):
         """Precompute obstacle masks, clearance field, and initial congestion."""
@@ -346,11 +386,20 @@ class PCBRouterEnv(gym.Env):
         curr_dist_geo = self._geo_dist_at(new_x, new_y)
         is_connected = False
 
+        is_revisit = False
         if not is_collided:
             # Draw line segment into copper grid
             self._rasterize_line(
                 prev_x, prev_y, new_x, new_y, self.head_layer, active_net.net_id
             )
+            # Revisit check: did this step cross any cell THIS net has
+            # already been through (excluding prev_x,prev_y itself, which is
+            # trivially "already visited" by definition). A curving detour
+            # around an obstacle does not re-cross its own earlier path, so
+            # this only fires on genuine backtracking/looping.
+            new_points = self._get_line_points(prev_x, prev_y, new_x, new_y)[1:]
+            is_revisit = any(p in self._visited_cells for p in new_points)
+            self._visited_cells.update(new_points)
             self.head_x = new_x
             self.head_y = new_y
             self.wirelength_per_net[active_net.net_id] += step_len
@@ -398,6 +447,7 @@ class PCBRouterEnv(gym.Env):
             is_bend=is_bend,
             is_via=is_via,
             congestion_overlap=cong_overlap,
+            is_revisit=is_revisit,
         )
 
         # Collision is a rejected move and a penalty, not an instant kill.
@@ -417,6 +467,17 @@ class PCBRouterEnv(gym.Env):
         # move succeeds, so this is strictly "what just happened", not a
         # lingering mark.
         self._last_rejected_pos = (new_x, new_y) if is_collided else None
+
+        # Every local option from the stuck position has now been tried and
+        # failed (see max_consecutive_collisions). Restarting from the
+        # source pad is a bounded way to "back up and try a different path"
+        # instead of only ever searching alternatives from inside the same
+        # trap -- see _restart_current_net(). Still bounded by
+        # max_steps_per_net below, so this cannot run forever.
+        if jammed and self.net_restart_count < self.max_net_restarts:
+            self.net_restart_count += 1
+            self._restart_current_net()
+            jammed = False
 
         # Transition / Termination logic
         net_timeout = self.steps_taken_current_net >= self.max_steps_per_net

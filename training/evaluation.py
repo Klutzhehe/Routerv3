@@ -26,6 +26,7 @@ def evaluate_policy(
     num_obstacles: int = 0,
     enable_layer_via: bool = True,
     max_steps_per_net: int = 120,
+    max_net_restarts: int = 0,
     device: str = "cpu",
 ) -> Dict[str, Any]:
     """Run deterministic evaluation of policy over test boards."""
@@ -37,6 +38,7 @@ def evaluate_policy(
         num_nets=num_nets,
         num_obstacles=num_obstacles,
         max_steps_per_net=max_steps_per_net,
+        max_net_restarts=max_net_restarts,
         snap_radius=6,
         enable_layer_via=enable_layer_via,
     )

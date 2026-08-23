@@ -8,6 +8,7 @@ Calculates step-wise and episodic rewards for RL agent actions:
 - Directional bend penalty (-1.0 for bends > 45 deg)
 - Via placement penalty (-5.0 per via)
 - Congestion / corridor blocking penalty (-50.0)
+- Revisit penalty for re-crossing this net's own earlier path (-3.0)
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ class RewardCalculator:
         bend_penalty: float = 0.5,
         via_penalty: float = 5.0,
         congestion_penalty_scale: float = 2.0,
+        revisit_penalty: float = 3.0,
     ):
         self.connect_bonus = connect_bonus
         self.collision_penalty = collision_penalty
@@ -36,6 +38,7 @@ class RewardCalculator:
         self.bend_penalty = bend_penalty
         self.via_penalty = via_penalty
         self.congestion_penalty_scale = congestion_penalty_scale
+        self.revisit_penalty = revisit_penalty
 
     def compute_step_reward(
         self,
@@ -48,6 +51,7 @@ class RewardCalculator:
         is_bend: bool,
         is_via: bool,
         congestion_overlap: float = 0.0,
+        is_revisit: bool = False,
     ) -> Tuple[float, Dict[str, float]]:
         """Compute the step reward and breakdown dict."""
         reward_breakdown = {}
@@ -87,5 +91,13 @@ class RewardCalculator:
         cong_cost = -self.congestion_penalty_scale * congestion_overlap
         reward_breakdown["congestion"] = cong_cost
 
-        total_reward = dist_reward + align_reward + length_cost + bend_cost + via_cost + cong_cost
+        # 7. Revisit penalty -- landed on a cell this SAME net has already
+        # passed through. Discourages loops/backtracking-in-place without
+        # touching termination logic; a legitimate curving detour around an
+        # obstacle does not re-cross its own earlier path, so this only
+        # fires on genuine self-intersection.
+        revisit_cost = -self.revisit_penalty if is_revisit else 0.0
+        reward_breakdown["revisit"] = revisit_cost
+
+        total_reward = dist_reward + align_reward + length_cost + bend_cost + via_cost + cong_cost + revisit_cost
         return total_reward, reward_breakdown
