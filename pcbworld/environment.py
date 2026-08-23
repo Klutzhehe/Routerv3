@@ -39,6 +39,7 @@ class PCBRouterEnv(gym.Env):
         seed: Optional[int] = None,
         reward_calculator: Optional[RewardCalculator] = None,
         enable_layer_via: bool = True,
+        max_consecutive_collisions: int = 8,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -49,6 +50,9 @@ class PCBRouterEnv(gym.Env):
         self.snap_radius = snap_radius
         self.min_pad_dist = min_pad_dist
         self.max_pad_dist = max_pad_dist
+        # Give up on a net after this many CONSECUTIVE rejected moves, not
+        # after the first one -- see the "jammed" check in step().
+        self.max_consecutive_collisions = max_consecutive_collisions
         # board_generator.py sets tgt_layer = src_layer for these stages, and
         # the head starts on the source pad's layer -- so a policy that never
         # touches via/layer is already correctly aligned, and every toggle
@@ -82,6 +86,7 @@ class PCBRouterEnv(gym.Env):
         self.head_prev_dir: Optional[int] = None
 
         self.steps_taken_current_net: int = 0
+        self.collision_run: int = 0
         self.total_steps: int = 0
         self.completed_nets: List[int] = []
         self.failed_nets: List[int] = []
@@ -165,6 +170,7 @@ class PCBRouterEnv(gym.Env):
             self.head_layer = active_net.source_pad.layer
             self.head_prev_dir = None
             self.steps_taken_current_net = 0
+            self.collision_run = 0
 
     def _precompute_static_caches(self):
         """Precompute obstacle masks, clearance field, and initial congestion."""
@@ -354,9 +360,23 @@ class PCBRouterEnv(gym.Env):
             congestion_overlap=cong_overlap,
         )
 
+        # Collision is a rejected move and a penalty, not an instant kill.
+        # Measured directly: a scripted policy that always follows the
+        # geodesic field's descent direction still hit obstacle corners
+        # ~20-25% of the time (coarse 8-direction/3-distance action space
+        # meeting real geometry), and EVERY one of those failures ended the
+        # net in under 20 steps, 37-125 cells from the target -- one bad
+        # step, no chance to try a different angle from the same spot. Same
+        # failure line_route_env.py already measured and fixed for the
+        # vector env ("a colliding head is not jammed, it is contouring").
+        # Only give up once actually stuck: several consecutive rejected
+        # moves in a row, not one.
+        self.collision_run = self.collision_run + 1 if is_collided else 0
+        jammed = self.collision_run >= self.max_consecutive_collisions
+
         # Transition / Termination logic
         net_timeout = self.steps_taken_current_net >= self.max_steps_per_net
-        net_done = is_connected or is_collided or net_timeout
+        net_done = is_connected or jammed or net_timeout
 
         if net_done and not is_connected:
             self.failed_nets.append(active_net.net_id)
