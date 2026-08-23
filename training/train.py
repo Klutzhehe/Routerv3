@@ -29,6 +29,7 @@ import torch.optim as optim
 from pcbworld.environment import PCBRouterEnv
 from models.router_policy import PCBRouterNet
 from training.replay_buffer import RolloutBuffer
+from training.reward_scaling import RewardScaler
 
 
 def train_single_net_policy(
@@ -38,14 +39,22 @@ def train_single_net_policy(
     minibatch_size: int = 64,
     lr: float = 3e-4,
     clip_coef: float = 0.2,
+    value_clip_coef: float = 0.2,
     ent_coef: float = 0.01,
     vf_coef: float = 0.5,
     max_grad_norm: float = 0.5,
+    gamma: float = 0.99,
+    num_nets: int = 1,
+    num_obstacles: int = 0,
     checkpoint_dir: str = "/content/drive/MyDrive/pcb_ai_router/checkpoints",
     device_str: Optional[str] = None,
     plot_interval: int = 1024,
 ) -> PCBRouterNet:
-    """Train single-net routing agent (Milestone 1 target: >95% routing success)."""
+    """Train a routing agent (Milestone 1 target: >95% routing success on stage 1).
+
+    `num_nets`/`num_obstacles` select the curriculum stage; the function name
+    predates stage 2/3 support and is kept so existing checkpoints/imports
+    don't break."""
     if device_str is None:
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
@@ -58,11 +67,11 @@ def train_single_net_policy(
     chk_path.mkdir(parents=True, exist_ok=True)
     plot_path = chk_path / "single_net_training_curves.png"
 
-    # 1. Instantiate Environment (Single net, 2 pads, 256x256 grid)
+    # 1. Instantiate Environment
     env = PCBRouterEnv(
         grid_size=256,
-        num_nets=1,
-        num_obstacles=0,
+        num_nets=num_nets,
+        num_obstacles=num_obstacles,
         max_steps_per_net=120,
         snap_radius=6,
     )
@@ -75,7 +84,13 @@ def train_single_net_policy(
         buffer_size=rollout_steps,
         obs_shape=env.observation_space.shape,
         device=device,
+        gamma=gamma,
     )
+    # Scales the reward the LEARNER sees by a running estimate of the
+    # discounted return's std -- see reward_scaling.py. Raw reward stays in
+    # curr_ep_reward/episode_reward_window for reporting; only what the
+    # buffer stores and the value loss trains against goes through this.
+    reward_scaler = RewardScaler(gamma=gamma)
 
     obs_np, info = env.reset()
     obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
@@ -118,13 +133,14 @@ def train_single_net_policy(
             action = int(action_t.item())
             next_obs_np, reward, term, trunc, step_info = env.step(action)
             done = term or trunc
-            curr_ep_reward += reward
+            curr_ep_reward += reward  # raw units, for reporting only
+            scaled_reward = reward_scaler.scale(reward, done)
 
             buffer.add(
                 obs=obs_t.squeeze(0),
                 action=action_t,
                 log_prob=log_prob_t,
-                reward=reward,
+                reward=scaled_reward,
                 done=done,
                 value=value_t,
             )
@@ -177,8 +193,17 @@ def train_single_net_policy(
                 surr2 = -mb_advs * torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef)
                 policy_loss = torch.max(surr1, surr2).mean()
 
-                # Value Loss
-                value_loss = 0.5 * ((new_value.squeeze() - mb_returns) ** 2).mean()
+                # Value Loss, clipped (PPO2-style): bounds how far one
+                # minibatch can drag the value estimate, the other half of
+                # fixing the V-loss-thrashing pattern -- reward scaling fixes
+                # the TARGET's scale, this fixes the update's step size.
+                new_value = new_value.squeeze()
+                v_unclipped = (new_value - mb_returns) ** 2
+                v_clipped_pred = mb_values + torch.clamp(
+                    new_value - mb_values, -value_clip_coef, value_clip_coef
+                )
+                v_clipped = (v_clipped_pred - mb_returns) ** 2
+                value_loss = 0.5 * torch.max(v_unclipped, v_clipped).mean()
 
                 # Total Loss
                 loss = policy_loss - ent_coef * entropy.mean() + vf_coef * value_loss
