@@ -108,6 +108,10 @@ class BoardBenchmarkResult:
     # different problems sharing one completion number, and which one dominates
     # decides whether steering was ever the thing to fix.
     failure_reasons: dict
+    # net -> fraction of the straight-line distance covered before giving
+    # up. 0.0 means the head never left the start pad.
+    failure_progress: dict
+    closest_approach_nm: dict
 
 
 @dataclass
@@ -128,7 +132,9 @@ class BenchmarkSuiteSummary:
     failures_fix_rejected: int
     failures_out_of_steps: int
     failures_jammed: int
+    failures_never_started: int
     failures_unattributed: int
+    median_progress_at_failure: float
 
 
 def _classify_net(name: str) -> str:
@@ -202,6 +208,8 @@ def evaluate_board(
     completed = info["completed"]
     failed = info["failed"]
     failure_reasons = info.get("failure_reasons", {})
+    failure_progress = info.get("failure_progress", {})
+    closest_approach = info.get("closest_approach_nm", {})
     total_completed = len(completed)
     total_nets = len(all_nets)
 
@@ -265,6 +273,8 @@ def evaluate_board(
         wall_clock_ms=wall_clock_ms,
         ms_per_step=ms_per_step,
         failure_reasons=failure_reasons,
+        failure_progress=failure_progress,
+        closest_approach_nm=closest_approach,
     )
 
 
@@ -329,6 +339,8 @@ def run_benchmark_suite(
     fix_rej = sum(1 for r in reasons if r == "fix_rejected")
     oos = sum(1 for r in reasons if r == "out_of_steps")
     jam = sum(1 for r in reasons if r == "jammed")
+    never = sum(1 for r in reasons if r == "route_never_started")
+    progress = [v for res in results for v in res.failure_progress.values()]
 
     summary = BenchmarkSuiteSummary(
         total_boards=len(results),
@@ -347,7 +359,9 @@ def run_benchmark_suite(
         failures_fix_rejected=fix_rej,
         failures_out_of_steps=oos,
         failures_jammed=jam,
-        failures_unattributed=(tot_eval - tot_comp) - (fix_rej + oos + jam),
+        failures_never_started=never,
+        failures_unattributed=(tot_eval - tot_comp) - (fix_rej + oos + jam + never),
+        median_progress_at_failure=float(np.median(progress)) if progress else float("nan"),
     )
 
     print("\n" + "=" * 80)
@@ -368,14 +382,37 @@ def run_benchmark_suite(
     if n_failed:
         print("-" * 80)
         print(f"WHY THE {n_failed} FAILED NETS FAILED")
+        print(f"  router never started the route:   {summary.failures_never_started:4d}"
+              f"  ({summary.failures_never_started / n_failed * 100:5.1f}%)  <- NO policy can move this head")
+        print(f"  navigating, ran out of steps:     {summary.failures_out_of_steps:4d}"
+              f"  ({summary.failures_out_of_steps / n_failed * 100:5.1f}%)  <- a real steering problem")
         print(f"  reached the pad, fix() refused:   {summary.failures_fix_rejected:4d}"
-              f"  ({summary.failures_fix_rejected / n_failed * 100:5.1f}%)  <- not a steering problem")
-        print(f"  never reached it (out of steps):  {summary.failures_out_of_steps:4d}"
-              f"  ({summary.failures_out_of_steps / n_failed * 100:5.1f}%)  <- navigation")
+              f"  ({summary.failures_fix_rejected / n_failed * 100:5.1f}%)")
         print(f"  head frozen against copper:       {summary.failures_jammed:4d}"
               f"  ({summary.failures_jammed / n_failed * 100:5.1f}%)")
+        print(f"  median distance covered before giving up: "
+              f"{summary.median_progress_at_failure * 100:5.1f}% of the straight line")
         if summary.failures_unattributed:
             print(f"  unattributed:                     {summary.failures_unattributed:4d}")
+
+        approaches = np.array(
+            [d for res in results for d in res.closest_approach_nm.values()], dtype=float
+        )
+        if approaches.size:
+            snap = 400_000.0
+            print("-" * 80)
+            print("HOW CLOSE THE HEAD GOT ON THOSE NETS (closest approach to the pad)")
+            for lo, hi, label in (
+                (0, snap, "inside the snap radius"),
+                (snap, 1e6, "0.4 - 1.0 mm  (arrived, could not close)"),
+                (1e6, 3e6, "1.0 - 3.0 mm"),
+                (3e6, 1e7, "3.0 - 10 mm"),
+                (1e7, float("inf"), "over 10 mm  (never got near)"),
+            ):
+                n = int(((approaches >= lo) & (approaches < hi)).sum())
+                print(f"  {label:<42s} {n:4d}  ({n / approaches.size * 100:5.1f}%)")
+            print(f"  median closest approach: {np.median(approaches) / 1e6:.3f} mm"
+                  f"   (snap radius {snap / 1e6:.2f} mm)")
     print("=" * 80)
 
     if json_out:

@@ -234,6 +234,17 @@ class LineRouteEnv(gym.Env):
         # obvious reading -- "it cannot steer around obstacles" -- is an
         # assumption rather than a measurement.
         self._failure_reasons: dict[str, str] = {}
+        self._failure_progress: dict[str, float] = {}
+        self._failure_travel: dict[str, float] = {}
+        self._start_ok = False
+        self._start_pad_id = -1
+        self._target_pad_id_ok = False
+        # Closest the head ever got to the target, per net. With 100% of
+        # failures reported as "never reached the pad" on a step budget 3.3x
+        # the typical net, this is the number that says whether the head
+        # stalls short of the pad or never travels at all.
+        self._closest_approach_nm: dict[str, float] = {}
+        self._min_dist_nm = float("inf")
 
     # -- setup ----------------------------------------------------------
 
@@ -333,6 +344,9 @@ class LineRouteEnv(gym.Env):
         self._net_index = 0
         self._completed, self._failed = [], []
         self._failure_reasons = {}
+        self._failure_progress = {}
+        self._failure_travel = {}
+        self._closest_approach_nm = {}
         self._ripup_count = 0
         self._blocking_nets = set()
         self._ripups_performed = []
@@ -357,6 +371,9 @@ class LineRouteEnv(gym.Env):
         self._steps = 0
         self._collides = False
         self._collision_run = 0
+        self._min_dist_nm = math.hypot(
+            self._target_xy[0] - self._start_xy[0], self._target_xy[1] - self._start_xy[1]
+        )
         self._blocking_nets = set()
         self._target_ref_length = 0.0
         self._prev_heading = math.atan2(self._target_xy[1] - self._start_xy[1], self._target_xy[0] - self._start_xy[0])
@@ -379,6 +396,14 @@ class LineRouteEnv(gym.Env):
         self._route_active = bool(
             self.bridge.start_route(int(a.x), int(a.y), start_id, 0)
         )
+        # A head the router never took charge of cannot be steered anywhere,
+        # by any policy. Recorded here so a net that never started is not
+        # filed under the same "ran out of steps" heading as one that was
+        # genuinely navigating and did not arrive -- they are opposite
+        # problems and the first is invisible to everything downstream.
+        self._start_ok = self._route_active
+        self._start_pad_id = start_id
+        self._target_pad_id_ok = self._target_id >= 0
         self._rebuild_obstacles()
 
 
@@ -408,8 +433,20 @@ class LineRouteEnv(gym.Env):
         # a route built on the requested position instead of the real one
         # accumulates error silently.
         head = self.bridge.get_head_geometry()
-        moved = math.hypot(head.end_x - self._pos[0], head.end_y - self._pos[1])
-        self._pos = (float(head.end_x), float(head.end_y))
+        # `active` is not decoration. With no live route the bridge returns a
+        # zeroed HeadGeometry, and reading end_x/end_y out of it unconditionally
+        # teleports the head to the board ORIGIN -- then charges the distance it
+        # "travelled" to get there to _routed_len. A net whose start_route()
+        # was refused therefore spends its whole budget reporting a head at
+        # (0, 0), with a detour_ratio and a shaping potential computed from a
+        # position the router never had. Every downstream signal on that net is
+        # fiction, and it looks exactly like a net that simply failed to
+        # navigate.
+        if head.active:
+            moved = math.hypot(head.end_x - self._pos[0], head.end_y - self._pos[1])
+            self._pos = (float(head.end_x), float(head.end_y))
+        else:
+            moved = 0.0
         self._routed_len += moved
         self._collides = bool(self.bridge.head_collides())
         # Only a STUCK collision counts toward the jam. Sliding along an
@@ -428,6 +465,7 @@ class LineRouteEnv(gym.Env):
                 self._blocking_nets.add(obs_item.net)
 
         dist = math.hypot(self._target_xy[0] - self._pos[0], self._target_xy[1] - self._pos[1])
+        self._min_dist_nm = min(self._min_dist_nm, dist)
         reward = self._shaping(prev_pos, self._pos) - self.weights.step
         if self._collides:
             reward -= self.weights.collision
@@ -532,9 +570,20 @@ class LineRouteEnv(gym.Env):
 
     def _abandon(self, reason: str = "out_of_steps") -> None:
         net = self._nets[self._net_index]
+        if reason == "out_of_steps" and not self._start_ok:
+            reason = "route_never_started"
         self.bridge.stop_routing()
         self._failed.append(net)
         self._failure_reasons[net] = reason
+        # How far along it got before giving up: 1.0 means it reached the pad,
+        # 0.0 means it never left the start. A budget problem and a head that
+        # never moved both read as "out of steps" without this.
+        dist = math.hypot(
+            self._target_xy[0] - self._pos[0], self._target_xy[1] - self._pos[1]
+        )
+        self._failure_progress[net] = 1.0 - min(1.0, dist / max(1.0, self._straight_len))
+        self._failure_travel[net] = self._routed_len
+        self._closest_approach_nm[net] = self._min_dist_nm
         if net.startswith("diffpair_") and net.endswith("_P"):
             self._failed.append(net[:-2] + "_N")
         self._route_active = False
@@ -648,6 +697,13 @@ class LineRouteEnv(gym.Env):
             "ripup_count": self._ripup_count,
             "ripups_performed": list(self._ripups_performed),
             "failure_reasons": dict(self._failure_reasons),
+            "failure_progress": dict(self._failure_progress),
+            "failure_travel_nm": dict(self._failure_travel),
+            "route_started": self._start_ok,
+            "start_pad_id": self._start_pad_id,
+            "target_pad_id": self._target_id,
+            "closest_approach_nm": dict(self._closest_approach_nm),
+            "snap_radius_nm": self.snap_radius_nm,
         }
 
 

@@ -708,3 +708,63 @@ def test_failure_reasons_reset_between_episodes():
             break
     _, info = env.reset()
     assert info["failure_reasons"] == {}
+
+
+class _RefusesToStart(fake_bridge.FakePNSBridge):
+    """start_route() refuses, and nothing is live afterwards -- as PNS behaves."""
+
+    def start_route(self, x, y, item_id, layer):
+        super().start_route(x, y, item_id, layer)
+        self._routing_active = False
+        return False
+
+    def push(self, x, y, item_id=-1):
+        return super().push(x, y, item_id) if self._routing_active else False
+
+    def fix(self, x, y, item_id=-1, force_finish=False, force_commit=False):
+        if not self._routing_active:
+            return False
+        return super().fix(x, y, item_id, force_finish, force_commit)
+
+
+def test_a_head_with_no_live_route_does_not_teleport_to_the_origin():
+    """Regression for a bug that corrupted every never-started net.
+
+    get_head_geometry() returns a ZEROED struct when no route is live. Reading
+    end_x/end_y out of it without checking `active` moved the head to the board
+    origin and billed _routed_len for the trip -- so a net whose start_route()
+    was refused spent its whole budget reporting a position the router never
+    had, with a detour_ratio and shaping potential computed from it. On stage-1
+    boards that is a third of all nets, and it is indistinguishable downstream
+    from a net that merely failed to navigate.
+    """
+    bridge.PNSBridge = lambda: _RefusesToStart(nets=_NETS[:2])
+    env = LineRouteEnv(
+        "fake_board.kicad_pcb",
+        obs_config=LineObsConfig(k_nearest=8, max_steps=6),
+        max_steps_per_net=6,
+    )
+    env.reset()
+    start = env._pos
+
+    for _ in range(3):
+        _, _, _, _, info = env.step(np.array([0.0], dtype=np.float32))
+        assert env._pos == start, f"head moved to {env._pos} with no live route"
+        assert info["routed_length_nm"] == 0.0, "billed for travel that never happened"
+
+
+def test_a_refused_start_is_not_filed_as_a_navigation_failure():
+    bridge.PNSBridge = lambda: _RefusesToStart(nets=_NETS[:2])
+    env = LineRouteEnv(
+        "fake_board.kicad_pcb",
+        obs_config=LineObsConfig(k_nearest=8, max_steps=4),
+        max_steps_per_net=4,
+    )
+    env.reset()
+    info = None
+    for _ in range(6):
+        _, _, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
+        if terminated:
+            break
+    assert info["failure_reasons"]["net_0"] == "route_never_started"
+    assert info["failure_progress"]["net_0"] == pytest.approx(0.0)
