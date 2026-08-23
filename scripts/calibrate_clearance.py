@@ -83,6 +83,9 @@ def walk(board_path: str, max_steps_per_net: int = 120):
     hits: list[bool] = []
     refusal_gaps: list[float] = []
     seen_refusals: set[str] = set()
+    # Per-net collision history, to test whether head_collides() is a POSITION
+    # signal or a LATCH on the whole in-progress route.
+    nets_seq: dict[str, list] = {}
 
     guard, limit = 0, len(env._nets) * max_steps_per_net * 3
     while guard < limit:
@@ -90,9 +93,13 @@ def walk(board_path: str, max_steps_per_net: int = 120):
         guard += 1
 
         gap = nearest_obstacle_gap(env._pos, env._obstacles)
+        collides = bool(info.get("collides", False))
         if math.isfinite(gap):
             gaps.append(gap)
-            hits.append(bool(info.get("collides", False)))
+            hits.append(collides)
+        net_now = info.get("net")
+        if net_now:
+            nets_seq.setdefault(net_now, []).append((collides, gap))
 
         for net, detail in info.get("fix_refusals", {}).items():
             if net not in seen_refusals:
@@ -102,7 +109,7 @@ def walk(board_path: str, max_steps_per_net: int = 120):
 
         if terminated:
             break
-    return gaps, hits, refusal_gaps
+    return gaps, hits, refusal_gaps, nets_seq
 
 
 def main() -> None:
@@ -122,11 +129,13 @@ def main() -> None:
     gaps: list[float] = []
     hits: list[bool] = []
     refusals: list[float] = []
+    seqs: list[list] = []
     for i, path in enumerate(paths):
-        g, h, r = walk(path)
+        g, h, r, ns = walk(path)
         gaps.extend(g)
         hits.extend(h)
         refusals.extend(r)
+        seqs.extend(ns.values())
         print(f"[{i + 1:2d}/{len(paths)}] {Path(path).name}", flush=True)
 
     g = np.array(gaps)
@@ -173,6 +182,39 @@ def main() -> None:
               f"p90 {np.percentile(r, 90) / 1000:7.1f}")
         print(f"    refused while INSIDE an obstacle footprint: "
               f"{(r < 0).sum()} of {len(r)}")
+    # -- latch test ------------------------------------------------------
+    ever, unlatch, first_gaps, after_true = 0, 0, [], []
+    for seq in seqs:
+        flags = [c for c, _ in seq]
+        if not any(flags):
+            continue
+        ever += 1
+        i = flags.index(True)
+        first_gaps.append(seq[i][1])
+        tail = flags[i:]
+        if not all(tail):
+            unlatch += 1
+        after_true.append(sum(tail) / len(tail))
+
+    print()
+    print("  IS head_collides() A POSITION SIGNAL, OR A LATCH ON THE ROUTE?")
+    print(f"    nets that ever collided            {ever}")
+    if ever:
+        print(f"    it went back to False afterwards   {unlatch} of {ever}"
+              f"  ({unlatch / ever * 100:5.1f}%)")
+        print(f"    fraction of steps true AFTER the first collision, mean "
+              f"{np.mean(after_true) * 100:5.1f}%")
+        fg = np.array(first_gaps)
+        print(f"    gap at the FIRST collision: median {np.median(fg) / 1000:7.1f} um"
+              f"   p90 {np.percentile(fg, 90) / 1000:7.1f} um")
+        print()
+        if unlatch / ever < 0.15:
+            print("    -> it essentially never clears. head_collides() reports that the")
+            print("       ROUTE has crossed something, not that the HEAD is near anything.")
+            print("       The env has been reading it as a per-step proximity signal.")
+        else:
+            print("    -> it does clear, so it is positional and the flat curve above")
+            print("       means the obstacle LIST is wrong, not the flag's meaning.")
     print("=" * 74)
 
 
