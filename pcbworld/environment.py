@@ -87,6 +87,12 @@ class PCBRouterEnv(gym.Env):
 
         self.steps_taken_current_net: int = 0
         self.collision_run: int = 0
+        # Where the last rejected move tried to land, or None if the last
+        # step was clean. The ONLY place the policy can perceive its own
+        # last mistake -- there is no recurrence/frame history here, so
+        # anything not in THIS observation is invisible to it, no matter how
+        # informative the reward gradient eventually is. See Channel 9.
+        self._last_rejected_pos: Optional[Tuple[int, int]] = None
         self.total_steps: int = 0
         self.completed_nets: List[int] = []
         self.failed_nets: List[int] = []
@@ -171,6 +177,7 @@ class PCBRouterEnv(gym.Env):
             self.head_prev_dir = None
             self.steps_taken_current_net = 0
             self.collision_run = 0
+            self._last_rejected_pos = None
 
     def _precompute_static_caches(self):
         """Precompute obstacle masks, clearance field, and initial congestion."""
@@ -373,6 +380,10 @@ class PCBRouterEnv(gym.Env):
         # moves in a row, not one.
         self.collision_run = self.collision_run + 1 if is_collided else 0
         jammed = self.collision_run >= self.max_consecutive_collisions
+        # WHERE the rejection landed, for Channel 9 -- cleared the instant a
+        # move succeeds, so this is strictly "what just happened", not a
+        # lingering mark.
+        self._last_rejected_pos = (new_x, new_y) if is_collided else None
 
         # Transition / Termination logic
         net_timeout = self.steps_taken_current_net >= self.max_steps_per_net
@@ -506,9 +517,22 @@ class PCBRouterEnv(gym.Env):
         # Channel 8: Layer occupancy (1.0 on top layer, 0.0 on bottom)
         obs[8].fill(1.0 if self.head_layer == 0 else 0.0)
 
-        # Channel 9: Future congestion estimate
-        if self._congestion_cache is not None:
-            obs[9] = self._congestion_cache
+        # Channel 9: Rejection feedback -- WHERE the last move was rejected
+        # (Gaussian marker, same shape as the Channel 3 head spot) and HOW
+        # STUCK the net currently is (peak intensity = collision_run /
+        # max_consecutive_collisions, so a single bump reads faint and
+        # approaching "jammed" reads strong). This used to duplicate Channel
+        # 4 verbatim -- dead weight, and the one thing actually missing was
+        # a signal the policy could react to WITHIN the same net, the direct
+        # analogue of an LLM seeing a DRC error before its next move rather
+        # than only being reachable through the reward gradient over many
+        # future episodes.
+        if self._last_rejected_pos is not None:
+            lx, ly = self._last_rejected_pos
+            intensity = min(1.0, self.collision_run / max(1, self.max_consecutive_collisions))
+            y_coords, x_coords = np.ogrid[:self.grid_size, :self.grid_size]
+            dist_sq = (x_coords - lx) ** 2 + (y_coords - ly) ** 2
+            obs[9] = (intensity * np.exp(-0.5 * dist_sq / 16.0)).astype(np.float32)
 
         return obs
 
