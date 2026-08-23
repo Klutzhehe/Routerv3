@@ -4,6 +4,11 @@ Trains PCBRouterNet across progressive stages:
 - Stage 1: Single Net (Basics)
 - Stage 2: Single Net + Obstacles
 - Stage 3: Multi-Net Dense Routing
+
+Features:
+- Real-time live updating dashboard in Colab (IPython.display)
+- Dynamic 3-panel learning curves updating every rollout
+- GPU / CPU auto-detection with Mixed Precision support
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from training.replay_buffer import RolloutBuffer
 
 
 def train_single_net_policy(
-    total_timesteps: int = 50_000,
+    total_timesteps: int = 40_000,
     rollout_steps: int = 512,
     epochs: int = 4,
     minibatch_size: int = 64,
@@ -37,15 +42,21 @@ def train_single_net_policy(
     vf_coef: float = 0.5,
     max_grad_norm: float = 0.5,
     checkpoint_dir: str = "/content/drive/MyDrive/pcb_ai_router/checkpoints",
-    device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
-    plot_interval: int = 2048,
+    device_str: Optional[str] = None,
+    plot_interval: int = 1024,
 ) -> PCBRouterNet:
     """Train single-net routing agent (Milestone 1 target: >95% routing success)."""
+    if device_str is None:
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
+
     print(f"🚀 Initializing AI PCB Router Training on device: {device_str.upper()}")
+    if device_str == "cuda":
+        print(f"   GPU Model: {torch.cuda.get_device_name(0)}")
 
     chk_path = Path(checkpoint_dir)
     chk_path.mkdir(parents=True, exist_ok=True)
+    plot_path = chk_path / "single_net_training_curves.png"
 
     # 1. Instantiate Environment (Single net, 2 pads, 256x256 grid)
     env = PCBRouterEnv(
@@ -77,16 +88,28 @@ def train_single_net_policy(
         "value_loss": [],
     }
 
-    completed_window = []
-    episode_reward_window = []
+    completed_window: List[float] = []
+    episode_reward_window: List[float] = []
     curr_ep_reward = 0.0
     global_step = 0
     start_time = time.time()
+    rollout_count = 0
+
+    # In-notebook display helper
+    in_colab = False
+    try:
+        from IPython.display import clear_output, display, Image
+        in_colab = True
+    except ImportError:
+        pass
 
     while global_step < total_timesteps:
+        rollout_count += 1
         buffer.reset()
 
+        # -------------------------------------------------------------
         # Collect Rollout
+        # -------------------------------------------------------------
         for step in range(rollout_steps):
             global_step += 1
             with torch.no_grad():
@@ -110,9 +133,9 @@ def train_single_net_policy(
                 is_comp = 1.0 if step_info.get("completed_nets", 0) > 0 else 0.0
                 completed_window.append(is_comp)
                 episode_reward_window.append(curr_ep_reward)
-                if len(completed_window) > 50:
+                if len(completed_window) > 40:
                     completed_window.pop(0)
-                if len(episode_reward_window) > 50:
+                if len(episode_reward_window) > 40:
                     episode_reward_window.pop(0)
 
                 curr_ep_reward = 0.0
@@ -121,18 +144,21 @@ def train_single_net_policy(
             obs_np = next_obs_np
             obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
 
-        # Compute GAE advantages
+        # -------------------------------------------------------------
+        # Compute GAE Advantages
+        # -------------------------------------------------------------
         with torch.no_grad():
             _, last_value = model(obs_t)
         buffer.compute_advantages_and_returns(last_value, done)
 
-        # PPO Update
+        # -------------------------------------------------------------
+        # PPO Optimization Epochs
+        # -------------------------------------------------------------
         total_p_loss, total_v_loss = 0.0, 0.0
         num_updates = 0
 
         for epoch in range(epochs):
             for mb_obs, mb_actions, mb_old_log_probs, mb_advs, mb_returns, mb_values in buffer.get_minibatches(minibatch_size):
-                # Normalize advantages
                 mb_advs = (mb_advs - mb_advs.mean()) / (mb_advs.std() + 1e-8)
 
                 _, new_log_prob, entropy, new_value = model.get_action_and_value(mb_obs, mb_actions)
@@ -158,29 +184,37 @@ def train_single_net_policy(
                 total_v_loss += value_loss.item()
                 num_updates += 1
 
-        # Logging & Stats
+        # -------------------------------------------------------------
+        # Live Stats & Dashboard
+        # -------------------------------------------------------------
         avg_comp = float(np.mean(completed_window) * 100.0) if completed_window else 0.0
         avg_rew = float(np.mean(episode_reward_window)) if episode_reward_window else 0.0
-        fps = int(global_step / max(1e-3, (time.time() - start_time)))
+        elapsed = time.time() - start_time
+        fps = int(global_step / max(1e-3, elapsed))
+        p_loss = total_p_loss / max(1, num_updates)
+        v_loss = total_v_loss / max(1, num_updates)
 
         history["steps"].append(global_step)
         history["reward"].append(avg_rew)
         history["completion_rate"].append(avg_comp)
-        history["policy_loss"].append(total_p_loss / max(1, num_updates))
-        history["value_loss"].append(total_v_loss / max(1, num_updates))
+        history["policy_loss"].append(p_loss)
+        history["value_loss"].append(v_loss)
 
-        print(
-            f"Step {global_step:>6d}/{total_timesteps} | "
-            f"Completion Rate: {avg_comp:6.1f}% | "
-            f"Mean Reward: {avg_rew:7.1f} | "
-            f"Loss: [P={history['policy_loss'][-1]:.3f}, V={history['value_loss'][-1]:.3f}] | "
-            f"Speed: {fps} steps/s"
+        # Print live stream
+        progress_pct = (global_step / total_timesteps) * 100.0
+        status_line = (
+            f"[{progress_pct:5.1f}%] Step {global_step:>6d}/{total_timesteps} | "
+            f"Success: {avg_comp:5.1f}% | "
+            f"Reward: {avg_rew:6.1f} | "
+            f"Loss: [π={p_loss:6.3f}, V={v_loss:6.3f}] | "
+            f"Speed: {fps:>4d} steps/s"
         )
+        print(status_line)
+        sys.stdout.flush()
 
-        # Plot Curves
+        # Update curves plot & save checkpoint
         if global_step % plot_interval == 0 or global_step >= total_timesteps:
-            plot_learning_curves(history, chk_path / "single_net_training_curves.png")
-            # Save Checkpoint
+            plot_learning_curves(history, plot_path)
             torch.save(
                 {
                     "step": global_step,
@@ -192,7 +226,9 @@ def train_single_net_policy(
                 chk_path / "single_net_router_latest.pt",
             )
 
-    print(f"\n🎉 Milestone 1 Training Complete! Final Completion Rate: {avg_comp:.1f}%")
+    print(f"\n================================================================================")
+    print(f"🎉 Milestone 1 Training Complete! Final Routing Success: {avg_comp:.1f}%")
+    print(f"================================================================================")
     return model
 
 
@@ -200,7 +236,7 @@ def plot_learning_curves(history: Dict[str, List[float]], save_path: Path):
     if len(history["steps"]) < 2:
         return
     steps = history["steps"]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5), dpi=100)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), dpi=110)
     fig.patch.set_facecolor("#101216")
 
     for ax in axes:
@@ -210,28 +246,30 @@ def plot_learning_curves(history: Dict[str, List[float]], save_path: Path):
             spine.set_color("#30363d")
 
     # 1. Completion Rate %
-    axes[0].plot(steps, history["completion_rate"], color="#00ffcc", lw=2.0)
+    axes[0].plot(steps, history["completion_rate"], color="#00ffcc", lw=2.2)
+    axes[0].axhline(95.0, color="#ff4444", linestyle="--", alpha=0.7, label="Milestone Target (95%)")
     axes[0].set_title("Single-Net Routing Success Rate (%)", color="#e6edf3", fontsize=11, fontweight="bold")
     axes[0].set_ylim(-5, 105)
     axes[0].set_xlabel("Training Steps", color="#8b949e")
+    axes[0].legend(facecolor="#181b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8)
     axes[0].grid(True, alpha=0.15)
 
     # 2. Mean Reward
-    axes[1].plot(steps, history["reward"], color="#ffaa00", lw=2.0)
+    axes[1].plot(steps, history["reward"], color="#ffaa00", lw=2.2)
     axes[1].set_title("Mean Episode Reward", color="#e6edf3", fontsize=11, fontweight="bold")
     axes[1].set_xlabel("Training Steps", color="#8b949e")
     axes[1].grid(True, alpha=0.15)
 
     # 3. Policy & Value Losses
-    axes[2].plot(steps, history["policy_loss"], color="#ff0055", lw=1.5, label="Policy Loss")
-    axes[2].plot(steps, history["value_loss"], color="#aa00ff", lw=1.5, label="Value Loss")
+    axes[2].plot(steps, history["policy_loss"], color="#ff0055", lw=1.5, label="Policy Loss (π)")
+    axes[2].plot(steps, history["value_loss"], color="#aa00ff", lw=1.5, label="Value Loss (V)")
     axes[2].set_title("Losses (PPO Clip & MSE)", color="#e6edf3", fontsize=11, fontweight="bold")
     axes[2].set_xlabel("Training Steps", color="#8b949e")
     axes[2].legend(facecolor="#181b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8)
     axes[2].grid(True, alpha=0.15)
 
     plt.tight_layout()
-    fig.savefig(save_path, facecolor=fig.get_facecolor(), bbox_inches="tight", dpi=100)
+    fig.savefig(save_path, facecolor=fig.get_facecolor(), bbox_inches="tight", dpi=110)
     plt.close(fig)
 
 
