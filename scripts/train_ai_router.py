@@ -1,9 +1,14 @@
 """Command-Line Interface to Train PCBRouterNet (New AI Router Architecture).
 
 Supports:
-  --stage 1 (Single net baseline target >95%)
+  --stage 1 (Single net, empty board -- baseline, target ~100%)
   --stage 2 (Single net + obstacles)
-  --stage 3 (Multi-net spatial competition)
+  --stage 3 (Multi-net + obstacles, via/layer still off)
+  --stage 4 (Multi-net + obstacles + via/layer)
+
+One new axis of difficulty per stage, deliberately -- see docs/RL_PLAN.md's
+Gate A and the stage-1 postmortem in this repo's history for what stacking
+more than one at a time costs to debug.
 """
 
 import argparse
@@ -20,7 +25,7 @@ from models.router_policy import PCBRouterNet
 def main():
     parser = argparse.ArgumentParser(description="Train AI PCB Router Platform (PCBRouterNet)")
     parser.add_argument("--timesteps", type=int, default=30_000, help="Total training steps")
-    parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3], help="Curriculum stage (1=single net, 2=obstacles, 3=multinet)")
+    parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3, 4], help="Curriculum stage (1=single net, 2=+obstacles, 3=+multinet, 4=+via/layer)")
     parser.add_argument("--checkpoint-dir", type=str, default="/content/drive/MyDrive/pcb_ai_router/checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--eval-only", action="store_true", help="Run evaluation only")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint for evaluation")
@@ -28,21 +33,20 @@ def main():
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # --stage was accepted but never actually changed the environment --
-    # every stage silently trained/evaluated on 1 net, 0 obstacles. Wired
-    # here so stage 2/3 runs actually exercise obstacles / multiple nets.
-    # enable_layer_via=False for stages 1-2: board_generator.py sets
-    # tgt_layer = src_layer for these stages, so the correct answer is
-    # "never touch layer/via" and exposing that dimension before the core
-    # skill exists just gives the policy a free way to fail (measured:
-    # ~75% of steps toggled it in an undertrained eval). Matches
-    # docs/RL_PLAN.md's Gate A finding -- via/layer comes in later, not
-    # from stage 1. Stage 3 (multi-net, dense) is where it might earn its
-    # keep, so it stays on there.
+    # One new axis of difficulty per stage. enable_layer_via stays False
+    # through stage 3 -- board_generator.py sets tgt_layer = src_layer for
+    # these stages, so the correct answer is "never touch layer/via", and
+    # exposing that dimension before the core skill exists just gives the
+    # policy a free way to fail (measured: ~75% of steps toggled it in an
+    # undertrained eval, before it was disabled). Multi-net (stage 3) and
+    # via/layer (stage 4) are kept separate for the same reason: stacking
+    # two unvalidated axes at once is how a failure stops being
+    # attributable to either one.
     STAGE_CONFIG = {
         1: dict(num_nets=1, num_obstacles=0, enable_layer_via=False),
         2: dict(num_nets=1, num_obstacles=6, enable_layer_via=False),
-        3: dict(num_nets=4, num_obstacles=6, enable_layer_via=True),
+        3: dict(num_nets=4, num_obstacles=6, enable_layer_via=False),
+        4: dict(num_nets=4, num_obstacles=6, enable_layer_via=True),
     }
     stage_cfg = STAGE_CONFIG[args.stage]
     action_dim = 96 if stage_cfg["enable_layer_via"] else 24
