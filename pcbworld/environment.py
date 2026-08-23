@@ -39,7 +39,7 @@ class PCBRouterEnv(gym.Env):
         seed: Optional[int] = None,
         reward_calculator: Optional[RewardCalculator] = None,
         enable_layer_via: bool = True,
-        max_consecutive_collisions: int = 8,
+        max_consecutive_collisions: Optional[int] = None,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -51,8 +51,20 @@ class PCBRouterEnv(gym.Env):
         self.min_pad_dist = min_pad_dist
         self.max_pad_dist = max_pad_dist
         # Give up on a net after this many CONSECUTIVE rejected moves, not
-        # after the first one -- see the "jammed" check in step().
-        self.max_consecutive_collisions = max_consecutive_collisions
+        # after the first one -- see the "jammed" check in step(). Defaults
+        # to the full action space (24, or 96 with via/layer on) so a
+        # deterministic run (select_deterministic_action, which tries a
+        # DIFFERENT action each retry) actually exhausts every local
+        # alternative before giving up, instead of stopping a third of the
+        # way through. Measured directly: the old default of 8 left 5/5
+        # tested stuck boards unsolved; a search that tries every candidate
+        # before committing solves all 5 of the same boards. No backtracking
+        # needed -- just not giving up early.
+        self.max_consecutive_collisions = (
+            max_consecutive_collisions
+            if max_consecutive_collisions is not None
+            else (96 if enable_layer_via else 24)
+        )
         # board_generator.py sets tgt_layer = src_layer for these stages, and
         # the head starts on the source pad's layer -- so a policy that never
         # touches via/layer is already correctly aligned, and every toggle

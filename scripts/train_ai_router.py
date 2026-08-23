@@ -49,6 +49,8 @@ def main():
     parser.add_argument("--timesteps", type=int, default=30_000, help="Total training steps")
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3, 4], help="Curriculum stage (1=single net, 2=+obstacles, 3=+multinet, 4=+via/layer)")
     parser.add_argument("--max-steps", type=int, default=120, help="Per-net step budget (max_steps_per_net) -- how many moves the head gets to reach one target before that net times out. Applies to both training and the post-training eval, so they stay comparable.")
+    parser.add_argument("--target-steps-per-net", type=float, default=None, help="If set, --timesteps becomes a safety cap instead of the stopping rule: training keeps going (up to that cap) until the rolling average Steps/net for SUCCESSFUL nets drops to this value or below, at --target-success-rate or higher. Use this to train for efficiency, not just completion.")
+    parser.add_argument("--target-success-rate", type=float, default=0.95, help="Success rate required (in addition to --target-steps-per-net) before training is allowed to stop early. Ignored unless --target-steps-per-net is set.")
     parser.add_argument("--checkpoint-dir", type=str, default="/content/drive/MyDrive/pcb_ai_router/checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--eval-only", action="store_true", help="Run evaluation only")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint for evaluation")
@@ -79,6 +81,8 @@ def main():
     model = train_single_net_policy(
         total_timesteps=args.timesteps,
         max_steps_per_net=args.max_steps,
+        target_steps_per_net=args.target_steps_per_net,
+        target_success_rate=args.target_success_rate,
         checkpoint_dir=args.checkpoint_dir,
         device_str=device_str,
         **stage_cfg,

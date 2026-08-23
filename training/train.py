@@ -49,6 +49,8 @@ def train_single_net_policy(
     num_obstacles: int = 0,
     enable_layer_via: bool = True,
     max_steps_per_net: int = 120,
+    target_steps_per_net: Optional[float] = None,
+    target_success_rate: float = 0.95,
     checkpoint_dir: str = "/content/drive/MyDrive/pcb_ai_router/checkpoints",
     device_str: Optional[str] = None,
     plot_interval: int = 1024,
@@ -298,8 +300,21 @@ def train_single_net_policy(
         print(status_line)
         sys.stdout.flush()
 
+        # target_steps_per_net makes total_timesteps a safety cap rather
+        # than the actual stopping rule: keep training past whatever budget
+        # was passed as long as it's still improving efficiency, and stop as
+        # soon as it's both reliable (target_success_rate) AND efficient
+        # (avg steps/net at or below target), instead of stopping at a fixed
+        # step count regardless of whether the routes it finds are any good.
+        efficiency_reached = (
+            target_steps_per_net is not None
+            and len(steps_to_complete_window) >= 20
+            and avg_comp >= target_success_rate * 100.0
+            and avg_steps_to_complete <= target_steps_per_net
+        )
+
         # Update curves plot & save checkpoint
-        if global_step % plot_interval == 0 or global_step >= total_timesteps:
+        if efficiency_reached or global_step % plot_interval == 0 or global_step >= total_timesteps:
             plot_learning_curves(history, plot_path)
             torch.save(
                 {
@@ -311,6 +326,14 @@ def train_single_net_policy(
                 },
                 chk_path / "single_net_router_latest.pt",
             )
+
+        if efficiency_reached:
+            print(
+                f"  >> target efficiency reached: Steps/net {avg_steps_to_complete:.1f} <= "
+                f"{target_steps_per_net} at {avg_comp:.1f}% success -- stopping early"
+            )
+            sys.stdout.flush()
+            break
 
     print(f"\n================================================================================")
     print(f"🎉 Milestone 1 Training Complete! Final Routing Success: {avg_comp:.1f}%")
