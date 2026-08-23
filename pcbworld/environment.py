@@ -16,7 +16,7 @@ from gymnasium import spaces
 import numpy as np
 
 from pcbworld.board_generator import BoardState, generate_random_board, NetSpec, Pad, Obstacle
-from pcbworld.congestion import compute_net_demand_heatmap, compute_distance_field, compute_clearance_field
+from pcbworld.congestion import compute_net_demand_heatmap, compute_geodesic_distance_field, compute_clearance_field
 from pcbworld.reward import RewardCalculator
 
 
@@ -94,6 +94,12 @@ class PCBRouterEnv(gym.Env):
         self._obs_cache: Optional[np.ndarray] = None
         self._congestion_cache: Optional[np.ndarray] = None
         self._clearance_cache: Optional[np.ndarray] = None
+        self._obs_grid: Optional[np.ndarray] = None
+        # Obstacle-aware cost-to-go for the ACTIVE net's target, rebuilt once
+        # per net (not per step -- same amortization as _refresh_static_segments
+        # in line_route_env.py). This is what lets a detour pay off before the
+        # collision fires, instead of only after -- see compute_geodesic_distance_field.
+        self._geodesic_cache: Optional[np.ndarray] = None
 
         if seed is not None:
             self.reset(seed=seed)
@@ -137,6 +143,7 @@ class PCBRouterEnv(gym.Env):
 
         self._init_current_net()
         self._precompute_static_caches()
+        self._update_geodesic_cache()
 
         obs = self._build_observation()
         info = self._get_info()
@@ -164,7 +171,44 @@ class PCBRouterEnv(gym.Env):
             obs_grid[y1:y2, x1:x2] = 1.0
 
         self._clearance_cache = compute_clearance_field(self.grid_size, obs_grid)
+        self._obs_grid = obs_grid
         self._update_congestion_cache()
+
+    def _update_geodesic_cache(self):
+        """Rebuild the cost-to-go field for whichever net is active now.
+
+        Only the target moves between nets; the obstacle grid does not, so
+        `self._obs_grid` from `_precompute_static_caches` is reused rather
+        than rebuilt.
+        """
+        if self.current_net_idx >= len(self.board.nets):
+            self._geodesic_cache = None
+            return
+        target = self.board.nets[self.current_net_idx].target_pad
+        self._geodesic_cache = compute_geodesic_distance_field(
+            self.grid_size, target.x, target.y, self._obs_grid
+        )
+
+    def _geo_dist_at(self, x: float, y: float) -> float:
+        if self._geodesic_cache is None:
+            return 0.0
+        gx = int(np.clip(round(x), 0, self.grid_size - 1))
+        gy = int(np.clip(round(y), 0, self.grid_size - 1))
+        return float(self._geodesic_cache[gy, gx])
+
+    def _geo_descent_dir(self, x: float, y: float) -> Tuple[float, float]:
+        """Which way the cost-to-go field decreases fastest -- the direction
+        that walks around whatever is in the way instead of into it."""
+        if self._geodesic_cache is None:
+            return (0.0, 0.0)
+        gx = int(np.clip(round(x), 1, self.grid_size - 2))
+        gy = int(np.clip(round(y), 1, self.grid_size - 2))
+        ddx = self._geodesic_cache[gy, gx - 1] - self._geodesic_cache[gy, gx + 1]
+        ddy = self._geodesic_cache[gy - 1, gx] - self._geodesic_cache[gy + 1, gx]
+        norm = math.hypot(ddx, ddy)
+        if norm < 1e-6:
+            return (0.0, 0.0)
+        return (ddx / norm, ddy / norm)
 
     def _update_congestion_cache(self):
         unrouted = [net for net in self.board.nets if net.net_id not in self.completed_nets]
@@ -182,7 +226,10 @@ class PCBRouterEnv(gym.Env):
         target = active_net.target_pad
 
         prev_x, prev_y, prev_layer = self.head_x, self.head_y, self.head_layer
-        prev_dist = math.hypot(prev_x - target.x, prev_y - target.y)
+        # Obstacle-aware cost-to-go, not straight-line -- a straight-line
+        # potential pays off walking INTO whatever is in the way right up
+        # until the collision fires. See compute_geodesic_distance_field.
+        prev_dist = self._geo_dist_at(prev_x, prev_y)
 
         # 1. Execute via / layer change
         is_via = False
@@ -212,8 +259,11 @@ class PCBRouterEnv(gym.Env):
                 prev_x, prev_y, new_x, new_y, self.head_layer, active_net.net_id
             )
 
-        # 5. Check if target pad reached
+        # 5. Check if target pad reached -- physical proximity, so Euclidean
+        # is correct here even though the reward below uses the geodesic
+        # distance (near the pad the two coincide anyway).
         curr_dist = math.hypot(new_x - target.x, new_y - target.y)
+        curr_dist_geo = self._geo_dist_at(new_x, new_y)
         is_connected = False
 
         if not is_collided:
@@ -237,12 +287,20 @@ class PCBRouterEnv(gym.Env):
         is_bend = (self.head_prev_dir is not None) and (self.head_prev_dir != dir_idx)
         self.head_prev_dir = dir_idx
 
-        # Compute heading alignment toward target pad
-        dx_tgt = target.x - prev_x
-        dy_tgt = target.y - prev_y
-        tgt_norm = math.hypot(dx_tgt, dy_tgt)
+        # Heading alignment against the field's descent direction, not the
+        # straight bearing to the pad -- this is what actually rewards
+        # circling an obstacle instead of pushing into it. Falls back to the
+        # straight bearing only where the field has no local gradient (e.g.
+        # against the board edge).
         act_norm = math.hypot(dir_x, dir_y)
-        heading_alignment = float((dx_tgt * dir_x + dy_tgt * dir_y) / (tgt_norm * act_norm)) if (tgt_norm > 1e-4 and act_norm > 1e-4) else 0.0
+        gdx, gdy = self._geo_descent_dir(prev_x, prev_y)
+        if act_norm > 1e-4 and (abs(gdx) > 1e-6 or abs(gdy) > 1e-6):
+            heading_alignment = float((gdx * dir_x + gdy * dir_y) / act_norm)
+        else:
+            dx_tgt = target.x - prev_x
+            dy_tgt = target.y - prev_y
+            tgt_norm = math.hypot(dx_tgt, dy_tgt)
+            heading_alignment = float((dx_tgt * dir_x + dy_tgt * dir_y) / (tgt_norm * act_norm)) if (tgt_norm > 1e-4 and act_norm > 1e-4) else 0.0
 
         # Congestion overlap penalty
         cong_overlap = 0.0
@@ -252,7 +310,7 @@ class PCBRouterEnv(gym.Env):
         # Compute Step Reward
         reward, _breakdown = self.reward_calc.compute_step_reward(
             prev_dist=prev_dist,
-            curr_dist=curr_dist,
+            curr_dist=curr_dist_geo,
             step_len=step_len,
             heading_alignment=heading_alignment,
             is_connected=is_connected,
@@ -277,6 +335,7 @@ class PCBRouterEnv(gym.Env):
             if self.current_net_idx < len(self.board.nets):
                 self._init_current_net()
                 self._update_congestion_cache()
+                self._update_geodesic_cache()
             else:
                 terminated = True
 
@@ -381,9 +440,14 @@ class PCBRouterEnv(gym.Env):
         if self._clearance_cache is not None:
             obs[6] = self._clearance_cache
 
-        # Channel 7: Distance to destination target pad
-        if active_net is not None:
-            obs[7] = compute_distance_field(self.grid_size, active_net.target_pad.x, active_net.target_pad.y)
+        # Channel 7: Obstacle-aware distance-to-go to the target pad (NOT
+        # Euclidean -- see compute_geodesic_distance_field). Normalized by
+        # the same constant a Euclidean field would use, so the channel's
+        # scale stays stationary across nets even though a detour's true
+        # cost-to-go can exceed straight-line distance.
+        if self._geodesic_cache is not None:
+            max_dist = math.hypot(self.grid_size, self.grid_size)
+            obs[7] = np.clip(self._geodesic_cache / max_dist, 0.0, 1.0)
 
         # Channel 8: Layer occupancy (1.0 on top layer, 0.0 on bottom)
         obs[8].fill(1.0 if self.head_layer == 0 else 0.0)

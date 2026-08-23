@@ -11,6 +11,11 @@ import math
 from typing import List, Tuple
 import numpy as np
 
+# Orthogonal and diagonal step costs, in cells -- same convention as
+# pcbworld/env/geodesic.py's wavefront relaxation.
+_ORTHO = 1.0
+_DIAG = float(np.sqrt(2.0))
+
 
 def compute_net_demand_heatmap(
     grid_size: int,
@@ -93,6 +98,67 @@ def _estimate_path_density(
     corridor_prob[obstacle_mask > 0] *= 0.1
 
     return corridor_prob.astype(np.float32)
+
+
+def compute_geodesic_distance_field(
+    grid_size: int,
+    target_x: int,
+    target_y: int,
+    obstacle_mask: np.ndarray,
+    downsample_factor: int = 2,
+) -> np.ndarray:
+    """Obstacle-aware cost-to-go, in grid cells, via Dijkstra flood from the target.
+
+    A straight-line distance field pays off walking INTO an obstacle right up
+    until the collision fires -- the same failure `pcbworld/env/geodesic.py`
+    measured on the vector env (600k steps, two reward configs, policy still
+    drew straight lines). This is that fix, but grid-native: flood-fill the
+    rasterized obstacle mask once per net instead of relaxing a field over
+    line segments. Cells the flood cannot reach (sealed pockets) fall back to
+    Euclidean distance rather than infinity, so the field stays defined
+    everywhere the head might legally be.
+
+    Downsampled for speed -- this runs once per net, not once per step, same
+    amortization as `compute_net_demand_heatmap` and `GeodesicField.build`.
+    """
+    ds_size = max(1, grid_size // downsample_factor)
+    ds_obs = (
+        obstacle_mask.reshape(ds_size, downsample_factor, ds_size, downsample_factor)
+        .max(axis=(1, 3))
+    )
+
+    tx = int(np.clip(target_x // downsample_factor, 0, ds_size - 1))
+    ty = int(np.clip(target_y // downsample_factor, 0, ds_size - 1))
+
+    dist = np.full((ds_size, ds_size), np.inf, dtype=np.float32)
+    visited = np.zeros((ds_size, ds_size), dtype=bool)
+    dist[ty, tx] = 0.0
+    heap: list = [(0.0, ty, tx)]
+    neighbors = (
+        (-1, 0, _ORTHO), (1, 0, _ORTHO), (0, -1, _ORTHO), (0, 1, _ORTHO),
+        (-1, -1, _DIAG), (-1, 1, _DIAG), (1, -1, _DIAG), (1, 1, _DIAG),
+    )
+    while heap:
+        d, y, x = heapq.heappop(heap)
+        if visited[y, x]:
+            continue
+        visited[y, x] = True
+        for dy, dx, cost in neighbors:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < ds_size and 0 <= nx < ds_size and not visited[ny, nx] and ds_obs[ny, nx] == 0:
+                nd = d + cost
+                if nd < dist[ny, nx]:
+                    dist[ny, nx] = nd
+                    heapq.heappush(heap, (nd, ny, nx))
+
+    unreached = ~np.isfinite(dist)
+    if unreached.any():
+        yy, xx = np.mgrid[0:ds_size, 0:ds_size]
+        dist[unreached] = np.hypot(xx - tx, yy - ty)[unreached]
+
+    full = np.repeat(np.repeat(dist, downsample_factor, axis=0), downsample_factor, axis=1)
+    full = full[:grid_size, :grid_size] * downsample_factor
+    return full.astype(np.float32)
 
 
 def compute_distance_field(grid_size: int, target_x: int, target_y: int) -> np.ndarray:
