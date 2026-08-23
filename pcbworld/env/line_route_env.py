@@ -464,10 +464,13 @@ class LineRouteEnv(gym.Env):
         self._collisions_this_net += int(self._collides)
         self._steps += 1
 
-        if self._collides and hasattr(self.bridge, "get_head_obstacle"):
-            obs_item = self.bridge.get_head_obstacle()
-            if getattr(obs_item, "found", False) and obs_item.net and (obs_item.net in self._completed):
-                self._blocking_nets.add(obs_item.net)
+        if self._collides:
+            # Through the guarded helper: this runs on every colliding step, so
+            # an exception out of the probe would take a whole training run
+            # down for a diagnostic nobody asked to be load-bearing.
+            obs_item = self._describe_head_obstacle()
+            if obs_item.get("found") and obs_item.get("net") in self._completed:
+                self._blocking_nets.add(obs_item["net"])
 
         dist = math.hypot(self._target_xy[0] - self._pos[0], self._target_xy[1] - self._pos[1])
         self._min_dist_nm = min(self._min_dist_nm, dist)
@@ -556,12 +559,58 @@ class LineRouteEnv(gym.Env):
     def _shaping(self, prev_pos, pos) -> float:
         return self.gamma * self._potential(pos) - self._potential(prev_pos)
 
+    def _describe_head_obstacle(self) -> dict:
+        """WHAT the head is touching, not just that it is touching something.
+
+        The two candidates behind a refused fix() need completely different
+        fixes and the completion number cannot tell them apart. If the head is
+        colliding with its OWN target pad, the router is treating this net's
+        endpoint as an obstacle and the bug is in how the route is started or
+        which pad id it was handed -- a bridge-integration problem with real
+        headroom behind it. If it is another net's copper, the route genuinely
+        crosses something and only better avoidance helps -- which the oracle
+        says is worth about one net.
+        """
+        if not hasattr(self.bridge, "get_head_obstacle"):
+            return {"probe": False}
+        try:
+            o = self.bridge.get_head_obstacle()
+        except Exception:  # a probe must never take the episode down
+            return {"probe": False}
+        if not getattr(o, "found", False):
+            return {"probe": True, "found": False}
+
+        own = self._nets[self._net_index] if self._net_index < len(self._nets) else ""
+        own_nets = {own}
+        if own.startswith("diffpair_") and own.endswith("_P"):
+            own_nets.add(own[:-2] + "_N")
+
+        ox, oy = float(getattr(o, "x", 0.0)), float(getattr(o, "y", 0.0))
+        return {
+            "probe": True,
+            "found": True,
+            "net": str(getattr(o, "net", "")),
+            "kind": str(getattr(o, "kind", "")),
+            "is_own_net": str(getattr(o, "net", "")) in own_nets,
+            "dist_to_target_nm": math.hypot(
+                self._target_xy[0] - ox, self._target_xy[1] - oy
+            ),
+            "dist_to_start_nm": math.hypot(
+                self._start_xy[0] - ox, self._start_xy[1] - oy
+            ),
+        }
+
     def _try_finish(self) -> bool:
         """force_finish/force_commit=True is the Colab-verified convention
         (commit 7f746b6) and is what snaps the route to the target pad."""
         net = self._nets[self._net_index]
+        # What the approach was touching, before the finish push moves the head
+        # onto the pad centre and possibly changes it.
+        obstacle_on_approach = self._describe_head_obstacle()
         # Push router head directly into the target pad candidate ID to snap both legs
         self.bridge.push(int(self._target_xy[0]), int(self._target_xy[1]), self._target_id)
+        collides_after_snap = bool(self.bridge.head_collides())
+        obstacle_at_fix = self._describe_head_obstacle()
         ok = bool(
             self.bridge.fix(
                 int(self._target_xy[0]), int(self._target_xy[1]), self._target_id, True, True
@@ -596,6 +645,9 @@ class LineRouteEnv(gym.Env):
                 "collision_steps": self._collisions_this_net,
                 "steps": self._steps,
                 "detour_ratio": self._routed_len / max(1.0, self._straight_len),
+                "collides_after_snap": collides_after_snap,
+                "obstacle_on_approach": obstacle_on_approach,
+                "obstacle_at_fix": obstacle_at_fix,
             }
             if net.startswith("diffpair_") and net.endswith("_P"):
                 self._failed.append(net[:-2] + "_N")

@@ -174,6 +174,40 @@ def main() -> None:
         clean = sum(1 for x in d if x["collision_steps"] == 0)
         print(f"    refused with ZERO collisions all net    {clean:4d} of {len(d)}"
               f"  ({clean / len(d) * 100:5.1f}%)  <- if high, refusal is not about clearance")
+        snap = sum(1 for x in d if x.get("collides_after_snap"))
+        print(f"    still colliding after the snap push     {snap:4d} of {len(d)}"
+              f"  ({snap / len(d) * 100:5.1f}%)")
+
+        print()
+        print("  WHAT the head was touching when fix() refused:")
+        for label, key in (("on approach", "obstacle_on_approach"),
+                           ("at the fix() call", "obstacle_at_fix")):
+            obs = [x.get(key) or {} for x in d]
+            probed = [o for o in obs if o.get("probe")]
+            if not probed:
+                print(f"    {label:<18} (bridge has no get_head_obstacle probe)")
+                continue
+            found = [o for o in probed if o.get("found")]
+            own = sum(1 for o in found if o.get("is_own_net"))
+            other = len(found) - own
+            near_t = sum(1 for o in found
+                         if o.get("dist_to_target_nm", 1e18) < 1_000_000)
+            near_s = sum(1 for o in found
+                         if o.get("dist_to_start_nm", 1e18) < 1_000_000)
+            print(f"    {label}:")
+            print(f"      nothing found                {len(probed) - len(found):4d} of {len(probed)}")
+            print(f"      the net's OWN copper/pad     {own:4d} of {len(probed)}"
+                  f"   <- bridge integration, not routing")
+            print(f"      another net's copper         {other:4d} of {len(probed)}"
+                  f"   <- genuine clearance")
+            print(f"      obstacle within 1mm of TARGET pad {near_t:4d}")
+            print(f"      obstacle within 1mm of START  pad {near_s:4d}")
+            names = {}
+            for o in found:
+                names[o.get("kind", "?")] = names.get(o.get("kind", "?"), 0) + 1
+            if names:
+                print(f"      obstacle kinds: "
+                      + ", ".join(f"{k or '(blank)'}={v}" for k, v in sorted(names.items())))
 
     print()
     lengths_ok = np.array([r["straight_mm"] for r in done], dtype=float)

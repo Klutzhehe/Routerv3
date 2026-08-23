@@ -834,3 +834,74 @@ def test_a_refused_fix_records_the_state_it_was_refused_in():
     assert detail["steps"] > 0
     assert "colliding_at_fix" in detail and "collision_steps" in detail
     assert detail["detour_ratio"] >= 1.0
+
+
+def test_a_refusal_records_what_the_head_was_touching():
+    """"Colliding at fix()" is not actionable on its own.
+
+    Colliding with the net's OWN target pad means the router is treating this
+    net's endpoint as an obstacle -- a bridge-integration bug with real
+    headroom. Colliding with another net's copper means the route genuinely
+    crosses something, which the oracle says is worth about one net in 124.
+    The completion number cannot tell those apart; this can.
+    """
+
+    class _RefusesAndReportsOwnPad(fake_bridge.FakePNSBridge):
+        def head_collides(self):
+            return bool(self._routing_active)
+
+        def get_head_obstacle(self):
+            # the net's own target pad, which is where net_0's B pad sits
+            return fake_bridge.HeadObstacle(
+                found=True, net="net_0", kind="pad", x=20 * MM, y=0
+            )
+
+        def fix(self, x, y, item_id=-1, force_finish=False, force_commit=False):
+            return False
+
+    bridge.PNSBridge = lambda: _RefusesAndReportsOwnPad(nets=_NETS[:2])
+    env = LineRouteEnv(
+        "fake_board.kicad_pcb",
+        obs_config=LineObsConfig(k_nearest=8, max_steps=120),
+        max_steps_per_net=120,
+    )
+    env.reset()
+    info = None
+    for _ in range(200):
+        _, _, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
+        if terminated:
+            break
+
+    detail = info["fix_refusals"]["net_0"]
+    for key in ("obstacle_on_approach", "obstacle_at_fix"):
+        o = detail[key]
+        assert o["probe"] is True and o["found"] is True
+        assert o["is_own_net"] is True, "own target pad must not read as another net"
+        assert o["dist_to_target_nm"] == pytest.approx(0.0, abs=1.0)
+    assert detail["collides_after_snap"] is True
+
+
+def test_the_obstacle_probe_never_takes_the_episode_down():
+    class _AngryProbe(fake_bridge.FakePNSBridge):
+        def head_collides(self):
+            return bool(self._routing_active)
+
+        def get_head_obstacle(self):
+            raise RuntimeError("bridge exploded")
+
+        def fix(self, x, y, item_id=-1, force_finish=False, force_commit=False):
+            return False
+
+    bridge.PNSBridge = lambda: _AngryProbe(nets=_NETS[:2])
+    env = LineRouteEnv(
+        "fake_board.kicad_pcb",
+        obs_config=LineObsConfig(k_nearest=8, max_steps=120),
+        max_steps_per_net=120,
+    )
+    env.reset()
+    info = None
+    for _ in range(200):
+        _, _, terminated, _, info = env.step(np.array([0.0], dtype=np.float32))
+        if terminated:
+            break
+    assert info["fix_refusals"]["net_0"]["obstacle_at_fix"] == {"probe": False}
