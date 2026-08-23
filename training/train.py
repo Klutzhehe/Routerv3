@@ -41,6 +41,7 @@ def train_single_net_policy(
     clip_coef: float = 0.2,
     value_clip_coef: float = 0.2,
     ent_coef: float = 0.01,
+    ent_coef_final: float = 0.001,
     vf_coef: float = 0.5,
     max_grad_norm: float = 0.5,
     gamma: float = 0.99,
@@ -212,6 +213,19 @@ def train_single_net_policy(
         # -------------------------------------------------------------
         # PPO Optimization Epochs
         # -------------------------------------------------------------
+        # Entropy decays linearly ent_coef -> ent_coef_final over training.
+        # Measured directly: a completely UNTRAINED, randomly-initialized
+        # model scored 37/50 on the fixed eval boards -- identical to every
+        # trained checkpoint so far. A constant entropy bonus keeps the
+        # policy perpetually penalized for committing to a confident choice,
+        # so even where the advantage signal DOES favor deviating from the
+        # init-time default (tight obstacle corners), the deterministic
+        # argmax never actually commits to it. Same schedule this repo's
+        # other env already uses (docs/RL_PLAN.md: "entropy 0.01 decaying to
+        # 0.001").
+        progress = min(1.0, global_step / max(1, total_timesteps))
+        current_ent_coef = ent_coef + (ent_coef_final - ent_coef) * progress
+
         total_p_loss, total_v_loss = 0.0, 0.0
         num_updates = 0
 
@@ -240,7 +254,7 @@ def train_single_net_policy(
                 value_loss = 0.5 * torch.max(v_unclipped, v_clipped).mean()
 
                 # Total Loss
-                loss = policy_loss - ent_coef * entropy.mean() + vf_coef * value_loss
+                loss = policy_loss - current_ent_coef * entropy.mean() + vf_coef * value_loss
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -277,6 +291,7 @@ def train_single_net_policy(
             f"Success: {avg_comp:5.1f}% | "
             f"Reward: {avg_rew:6.1f} | "
             f"Steps/net: {steps_to_complete_str} | "
+            f"Ent: {current_ent_coef:.4f} | "
             f"Loss: [π={p_loss:6.3f}, V={v_loss:6.3f}] | "
             f"Speed: {fps:>4d} steps/s"
         )
