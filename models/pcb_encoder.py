@@ -27,25 +27,43 @@ class PCBEncoder(nn.Module):
 
         # 1. Multi-scale Convolutional Patch Extractor (256x256 -> 16x16 feature grid)
         # Downsample factor: 16 (256/16 = 16x16 = 256 patch tokens)
+        #
+        # GroupNorm, not BatchNorm -- same reasoning as
+        # pcbworld/agents/cfp/modules.py's ResBlock, which already documents
+        # this: on-policy rollout collection is thousands of batch-of-1
+        # forward passes, each one updating BatchNorm's running stats with a
+        # noisy single-sample estimate. The same observation then evaluates
+        # differently at collection time (train mode, batch stats) than at
+        # update time or eval time (running stats, drifted since collection)
+        # -- which silently corrupts the PPO ratio during training and, at
+        # deploy time, washes out whatever the weights actually learned.
+        # Measured: three differently-trained checkpoints produced
+        # bit-identical evaluate_policy() stats (37/50 nets, 0.86x, every
+        # time) despite clearly different training curves -- the eval-mode
+        # running statistics, not the learned weights, were what eval was
+        # actually measuring.
+        def _norm(channels: int) -> nn.GroupNorm:
+            return nn.GroupNorm(min(8, channels), channels)
+
         self.cnn_extractor = nn.Sequential(
             # Stage 1: 256x256 -> 128x128
             nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm2d(64),
+            _norm(64),
             nn.ReLU(inplace=True),
-            
+
             # Stage 2: 128x128 -> 64x64
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
+            _norm(128),
             nn.ReLU(inplace=True),
-            
+
             # Stage 3: 64x64 -> 32x32
             nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(256),
+            _norm(256),
             nn.ReLU(inplace=True),
-            
+
             # Stage 4: 32x32 -> 16x16
             nn.Conv2d(256, d_model, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(d_model),
+            _norm(d_model),
             nn.ReLU(inplace=True),
         )
 
