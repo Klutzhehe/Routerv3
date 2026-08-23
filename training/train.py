@@ -113,6 +113,19 @@ def train_single_net_policy(
     start_time = time.time()
     rollout_count = 0
 
+    # Distance curriculum gated on measured success, not a fixed step count.
+    # The old version advanced at hard-coded step thresholds regardless of
+    # whether the current distance was mastered -- which is what produced a
+    # success rate that LOOKED like decay (42.9% -> 5%) but was actually the
+    # task quietly getting harder out from under a policy that hadn't
+    # converged on the easy case yet. Matches the >80%-success auto-advance
+    # rule this repo already uses for other curricula (AI_ARCHITECTURE.md,
+    # RL_PLAN.md) -- this trainer just never applied it.
+    DIST_CURRICULUM = [50, 100, None]
+    dist_stage = 0
+    dist_curriculum_window: List[float] = []
+    env.max_pad_dist = DIST_CURRICULUM[dist_stage]
+
     # In-notebook display helper
     in_colab = False
     try:
@@ -157,13 +170,20 @@ def train_single_net_policy(
                 if len(episode_reward_window) > 40:
                     episode_reward_window.pop(0)
 
-                # Progressive Distance Curriculum
-                if global_step < 8_000:
-                    env.max_pad_dist = 50
-                elif global_step < 18_000:
-                    env.max_pad_dist = 100
-                else:
-                    env.max_pad_dist = None
+                # Progressive Distance Curriculum, gated on measured success
+                dist_curriculum_window.append(is_comp)
+                if len(dist_curriculum_window) > 40:
+                    dist_curriculum_window.pop(0)
+                if (
+                    dist_stage < len(DIST_CURRICULUM) - 1
+                    and len(dist_curriculum_window) >= 20
+                    and float(np.mean(dist_curriculum_window)) >= 0.85
+                ):
+                    dist_stage += 1
+                    env.max_pad_dist = DIST_CURRICULUM[dist_stage]
+                    dist_curriculum_window = []
+                    print(f"  >> distance curriculum advanced: max_pad_dist={env.max_pad_dist}")
+                    sys.stdout.flush()
 
                 curr_ep_reward = 0.0
                 next_obs_np, step_info = env.reset()

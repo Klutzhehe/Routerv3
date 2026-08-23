@@ -64,6 +64,22 @@ class PCBRouterNet(nn.Module):
         nn.init.orthogonal_(self.policy_head[-1].weight, gain=0.01)
         nn.init.constant_(self.policy_head[-1].bias, 0.0)
 
+        # Bias the dir_idx == 0 actions ("toward the target", or around
+        # whatever the geodesic field says is in the way -- see
+        # PCBRouterEnv._relative_direction_vector) higher at init. This is
+        # the discrete analogue of line_route_env.py's continuous
+        # mean-zero-action trick: instead of an untrained policy sampling
+        # uniformly over 8 board-pose-dependent directions, it starts
+        # already preferring the one direction that generalizes across
+        # every board. +2.0 logit ~= e^2 higher relative weight, soft
+        # enough that every other action stays reachable.
+        with torch.no_grad():
+            bias = self.policy_head[-1].bias
+            if action_dim == 24:      # dir_idx*3 + dist_idx
+                bias[0:3] += 2.0
+            elif action_dim == 96:    # dir_idx*12 + dist_idx*4 + layer*2 + via
+                bias[0:12] += 2.0
+
     def forward(
         self,
         obs: torch.Tensor,

@@ -20,19 +20,6 @@ from pcbworld.congestion import compute_net_demand_heatmap, compute_geodesic_dis
 from pcbworld.reward import RewardCalculator
 
 
-# Direction vectors: (dx, dy) in grid space
-# 0: N, 1: NE, 2: E, 3: SE, 4: S, 5: SW, 6: W, 7: NW
-DIR_VECTORS = [
-    (0, -1),   # 0: North
-    (1, -1),   # 1: North-East
-    (1, 0),    # 2: East
-    (1, 1),    # 3: South-East
-    (0, 1),    # 4: South
-    (-1, 1),   # 5: South-West
-    (-1, 0),   # 6: West
-    (-1, -1),  # 7: North-West
-]
-
 DIST_STEPS = [2, 4, 8]  # Step distances for fast grid traversal
 
 
@@ -230,6 +217,30 @@ class PCBRouterEnv(gym.Env):
             return (0.0, 0.0)
         return (ddx / norm, ddy / norm)
 
+    def _relative_direction_vector(self, dir_idx: int, x: float, y: float, target_x: float, target_y: float) -> Tuple[float, float]:
+        """dir_idx=0 means 'toward the target' (or around whatever the
+        geodesic field says is in the way, when one exists) -- the same free
+        baseline `pcbworld/env/line_route_env.py`'s bearing-relative frame
+        gives the vector agent: a policy that has not learned anything yet
+        still walks toward the target by construction, instead of having to
+        first infer, from raw pixels, which of 8 FIXED compass directions
+        happens to point at wherever this episode's target landed. The old
+        DIR_VECTORS table was exactly that -- board-pose-dependent, so the
+        "correct" action for dir_idx=0 changed every episode and had to be
+        relearned from image content each time. This makes it stationary.
+
+        dir_idx counts 45-degree steps around from there, covering the same
+        full circle DIR_VECTORS did.
+        """
+        gdx, gdy = self._geo_descent_dir(x, y) if self._geodesic_cache is not None else (0.0, 0.0)
+        if gdx == 0.0 and gdy == 0.0:
+            gdx, gdy = target_x - x, target_y - y
+            norm = math.hypot(gdx, gdy)
+            gdx, gdy = (gdx / norm, gdy / norm) if norm > 1e-6 else (1.0, 0.0)
+        bearing = math.atan2(gdy, gdx)
+        angle = bearing + dir_idx * (math.pi / 4.0)
+        return math.cos(angle), math.sin(angle)
+
     def _update_congestion_cache(self):
         unrouted = [net for net in self.board.nets if net.net_id not in self.completed_nets]
         obs_mask = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
@@ -240,12 +251,12 @@ class PCBRouterEnv(gym.Env):
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         dir_idx, dist_idx, layer_change, via_flag = self.decode_action(action)
         step_dist = DIST_STEPS[dist_idx]
-        dir_x, dir_y = DIR_VECTORS[dir_idx]
 
         active_net = self.board.nets[self.current_net_idx]
         target = active_net.target_pad
 
         prev_x, prev_y, prev_layer = self.head_x, self.head_y, self.head_layer
+        dir_x, dir_y = self._relative_direction_vector(dir_idx, prev_x, prev_y, target.x, target.y)
         # Obstacle-aware cost-to-go, not straight-line -- a straight-line
         # potential pays off walking INTO whatever is in the way right up
         # until the collision fires. See compute_geodesic_distance_field.
@@ -259,9 +270,12 @@ class PCBRouterEnv(gym.Env):
             self.head_layer = new_layer
             self.vias_per_net[active_net.net_id] += 1
 
-        # 2. Compute new head coordinate
-        new_x = prev_x + dir_x * step_dist
-        new_y = prev_y + dir_y * step_dist
+        # 2. Compute new head coordinate. Rounded to int: _rasterize_line's
+        # Bresenham walk increments by whole cells and terminates on
+        # x == x1 and y == y1 -- a float target it can step past without
+        # ever hitting exactly would loop forever.
+        new_x = int(round(prev_x + dir_x * step_dist))
+        new_y = int(round(prev_y + dir_y * step_dist))
 
         step_len = math.hypot(new_x - prev_x, new_y - prev_y)
         self.steps_taken_current_net += 1
