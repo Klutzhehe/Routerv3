@@ -46,6 +46,7 @@ def train_single_net_policy(
     gamma: float = 0.99,
     num_nets: int = 1,
     num_obstacles: int = 0,
+    enable_layer_via: bool = True,
     checkpoint_dir: str = "/content/drive/MyDrive/pcb_ai_router/checkpoints",
     device_str: Optional[str] = None,
     plot_interval: int = 1024,
@@ -74,10 +75,12 @@ def train_single_net_policy(
         num_obstacles=num_obstacles,
         max_steps_per_net=120,
         snap_radius=6,
+        enable_layer_via=enable_layer_via,
     )
 
     # 2. Instantiate Model & Optimizer
-    model = PCBRouterNet(in_channels=10, action_dim=96, d_model=256, num_transformer_layers=2, num_heads=4).to(device)
+    action_dim = 96 if enable_layer_via else 24
+    model = PCBRouterNet(in_channels=10, action_dim=action_dim, d_model=256, num_transformer_layers=2, num_heads=4).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
 
     buffer = RolloutBuffer(

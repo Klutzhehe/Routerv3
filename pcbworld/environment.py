@@ -51,6 +51,7 @@ class PCBRouterEnv(gym.Env):
         max_pad_dist: Optional[int] = None,
         seed: Optional[int] = None,
         reward_calculator: Optional[RewardCalculator] = None,
+        enable_layer_via: bool = True,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -61,6 +62,16 @@ class PCBRouterEnv(gym.Env):
         self.snap_radius = snap_radius
         self.min_pad_dist = min_pad_dist
         self.max_pad_dist = max_pad_dist
+        # board_generator.py sets tgt_layer = src_layer for these stages, and
+        # the head starts on the source pad's layer -- so a policy that never
+        # touches via/layer is already correctly aligned, and every toggle
+        # moves it OFF the one layer where head_layer == target.layer can
+        # ever be true again. Measured: with this on and undertrained, a
+        # deterministic eval picked via/layer on ~75% of steps (1743 vias /
+        # 50 nets) against a correct answer of zero -- matches
+        # docs/RL_PLAN.md's Gate A finding that layer/via actions are not
+        # viable this early and should be introduced later, not from stage 1.
+        self.enable_layer_via = enable_layer_via
 
         self.reward_calc = reward_calculator or RewardCalculator()
 
@@ -72,9 +83,9 @@ class PCBRouterEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Action Space: 96 Discrete Actions
-        # 8 directions * 3 step distances * 2 layer changes * 2 via flags = 96
-        self.action_space = spaces.Discrete(96)
+        # Action Space: 8 directions * 3 step distances, times 4 if
+        # layer/via is enabled (2 layer changes * 2 via flags), else 1.
+        self.action_space = spaces.Discrete(96 if enable_layer_via else 24)
 
         self.board: Optional[BoardState] = None
         self.current_net_idx: int = 0
@@ -105,7 +116,16 @@ class PCBRouterEnv(gym.Env):
             self.reset(seed=seed)
 
     def decode_action(self, action: int) -> Tuple[int, int, int, int]:
-        """Decode discrete action [0..95] into (dir_idx, dist_idx, layer_change, via_flag)."""
+        """Decode a discrete action into (dir_idx, dist_idx, layer_change, via_flag).
+
+        With `enable_layer_via=False` the env only ever hands out an index in
+        [0, 24) and layer_change/via_flag are fixed at 0 -- there is no
+        "toggle" action to accidentally learn.
+        """
+        if not self.enable_layer_via:
+            dist_idx = action % 3
+            dir_idx = action // 3
+            return dir_idx, dist_idx, 0, 0
         # action = dir * 12 + dist * 4 + layer * 2 + via
         via_flag = action % 2
         rem = action // 2

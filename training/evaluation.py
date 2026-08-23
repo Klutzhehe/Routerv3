@@ -24,6 +24,7 @@ def evaluate_policy(
     grid_size: int = 256,
     num_nets: int = 1,
     num_obstacles: int = 0,
+    enable_layer_via: bool = True,
     device: str = "cpu",
 ) -> Dict[str, Any]:
     """Run deterministic evaluation of policy over test boards."""
@@ -36,6 +37,7 @@ def evaluate_policy(
         num_obstacles=num_obstacles,
         max_steps_per_net=120,
         snap_radius=6,
+        enable_layer_via=enable_layer_via,
     )
 
     total_nets = 0

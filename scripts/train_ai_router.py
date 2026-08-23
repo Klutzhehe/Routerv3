@@ -31,16 +31,25 @@ def main():
     # --stage was accepted but never actually changed the environment --
     # every stage silently trained/evaluated on 1 net, 0 obstacles. Wired
     # here so stage 2/3 runs actually exercise obstacles / multiple nets.
+    # enable_layer_via=False for stages 1-2: board_generator.py sets
+    # tgt_layer = src_layer for these stages, so the correct answer is
+    # "never touch layer/via" and exposing that dimension before the core
+    # skill exists just gives the policy a free way to fail (measured:
+    # ~75% of steps toggled it in an undertrained eval). Matches
+    # docs/RL_PLAN.md's Gate A finding -- via/layer comes in later, not
+    # from stage 1. Stage 3 (multi-net, dense) is where it might earn its
+    # keep, so it stays on there.
     STAGE_CONFIG = {
-        1: dict(num_nets=1, num_obstacles=0),
-        2: dict(num_nets=1, num_obstacles=6),
-        3: dict(num_nets=4, num_obstacles=6),
+        1: dict(num_nets=1, num_obstacles=0, enable_layer_via=False),
+        2: dict(num_nets=1, num_obstacles=6, enable_layer_via=False),
+        3: dict(num_nets=4, num_obstacles=6, enable_layer_via=True),
     }
     stage_cfg = STAGE_CONFIG[args.stage]
+    action_dim = 96 if stage_cfg["enable_layer_via"] else 24
 
     if args.eval_only:
         print(f"Loading checkpoint from: {args.checkpoint}")
-        model = PCBRouterNet(in_channels=10, action_dim=96, d_model=256, num_transformer_layers=2, num_heads=4)
+        model = PCBRouterNet(in_channels=10, action_dim=action_dim, d_model=256, num_transformer_layers=2, num_heads=4)
         if args.checkpoint and os.path.exists(args.checkpoint):
             chk = torch.load(args.checkpoint, map_location=device_str, weights_only=False)
             model.load_state_dict(chk["model_state_dict"])
