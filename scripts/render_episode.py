@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--stochastic", action="store_true", help="Sample actions like training's rollout collection does, instead of the deterministic argmax evaluate_policy uses.")
     parser.add_argument("--raw", action="store_true", help="Draw the raw rasterized copper (every stepped cell) instead of the simplified straight-segment trace. Use this to compare against the cleaned-up default.")
     parser.add_argument("--out", default="episode_render.png")
+    parser.add_argument("--verbose", action="store_true", help="Print a step-by-step trace (position, decoded action, distance-to-target, reward, status) instead of just the final image -- the same evidence format used to diagnose every jam/trap bug in this project so far.")
     args = parser.parse_args()
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -66,22 +67,47 @@ def main():
     # forbidden set keyed by whichever net just acted, not one shared set
     # that silently mixes different nets' rejected actions together.
     forbidden_by_net: dict[int, set[int]] = {}
+    step_num = 0
+    if args.verbose:
+        print(f"{'Step':>5} | {'Net':>3} | {'Pos':>12} | {'Action':>6} (dir,dist) | {'Forbid':>6} | {'ToTarget':>8} | {'Reward':>9} | Status")
     while not done:
         obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device_str).unsqueeze(0)
         acting_idx = env.current_net_idx
+        acting_state = env.net_states[acting_idx]
         prev_head = (env.head_x, env.head_y)
+        prev_completed = len(env.completed_nets)
+        prev_failed = len(env.failed_nets)
+        prev_restarts = acting_state.restart_count
         with torch.no_grad():
             dist, _ = model(obs_t)
             forbidden = forbidden_by_net.get(acting_idx, set())
             action = int(dist.sample().item()) if args.stochastic else select_deterministic_action(dist, forbidden)
+        dir_idx, dist_idx, _, _ = env.decode_action(action)
         obs_np, reward, term, trunc, info = env.step(action)
         done = term or trunc
+        new_head = info["acted_head_pos"][:2]
         if not args.stochastic:
-            new_head = info["acted_head_pos"][:2]
             if new_head == prev_head:
                 forbidden_by_net[acting_idx] = forbidden_by_net.get(acting_idx, set()) | {action}
             else:
                 forbidden_by_net[acting_idx] = set()
+        if args.verbose:
+            if len(env.completed_nets) > prev_completed:
+                status = "CONNECTED"
+            elif acting_state.restart_count > prev_restarts:
+                status = "RESTARTED"
+            elif len(env.failed_nets) > prev_failed:
+                status = "FAILED (timeout/jammed-out)"
+            elif new_head == prev_head:
+                status = "REJECTED (collision)"
+            else:
+                status = "GROW"
+            dist_to_target = env._geo_dist_at(acting_state.geodesic_cache, new_head[0], new_head[1])
+            forbidden_count = len(forbidden_by_net.get(acting_idx, set())) if not args.stochastic else 0
+            print(f"{step_num:5d} | {info['acted_net_id']:3d} | {str(new_head):>12} | "
+                  f"{action:3d} ({dir_idx},{dist_idx}) | {forbidden_count:6d} | {dist_to_target:8.1f} | "
+                  f"{reward:+9.1f} | {status}")
+        step_num += 1
 
     print(f"completed_nets={info['completed_nets']}/{info['total_nets']}  "
           f"failed_nets={info['failed_nets']}  wirelength={info['total_wirelength']:.1f}  "
