@@ -87,9 +87,12 @@ def main():
     parser.add_argument("--fast-lookahead", action="store_true", help="Use fast_lookahead_select_action instead of plain deterministic argmax -- see models/fast_lookahead.py. A small trained MLP predicts each candidate action's future distance-to-target from the already-computed encoder output, instead of simulating it via real environment steps like --lookahead does. Dramatically cheaper (no env copies, no repeated full-network passes) but not yet proven as reliable as --lookahead -- validate against known hard seeds and the full benchmark before trusting it as the default. Requires --fast-lookahead-checkpoint. Mutually exclusive with --lookahead.")
     parser.add_argument("--fast-lookahead-checkpoint", type=str, default=None, help="Path to a FastDistancePredictor checkpoint saved by scripts/train_fast_lookahead.py.")
     parser.add_argument("--fast-lookahead-top-k", type=int, default=4, help="How many of the policy's top candidate actions to score under --fast-lookahead.")
+    parser.add_argument("--analytic-lookahead", action="store_true", help="Use analytic_lookahead_select_action instead of plain deterministic argmax -- see models/analytic_lookahead.py. Scores each candidate by replaying the environment's own deterministic movement/collision math against the already-computed geodesic distance field -- no learned predictor, no simulated env.step(). Superseded --fast-lookahead after real-checkpoint validation showed distance-to-target isn't decodable from this encoder's embeddings at all (see jepa/README.md). Mutually exclusive with --lookahead and --fast-lookahead.")
+    parser.add_argument("--analytic-lookahead-top-k", type=int, default=4, help="How many of the policy's top candidate actions to score under --analytic-lookahead.")
     args = parser.parse_args()
-    if args.lookahead and args.fast_lookahead:
-        raise SystemExit("--lookahead and --fast-lookahead are incompatible -- pick one action selector.")
+    selector_flags = [args.lookahead, args.fast_lookahead, args.analytic_lookahead]
+    if sum(bool(f) for f in selector_flags) > 1:
+        raise SystemExit("--lookahead, --fast-lookahead, and --analytic-lookahead are mutually exclusive -- pick one action selector.")
     if args.fast_lookahead and not args.fast_lookahead_checkpoint:
         raise SystemExit("--fast-lookahead requires --fast-lookahead-checkpoint")
 
@@ -109,7 +112,7 @@ def main():
             chk = torch.load(args.checkpoint, map_location=device_str, weights_only=False)
             model.load_state_dict(chk["model_state_dict"])
         model.to(device_str)
-        evaluate_policy(model, num_eval_episodes=args.num_eval_episodes, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, use_lookahead=args.lookahead, lookahead_top_k=args.lookahead_top_k, lookahead_horizon=args.lookahead_horizon, use_fast_lookahead=args.fast_lookahead, fast_lookahead_predictor=fast_lookahead_predictor, fast_lookahead_top_k=args.fast_lookahead_top_k, **stage_cfg)
+        evaluate_policy(model, num_eval_episodes=args.num_eval_episodes, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, use_lookahead=args.lookahead, lookahead_top_k=args.lookahead_top_k, lookahead_horizon=args.lookahead_horizon, use_fast_lookahead=args.fast_lookahead, fast_lookahead_predictor=fast_lookahead_predictor, fast_lookahead_top_k=args.fast_lookahead_top_k, use_analytic_lookahead=args.analytic_lookahead, analytic_lookahead_top_k=args.analytic_lookahead_top_k, **stage_cfg)
         return
 
     print("=" * 80)
@@ -136,7 +139,7 @@ def main():
     )
 
     print("\nRunning post-training benchmark evaluation...")
-    evaluate_policy(model, num_eval_episodes=args.num_eval_episodes, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, use_lookahead=args.lookahead, lookahead_top_k=args.lookahead_top_k, lookahead_horizon=args.lookahead_horizon, use_fast_lookahead=args.fast_lookahead, fast_lookahead_predictor=fast_lookahead_predictor, fast_lookahead_top_k=args.fast_lookahead_top_k, **stage_cfg)
+    evaluate_policy(model, num_eval_episodes=args.num_eval_episodes, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, use_lookahead=args.lookahead, lookahead_top_k=args.lookahead_top_k, lookahead_horizon=args.lookahead_horizon, use_fast_lookahead=args.fast_lookahead, fast_lookahead_predictor=fast_lookahead_predictor, fast_lookahead_top_k=args.fast_lookahead_top_k, use_analytic_lookahead=args.analytic_lookahead, analytic_lookahead_top_k=args.analytic_lookahead_top_k, **stage_cfg)
 
 
 if __name__ == "__main__":

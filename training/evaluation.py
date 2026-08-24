@@ -17,6 +17,7 @@ import torch
 from pcbworld.environment import PCBRouterEnv
 from models.router_policy import PCBRouterNet, select_deterministic_action, lookahead_select_action
 from models.fast_lookahead import FastDistancePredictor, fast_lookahead_select_action
+from models.analytic_lookahead import analytic_lookahead_select_action
 
 
 def evaluate_policy(
@@ -37,6 +38,8 @@ def evaluate_policy(
     use_fast_lookahead: bool = False,
     fast_lookahead_predictor: "FastDistancePredictor | None" = None,
     fast_lookahead_top_k: int = 4,
+    use_analytic_lookahead: bool = False,
+    analytic_lookahead_top_k: int = 4,
 ) -> Dict[str, Any]:
     """Run deterministic evaluation of policy over test boards.
 
@@ -62,8 +65,19 @@ def evaluate_policy(
     models/fast_lookahead.py) -- a small trained MLP predicts each candidate
     action's future distance-to-target instead of simulating it, so this
     should run close to plain-argmax speed. Not proven as reliable as
-    use_lookahead yet; requires fast_lookahead_predictor. Mutually exclusive
-    with use_lookahead (the caller picks one).
+    use_lookahead yet; requires fast_lookahead_predictor.
+
+    use_analytic_lookahead swaps in analytic_lookahead_select_action instead
+    (see models/analytic_lookahead.py) -- scores each candidate by replaying
+    the environment's own deterministic movement/collision math against the
+    already-computed geodesic field, no learned predictor and no simulated
+    env.step() involved, so this should also run close to plain-argmax
+    speed. Superseded models/fast_lookahead.py after that approach's own
+    real-checkpoint validation (jepa/README.md, models/fast_lookahead.py's
+    docstring) found distance-to-target isn't decodable from ANY embedding
+    this encoder produces -- this sidesteps that question by not decoding
+    anything. Only one of use_lookahead / use_fast_lookahead /
+    use_analytic_lookahead may be set at a time (the caller picks one).
     """
     model.eval()
     dev = torch.device(device)
@@ -118,6 +132,11 @@ def evaluate_policy(
                 action = fast_lookahead_select_action(
                     model, fast_lookahead_predictor, env, obs_np, device, forbidden,
                     top_k=fast_lookahead_top_k,
+                )
+            elif use_analytic_lookahead:
+                action = analytic_lookahead_select_action(
+                    model, env, obs_np, device, forbidden,
+                    top_k=analytic_lookahead_top_k,
                 )
             else:
                 obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=dev).unsqueeze(0)
