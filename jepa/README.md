@@ -76,8 +76,29 @@ from it) rather than a from-scratch geodesic-distance regression. If either
 probe DOES beat the baseline, the problem is specific to the predictor/
 `z_hat` pathway and needs a different fix there.
 
-- [ ] Run `probe_distance_from_embedding.py` against the real collected data
-      and read the verdict.
+**Result, run against the real 26,070-transition dataset**: neither probe
+beat the baseline. Ridge MAE 0.1261 vs baseline 0.1258 (essentially no
+signal recovered -- the tiny gap is within noise); the MLP's 0.1252 is a
+~0.5% relative improvement, also not meaningfully different from baseline.
+Confirms this is a property of the embedding space, not the predictor
+architecture, input scale, or a data-collection artifact -- distance-to-
+target genuinely is not decodable from `z_t` by an independently-trained
+head, linear or shallow-nonlinear, even given the full real dataset.
+
+Before committing to the value_head-anchor idea the probe itself suggested,
+`inspect_value_head.py` checks it cheaply first (same
+evidence-before-architecture-change discipline, since "already trained"
+does not automatically mean "decodes the specific thing we want a proxy
+for" -- exactly the assumption that just failed for distance). It loads the
+ORIGINAL checkpoint's `value_head` and applies it directly to the already-
+logged `z_t` vectors -- no new environment rollouts needed. Reports
+`value_head(z_t)`'s own std (is IT also degenerate?) and its Pearson
+correlation with `dist_t` (expected notably negative if value tracks
+progress-to-target).
+
+- [ ] Run `inspect_value_head.py` against the real checkpoint + data and
+      read the verdict before deciding whether to switch the auxiliary
+      anchor to it.
 - [ ] Fast action-selector (`jepa_lookahead_select_action`) -- **not built
       yet, deliberately**. Building a selector against an unvalidated
       predictor would mean debugging two unknowns (does the predictor work?
