@@ -9,6 +9,7 @@ Combines:
 
 from __future__ import annotations
 
+import copy
 from typing import Tuple, Dict, Any, Optional
 import torch
 import torch.nn as nn
@@ -163,3 +164,100 @@ def select_deterministic_action(dist: Categorical, forbidden: set[int]) -> int:
         if idx not in forbidden:
             return idx
     return int(torch.argmax(logits).item())  # every action forbidden; shouldn't happen
+
+
+def lookahead_select_action(
+    model: "PCBRouterNet",
+    env,
+    obs_np,
+    device_str: str,
+    forbidden: set,
+    top_k: int = 4,
+    horizon: int = 4,
+) -> int:
+    """Pick an action via a shallow forward search instead of committing to
+    the single best immediate one.
+
+    select_deterministic_action is purely reactive: one observation in, one
+    action out, no lookahead beyond what that single observation encodes.
+    Measured directly (render_episode.py --verbose traces on seeds 9148/9251
+    under an earlier checkpoint): at a tight multi-obstacle intersection, a
+    fully-trained deterministic policy can get caught in a stable CYCLE
+    between the same few cells, because from wherever it currently stands
+    the locally-best action leads to a position whose own locally-best
+    action leads right back. A non-learned oracle graph search never hits
+    this, because it can look several steps ahead and discover a direction
+    that looks worse RIGHT NOW pays off in 2-3 steps -- exactly what a
+    single-step-reactive choice structurally cannot represent.
+
+    This borrows that same idea without touching the trained weights: for
+    each of the policy's top-K candidate first actions, simulate `horizon`
+    steps forward on a throwaway deep copy of the env (continuing greedily
+    with the SAME policy for the simulated steps too), and commit to
+    whichever real first action's simulated rollout got closest to the
+    target (or actually connected, or avoided leading to failure). Same
+    network, same weights -- more compute spent at decision time instead of
+    learned in advance. Materially slower per step (~top_k*horizon extra
+    env steps and forward passes) -- meant for targeted investigation of
+    specific hard boards, not routine bulk benchmarking.
+
+    Only reasons about ONE net's own trajectory: if round-robin (num_nets >
+    1) rotates control to a different net mid-simulation, the simulated
+    rollout for that candidate stops there rather than feed an action meant
+    for this net to whichever net actually became active.
+    """
+    idx = env.current_net_idx
+    if idx is None:
+        return 0
+    active_net = env.board.nets[idx]
+
+    obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device_str).unsqueeze(0)
+    with torch.no_grad():
+        dist, _ = model(obs_t)
+    logits = dist.logits.squeeze(0) if dist.logits.dim() > 1 else dist.logits
+    ranked = [a for a in torch.argsort(logits, descending=True).tolist() if a not in forbidden]
+    if not ranked:
+        ranked = torch.argsort(logits, descending=True).tolist()
+    candidates = ranked[:top_k]
+
+    best_action = candidates[0]
+    best_score = float("inf")
+
+    for cand in candidates:
+        sim_env = copy.deepcopy(env)
+        sim_forbidden: set = set()
+        state = sim_env.net_states[idx]
+        sim_prev_head = (state.head_x, state.head_y)
+        action = cand
+        score = float("inf")
+
+        for _ in range(horizon):
+            if sim_env.current_net_idx != idx:
+                break
+            sim_obs, _reward, term, trunc, info = sim_env.step(action)
+            if active_net.net_id in sim_env.completed_nets:
+                score = 0.0
+                break
+            if active_net.net_id in sim_env.failed_nets:
+                score = float("inf")
+                break
+            state = sim_env.net_states[idx]
+            score = min(score, sim_env._geo_dist_at(state.geodesic_cache, state.head_x, state.head_y))
+            if term or trunc:
+                break
+            new_head = info["acted_head_pos"][:2]
+            if new_head == sim_prev_head:
+                sim_forbidden.add(action)
+            else:
+                sim_forbidden = set()
+            sim_prev_head = new_head
+            sim_obs_t = torch.as_tensor(sim_obs, dtype=torch.float32, device=device_str).unsqueeze(0)
+            with torch.no_grad():
+                sim_dist, _ = model(sim_obs_t)
+            action = select_deterministic_action(sim_dist, sim_forbidden)
+
+        if score < best_score:
+            best_score = score
+            best_action = cand
+
+    return best_action

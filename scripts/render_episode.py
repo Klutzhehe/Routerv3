@@ -23,7 +23,7 @@ import torch
 
 from pcbworld.environment import PCBRouterEnv
 from pcbworld.renderer import render_grid_board
-from models.router_policy import PCBRouterNet, select_deterministic_action
+from models.router_policy import PCBRouterNet, select_deterministic_action, lookahead_select_action
 from scripts.train_ai_router import STAGE_CONFIG, action_dim_for_stage
 
 
@@ -39,7 +39,12 @@ def main():
     parser.add_argument("--raw", action="store_true", help="Draw the raw rasterized copper (every stepped cell) instead of the simplified straight-segment trace. Use this to compare against the cleaned-up default.")
     parser.add_argument("--out", default="episode_render.png")
     parser.add_argument("--verbose", action="store_true", help="Print a step-by-step trace (position, decoded action, distance-to-target, reward, status) instead of just the final image -- the same evidence format used to diagnose every jam/trap bug in this project so far.")
+    parser.add_argument("--lookahead", action="store_true", help="Use lookahead_select_action instead of plain deterministic argmax: simulates --lookahead-horizon steps ahead for the top --lookahead-top-k candidate actions (continuing greedily with the same policy) and commits to whichever gets closest to the target, instead of the single best immediate action. Meant for targeted investigation of boards where the plain policy gets stuck oscillating -- materially slower per step, not for bulk benchmarking. Incompatible with --stochastic.")
+    parser.add_argument("--lookahead-top-k", type=int, default=4, help="How many of the policy's top candidate actions to simulate forward under --lookahead.")
+    parser.add_argument("--lookahead-horizon", type=int, default=4, help="How many steps to simulate forward per candidate under --lookahead.")
     args = parser.parse_args()
+    if args.lookahead and args.stochastic:
+        raise SystemExit("--lookahead and --stochastic are incompatible -- lookahead is a deterministic search over the policy's own distribution.")
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     stage_cfg = STAGE_CONFIG[args.stage]
@@ -78,10 +83,16 @@ def main():
         prev_completed = len(env.completed_nets)
         prev_failed = len(env.failed_nets)
         prev_restarts = acting_state.restart_count
-        with torch.no_grad():
-            dist, _ = model(obs_t)
-            forbidden = forbidden_by_net.get(acting_idx, set())
-            action = int(dist.sample().item()) if args.stochastic else select_deterministic_action(dist, forbidden)
+        forbidden = forbidden_by_net.get(acting_idx, set())
+        if args.lookahead:
+            action = lookahead_select_action(
+                model, env, obs_np, device_str, forbidden,
+                top_k=args.lookahead_top_k, horizon=args.lookahead_horizon,
+            )
+        else:
+            with torch.no_grad():
+                dist, _ = model(obs_t)
+                action = int(dist.sample().item()) if args.stochastic else select_deterministic_action(dist, forbidden)
         dir_idx, dist_idx, _, _ = env.decode_action(action)
         obs_np, reward, term, trunc, info = env.step(action)
         done = term or trunc
