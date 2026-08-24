@@ -61,6 +61,10 @@ class _NetState:
     # reused every time round-robin rotates back to it, not recomputed
     # per step. See compute_geodesic_distance_field.
     geodesic_cache: Optional[np.ndarray] = None
+    # EMA of the field's descent direction -- see _smoothed_descent_dir.
+    # Reset alongside geodesic_cache on init/restart so a fresh attempt
+    # isn't biased by the direction the previous attempt was walking.
+    smoothed_descent_dir: Optional[Tuple[float, float]] = None
 
 
 class PCBRouterEnv(gym.Env):
@@ -285,6 +289,7 @@ class PCBRouterEnv(gym.Env):
         state.geodesic_cache = compute_geodesic_distance_field(
             self.grid_size, net.target_pad.x, net.target_pad.y, self._obs_grid
         )
+        state.smoothed_descent_dir = None
         state.best_dist_this_attempt = self._geo_dist_at(state.geodesic_cache, state.head_x, state.head_y)
         self.net_states[idx] = state
 
@@ -326,6 +331,7 @@ class PCBRouterEnv(gym.Env):
         state.last_rejected_pos = None
         state.visited_cells = {(state.head_x, state.head_y)}
         state.waypoints = [(state.head_x, state.head_y, state.head_layer)]
+        state.smoothed_descent_dir = None
         state.best_dist_this_attempt = self._geo_dist_at(state.geodesic_cache, state.head_x, state.head_y)
         state.no_progress_run = 0
 
@@ -345,29 +351,92 @@ class PCBRouterEnv(gym.Env):
         self._clearance_cache = compute_clearance_field(self.grid_size, obs_grid)
         self._obs_grid = obs_grid
 
+    def _bilinear_sample(self, field: np.ndarray, x: float, y: float) -> float:
+        """Sample field at a fractional (x, y) via bilinear interpolation
+        between its 4 nearest integer pixels, instead of rounding to the
+        nearest pixel first. Rounding before sampling snaps the query point
+        onto a fixed integer grid, which is invisible almost everywhere but
+        creates a real discontinuity wherever the field has a local extremum
+        near a half-integer coordinate (e.g. a target's own x-column) --
+        the sample flips which side of the extremum it lands on as the true
+        position drifts a fraction of a pixel past the rounding boundary,
+        which is exactly what was causing a head walking a near-straight
+        line toward its target to oscillate left/right around it."""
+        cx = float(np.clip(x, 0, self.grid_size - 1))
+        cy = float(np.clip(y, 0, self.grid_size - 1))
+        x0, y0 = int(np.floor(cx)), int(np.floor(cy))
+        x1 = min(x0 + 1, self.grid_size - 1)
+        y1 = min(y0 + 1, self.grid_size - 1)
+        wx, wy = cx - x0, cy - y0
+        top = field[y0, x0] * (1 - wx) + field[y0, x1] * wx
+        bot = field[y1, x0] * (1 - wx) + field[y1, x1] * wx
+        return float(top * (1 - wy) + bot * wy)
+
     def _geo_dist_at(self, geodesic_cache: Optional[np.ndarray], x: float, y: float) -> float:
         if geodesic_cache is None:
             return 0.0
-        gx = int(np.clip(round(x), 0, self.grid_size - 1))
-        gy = int(np.clip(round(y), 0, self.grid_size - 1))
-        return float(geodesic_cache[gy, gx])
+        return self._bilinear_sample(geodesic_cache, x, y)
 
     def _geo_descent_dir(self, geodesic_cache: Optional[np.ndarray], x: float, y: float) -> Tuple[float, float]:
         """Which way the cost-to-go field decreases fastest -- the direction
         that walks around whatever is in the way instead of into it."""
         if geodesic_cache is None:
             return (0.0, 0.0)
-        gx = int(np.clip(round(x), 1, self.grid_size - 2))
-        gy = int(np.clip(round(y), 1, self.grid_size - 2))
-        ddx = geodesic_cache[gy, gx - 1] - geodesic_cache[gy, gx + 1]
-        ddy = geodesic_cache[gy - 1, gx] - geodesic_cache[gy + 1, gx]
+        cx = float(np.clip(x, 1.0, self.grid_size - 2.0))
+        cy = float(np.clip(y, 1.0, self.grid_size - 2.0))
+        ddx = self._bilinear_sample(geodesic_cache, cx - 1.0, cy) - self._bilinear_sample(geodesic_cache, cx + 1.0, cy)
+        ddy = self._bilinear_sample(geodesic_cache, cx, cy - 1.0) - self._bilinear_sample(geodesic_cache, cx, cy + 1.0)
         norm = math.hypot(ddx, ddy)
         if norm < 1e-6:
             return (0.0, 0.0)
         return (ddx / norm, ddy / norm)
 
-    def _relative_direction_vector(
-        self, geodesic_cache: Optional[np.ndarray], dir_idx: int, x: float, y: float, target_x: float, target_y: float
+    def _smoothed_descent_dir(self, state: "_NetState", x: float, y: float) -> Tuple[float, float]:
+        """The field's descent direction, exponentially smoothed over this
+        net's own recent steps -- not just spatially interpolated (see
+        _bilinear_sample) but temporally damped.
+
+        Measured directly: even with a perfectly smooth, correctly
+        interpolated field, a head walking a near-straight line toward its
+        target oscillated +-22.5 degrees off vertical, EXACTLY every other
+        step. That's not noise -- it's a real property of the octile
+        distance metric this field is built from (edges cost 1.0 orthogonal
+        / sqrt(2) diagonal): unlike true Euclidean distance, its gradient
+        has a genuine non-smooth kink along the axis through the target,
+        flipping ~45 degrees the instant the head crosses that axis, even
+        though the right thing to do is obviously "keep going straight."
+        Spatial smoothing can't fix a kink that's mathematically exact at
+        every point along that axis -- only damping the direction estimate
+        ACROSS steps can, since the true average of "+22.5, -22.5, +22.5,
+        ..." is the straight line the kink is hiding.
+
+        0.7 is a starting point, not a tuned constant -- heavier damping
+        tracks a real obstacle-driven direction change more sluggishly, so
+        this trades off against how fast a net can react to something
+        actually in the way. The reactive collision/retry path is what
+        actually guarantees safety regardless of how this is tuned; this
+        only shapes which direction gets tried at dir_idx=0.
+        """
+        raw_gdx, raw_gdy = self._geo_descent_dir(state.geodesic_cache, x, y)
+        if raw_gdx == 0.0 and raw_gdy == 0.0:
+            # No local gradient (e.g. board edge, or exactly at the target's
+            # cell) -- nothing to smooth toward, and stale history would
+            # just leak a previous direction into a state that has none.
+            return (0.0, 0.0)
+        if state.smoothed_descent_dir is None:
+            smoothed = (raw_gdx, raw_gdy)
+        else:
+            ema = 0.7
+            pgdx, pgdy = state.smoothed_descent_dir
+            sgdx = ema * pgdx + (1.0 - ema) * raw_gdx
+            sgdy = ema * pgdy + (1.0 - ema) * raw_gdy
+            norm = math.hypot(sgdx, sgdy)
+            smoothed = (sgdx / norm, sgdy / norm) if norm > 1e-6 else (raw_gdx, raw_gdy)
+        state.smoothed_descent_dir = smoothed
+        return smoothed
+
+    def _bearing_vector(
+        self, gdx: float, gdy: float, dir_idx: int, x: float, y: float, target_x: float, target_y: float
     ) -> Tuple[float, float]:
         """dir_idx=0 means 'toward the target' (or around whatever the
         geodesic field says is in the way, when one exists) -- the same free
@@ -381,9 +450,13 @@ class PCBRouterEnv(gym.Env):
         relearned from image content each time. This makes it stationary.
 
         dir_idx counts 45-degree steps around from there, covering the same
-        full circle DIR_VECTORS did.
+        full circle DIR_VECTORS did. Takes an already-resolved descent
+        direction (gdx, gdy) -- see _smoothed_descent_dir -- rather than
+        computing it fresh, so callers needing this net's direction more
+        than once per step (action selection AND heading-alignment reward)
+        stay consistent with each other instead of each smoothing
+        independently.
         """
-        gdx, gdy = self._geo_descent_dir(geodesic_cache, x, y) if geodesic_cache is not None else (0.0, 0.0)
         if gdx == 0.0 and gdy == 0.0:
             gdx, gdy = target_x - x, target_y - y
             norm = math.hypot(gdx, gdy)
@@ -437,7 +510,11 @@ class PCBRouterEnv(gym.Env):
         step_dist = DIST_STEPS[dist_idx]
 
         prev_x, prev_y, prev_layer = state.head_x, state.head_y, state.head_layer
-        dir_x, dir_y = self._relative_direction_vector(state.geodesic_cache, dir_idx, prev_x, prev_y, target.x, target.y)
+        # Smoothed once here, reused below for heading_alignment too, so
+        # action selection and its own reward term agree on "which way is
+        # forward" this step -- see _smoothed_descent_dir.
+        smoothed_gdx, smoothed_gdy = self._smoothed_descent_dir(state, prev_x, prev_y)
+        dir_x, dir_y = self._bearing_vector(smoothed_gdx, smoothed_gdy, dir_idx, prev_x, prev_y, target.x, target.y)
         # Obstacle-aware cost-to-go, not straight-line -- a straight-line
         # potential pays off walking INTO whatever is in the way right up
         # until the collision fires. See compute_geodesic_distance_field.
@@ -526,13 +603,16 @@ class PCBRouterEnv(gym.Env):
         is_bend = (state.head_prev_dir is not None) and (state.head_prev_dir != dir_idx)
         state.head_prev_dir = dir_idx
 
-        # Heading alignment against the field's descent direction, not the
-        # straight bearing to the pad -- this is what actually rewards
-        # circling an obstacle instead of pushing into it. Falls back to the
-        # straight bearing only where the field has no local gradient (e.g.
-        # against the board edge).
+        # Heading alignment against the field's (smoothed) descent
+        # direction, not the straight bearing to the pad -- this is what
+        # actually rewards circling an obstacle instead of pushing into it.
+        # Reuses this step's already-computed smoothed_gdx/gdy (see above)
+        # rather than recomputing raw, so the reward judges the SAME
+        # direction the action was actually chosen relative to. Falls back
+        # to the straight bearing only where the field has no local
+        # gradient (e.g. against the board edge).
         act_norm = math.hypot(dir_x, dir_y)
-        gdx, gdy = self._geo_descent_dir(state.geodesic_cache, prev_x, prev_y)
+        gdx, gdy = smoothed_gdx, smoothed_gdy
         if act_norm > 1e-4 and (abs(gdx) > 1e-6 or abs(gdy) > 1e-6):
             heading_alignment = float((gdx * dir_x + gdy * dir_y) / act_norm)
         else:
@@ -715,7 +795,7 @@ class PCBRouterEnv(gym.Env):
         _geo_descent_dir), which wobbles even along what should be a
         straight run, AND dir_idx is an offset from that continuously
         varying bearing (not one of a fixed set of compass directions -- see
-        _relative_direction_vector), so raw step deltas are essentially
+        _bearing_vector), so raw step deltas are essentially
         never exactly axis/diagonal-aligned. This does not touch the copper
         grid, reward, or any training-facing state -- it's a pure post-hoc
         geometry cleanup, the same separation real grid autorouters draw

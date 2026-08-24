@@ -78,7 +78,7 @@ class PCBRouterNet(nn.Module):
 
         # Bias the dir_idx == 0 actions ("toward the target", or around
         # whatever the geodesic field says is in the way -- see
-        # PCBRouterEnv._relative_direction_vector) higher at init. This is
+        # PCBRouterEnv._bearing_vector) higher at init. This is
         # the discrete analogue of line_route_env.py's continuous
         # mean-zero-action trick: instead of an untrained policy sampling
         # uniformly over 8 board-pose-dependent directions, it starts

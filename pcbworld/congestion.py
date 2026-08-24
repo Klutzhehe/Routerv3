@@ -17,6 +17,30 @@ _ORTHO = 1.0
 _DIAG = float(np.sqrt(2.0))
 
 
+def _bilinear_upsample(coarse: np.ndarray, out_h: int, out_w: int, downsample_factor: int) -> np.ndarray:
+    """Smoothly upsample a coarse grid to (out_h, out_w), instead of
+    np.repeat's block-nearest-neighbor (every downsample_factor x
+    downsample_factor block sharing one identical value). The env reads this
+    field's local GRADIENT every step to steer (_geo_descent_dir) -- a
+    blocky field's gradient is flat within a block and jumps at block
+    boundaries, which is a real, measured source of the "should be a
+    straight line but wobbles" artifact, independent of anything the policy
+    has or hasn't learned. Bilinear interpolation makes the field, and so
+    its gradient, continuous instead."""
+    ds_h, ds_w = coarse.shape
+    ys = np.clip((np.arange(out_h) + 0.5) / downsample_factor - 0.5, 0, ds_h - 1)
+    xs = np.clip((np.arange(out_w) + 0.5) / downsample_factor - 0.5, 0, ds_w - 1)
+    y0 = np.floor(ys).astype(np.int32)
+    x0 = np.floor(xs).astype(np.int32)
+    y1 = np.clip(y0 + 1, 0, ds_h - 1)
+    x1 = np.clip(x0 + 1, 0, ds_w - 1)
+    wy = (ys - y0)[:, None]
+    wx = (xs - x0)[None, :]
+    top = coarse[y0][:, x0] * (1 - wx) + coarse[y0][:, x1] * wx
+    bot = coarse[y1][:, x0] * (1 - wx) + coarse[y1][:, x1] * wx
+    return (top * (1 - wy) + bot * wy).astype(np.float32)
+
+
 def compute_net_demand_heatmap(
     grid_size: int,
     unrouted_nets: list,
@@ -156,8 +180,7 @@ def compute_geodesic_distance_field(
         yy, xx = np.mgrid[0:ds_size, 0:ds_size]
         dist[unreached] = np.hypot(xx - tx, yy - ty)[unreached]
 
-    full = np.repeat(np.repeat(dist, downsample_factor, axis=0), downsample_factor, axis=1)
-    full = full[:grid_size, :grid_size] * downsample_factor
+    full = _bilinear_upsample(dist, grid_size, grid_size, downsample_factor) * downsample_factor
     return full.astype(np.float32)
 
 
