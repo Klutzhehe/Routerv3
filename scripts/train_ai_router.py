@@ -53,6 +53,7 @@ def main():
     parser.add_argument("--target-steps-per-net", type=float, default=None, help="If set, --timesteps becomes a safety cap instead of the stopping rule: training keeps going (up to that cap) until the rolling average Steps/net for SUCCESSFUL nets drops to this value or below, at --target-success-rate or higher. Use this to train for efficiency, not just completion.")
     parser.add_argument("--target-success-rate", type=float, default=0.95, help="Success rate required (in addition to --target-steps-per-net) before training is allowed to stop early. Ignored unless --target-steps-per-net is set.")
     parser.add_argument("--checkpoint-dir", type=str, default="/content/drive/MyDrive/pcb_ai_router/checkpoints", help="Directory to save model checkpoints")
+    parser.add_argument("--eval-seed-offset", type=int, default=9000, help="First board seed of the num_eval_episodes-sized block used for the post-training/--eval-only benchmark. Every stage-2 result so far has been measured against the default (9000-9049) -- pass a different offset (e.g. 20000) to check generalization against boards that specific block was never explicitly re-tuned against.")
     parser.add_argument("--eval-only", action="store_true", help="Run evaluation only")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint for evaluation")
     args = parser.parse_args()
@@ -69,7 +70,7 @@ def main():
             chk = torch.load(args.checkpoint, map_location=device_str, weights_only=False)
             model.load_state_dict(chk["model_state_dict"])
         model.to(device_str)
-        evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, device=device_str, **stage_cfg)
+        evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, eval_seed_offset=args.eval_seed_offset, device=device_str, **stage_cfg)
         return
 
     print("=" * 80)
@@ -91,7 +92,7 @@ def main():
     )
 
     print("\nRunning post-training benchmark evaluation...")
-    evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, device=device_str, **stage_cfg)
+    evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, eval_seed_offset=args.eval_seed_offset, device=device_str, **stage_cfg)
 
 
 if __name__ == "__main__":

@@ -27,9 +27,19 @@ def evaluate_policy(
     enable_layer_via: bool = True,
     max_steps_per_net: int = 120,
     max_net_restarts: int = 0,
+    eval_seed_offset: int = 9000,
     device: str = "cpu",
 ) -> Dict[str, Any]:
-    """Run deterministic evaluation of policy over test boards."""
+    """Run deterministic evaluation of policy over test boards.
+
+    eval_seed_offset picks WHICH num_eval_episodes-sized block of board
+    seeds to test on. The default (9000) is the block every prior stage-2
+    result in this project's history has been measured against -- a policy
+    scoring well there has been checked against those specific boards, not
+    against boards in general. Passing a different offset (e.g. 20000) is
+    the cheap way to ask "does this generalize, or did it just get good at
+    the 50 boards we keep testing on."
+    """
     model.eval()
     dev = torch.device(device)
 
@@ -52,7 +62,7 @@ def evaluate_policy(
     failed_seeds: List[int] = []
 
     for ep in range(num_eval_episodes):
-        seed = 9000 + ep
+        seed = eval_seed_offset + ep
         obs_np, info = env.reset(seed=seed)
         done = False
 
@@ -97,6 +107,7 @@ def evaluate_policy(
     print("=" * 70)
     print("                    AI PCB ROUTER EVALUATION REPORT")
     print("=" * 70)
+    print(f"Board Seeds:                  {eval_seed_offset}-{eval_seed_offset + num_eval_episodes - 1}")
     print(f"Total Boards Evaluated:       {num_eval_episodes}")
     print(f"Total Nets Evaluated:         {total_nets}")
     print(f"Completion Rate:              {completion_rate:.2f}% ({completed_nets}/{total_nets} nets)")
