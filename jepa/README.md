@@ -137,7 +137,38 @@ Live options, not yet decided:
      out, delete `jepa/` and stay on the proven, working `--lookahead` path,
      moving on to stage 3 instead.
 
-- [ ] Decide between the above before writing more code.
+**Decision: option 2, the per-token redesign.** Before rewriting the whole
+data pipeline around it, `probe_token_features.py` validates the hypothesis
+cheaply first (same discipline as every other check above) -- rather than
+store all 256 patch tokens (256x the pooled vector's storage, and a much
+bigger predictor input than needed), it extracts just the ONE token whose
+16x16-downsampled patch covers the head's current position, and the one
+covering the target pad's position (both known exactly at collection time,
+no learning needed to find them), and runs the same ridge/MLP probe against
+`pooled` (control), `head_token`, `target_token`, and `head_token +
+target_token` concatenated.
+
+**Smoke test result (random-init checkpoint, 277 timesteps -- mechanical
+sanity check only, not the real verdict)**: `head_token` alone crushed the
+baseline via ridge regression (0.0308 vs baseline 0.1408) -- even with
+UNTRAINED weights. This makes mechanistic sense: the geodesic distance field
+is already one of the 10 input CHANNELS (Channel 7), so the patch centered
+on the head's own position has near-direct local access to the distance-to-
+go value baked into the raw pixel input at that exact spot, independent of
+training. `target_token` alone did not help (expected -- target position
+alone can't determine distance without also knowing where the head is,
+which is a different image region entirely). Strong signal the redesign
+direction is mechanically sound; real validation still needs the actual
+trained checkpoint and real-scale data.
+
+- [ ] Run `probe_token_features.py` against the real v7 checkpoint (fresh
+      short rollouts, not the existing shards -- this needs per-token
+      features that were never logged before) and confirm `head_token` (or
+      `head_token + target_token`) clearly beats the pooled control on real
+      data, not just this smoke test.
+- [ ] If confirmed: rewrite `collect_transitions.py` to log `head_token`/
+      `target_token` (not the pooled `global_latent`) and rebuild
+      `dynamics_model.py`/`train_dynamics.py` around that representation.
 - [ ] Fast action-selector (`jepa_lookahead_select_action`) -- **not built
       yet, deliberately**. Building a selector against an unvalidated
       predictor would mean debugging two unknowns (does the predictor work?
