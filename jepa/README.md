@@ -20,46 +20,64 @@ path (100% on the full benchmark, just slow) is exactly as it was.
       init, tiny synthetic run, not a real training result).
 - [x] Real data collection run: 1000 episodes, seeds 100000-100999, stage 2,
       v7 checkpoint -- 26,070 transitions (997/1000 completed).
-- [x] First real training run (50 epochs, same data) -- diagnosed a real
-      issue, described below, not yet re-validated after the fix.
+- [x] First real training run (50 epochs, same data) -- diagnosed a
+      flatlined auxiliary loss, described below.
+- [x] Applied an input-normalization fix (LayerNorm + learnable
+      `delta_scale`) and re-ran -- **the fix did not work**. `aux dist MAE`
+      was bit-for-bit unchanged (still tied to the mean baseline), and
+      action-vs-state sensitivity actually got worse. Scale mismatch was not
+      the (sole) bottleneck. Kept in the codebase since it's harmless and
+      may still matter once the real issue is fixed, but it did not resolve
+      this on its own.
+- [x] Built `probe_distance_from_embedding.py` to isolate the real question
+      (see below) -- mechanically smoke-tested, not yet run against real
+      data.
 
-### Known issue (found in the first real run, fixed, not yet re-validated)
+### Known issue: the auxiliary distance anchor isn't learning anything
 
-The first real 50-epoch run showed `pred_loss` collapsing to ~0.0000 by
-epoch 2-3 while `aux dist MAE` stayed flat at ~0.123-0.127 for all 50
-epochs -- statistically indistinguishable from the "predict the dataset
-mean" baseline (0.1237) the entire time. No outright representational
-collapse (`z_hat_std` stayed non-zero, action-vs-state sensitivity ratio
-stayed ~0.8-1.07), but this is still the hollow-victory failure mode
-section 4 above exists to catch: the predictor satisfied the cosine
-predictive loss almost for free (one router step barely moves the state, so
-`delta -> 0` -- "predict no change" -- nearly solves it without learning
-anything about the action), and the auxiliary anchor that was supposed to
-catch that wasn't extracting any real signal either.
+Two full real 50-epoch runs (before and after the input-normalization fix)
+both showed the same pattern: `pred_loss` collapses to ~0.0000 by epoch 2-3
+(consistent with the predictor finding the trivial "predict no change"
+solution to the cosine loss, since one router step barely moves the real
+state -- normalize()'d cosine similarity doesn't care about scale, so the
+LayerNorm fix was never going to touch this half), while `aux dist MAE`
+stays flat at ~0.123-0.127 the ENTIRE time, statistically indistinguishable
+from "predict the dataset mean" (0.1237) in both runs. No outright
+representational collapse in the classic sense (`z_hat_std` non-zero,
+action-vs-state sensitivity non-zero) -- but this is still exactly the
+hollow-victory failure mode section 4 exists to catch: the main loss looks
+solved while the auxiliary anchor that's supposed to verify real learning
+is happening extracts nothing.
 
-Root cause: the frozen encoder's `global_latent` (mean-pooled over 256
-post-LayerNorm patch tokens) turned out to have surprisingly small scale
-across the dataset (~0.01-0.02 std) -- averaging many roughly-independent
-unit-scale token vectors shrinks the aggregate. `DynamicsPredictor` and
-`DistanceHead` were plain `nn.Linear` stacks with PyTorch's default init,
-which implicitly assumes ~unit-scale input -- the same class of bug this
-repo already hit once before in `models/router_policy.py`'s policy head
-(the `gain=0.01` vs `0.1` story). Compounding it: `ActionEncoder`'s
-freshly-initialized embeddings sit at the default ~unit scale, ~70x larger
-than `z_t` -- concatenated together, the action channel likely dominated
-the predictor's first layer.
+Importantly, `dist_next` clearly correlates strongly with `dist_t` in the
+real data (the "no-change" baseline -- predict `dist_next = dist_t` using
+the REAL known current distance, not a decoded one -- gets MAE 0.0173, ~7x
+better than the mean baseline). So there IS plenty of real signal in the
+target; the model just isn't extracting any of it from the embedding.
 
-Fix applied (`dynamics_model.py`): both modules now `LayerNorm`-normalize
-their input before their MLPs; `DynamicsPredictor` additionally applies a
-learnable `delta_scale` (initialized small) so the residual itself starts
-close to `z_t`'s own natural scale rather than being swamped by an
-internally-normalized (~unit-scale) delta from the first step of training.
-This does NOT require re-collecting data -- only re-running
-`train_dynamics.py` on the existing shards. **Not yet re-validated against
-a real run** -- next step is exactly that.
+Working hypothesis now: `PCBRouterNet`'s policy/value heads were CO-TRAINED
+with the encoder end-to-end over thousands of PPO updates, so whatever form
+the encoder represents distance-relevant information in only has to be
+usable by heads trained jointly with it. There's no guarantee that same
+representation is easily decodable by a FRESH head trained in isolation for
+a few dozen epochs on ~20k examples -- especially since mean-pooling over
+256 patch tokens could dilute inherently local/spatial facts (where's the
+head, where's the target) that a global average doesn't obviously preserve.
 
-- [ ] Real training run + collapse diagnostic actually checked against real
-      data, WITH the input-normalization fix above.
+`probe_distance_from_embedding.py` tests this directly and in isolation:
+given `z_t` alone (no predictor, no action, no "predict the NEXT state"),
+can (a) a closed-form ridge linear regression, or (b) a small MLP, decode
+`dist_t` (the CURRENT, already-known distance at that same timestep) at all?
+If NEITHER beats the naive mean baseline, that's strong evidence the issue
+is the embedding space itself, not the predictor architecture -- pointing at
+switching the auxiliary anchor to match the ALREADY-TRAINED `value_head`'s
+output instead (co-trained with this exact encoder, so proven decodable
+from it) rather than a from-scratch geodesic-distance regression. If either
+probe DOES beat the baseline, the problem is specific to the predictor/
+`z_hat` pathway and needs a different fix there.
+
+- [ ] Run `probe_distance_from_embedding.py` against the real collected data
+      and read the verdict.
 - [ ] Fast action-selector (`jepa_lookahead_select_action`) -- **not built
       yet, deliberately**. Building a selector against an unvalidated
       predictor would mean debugging two unknowns (does the predictor work?
