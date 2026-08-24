@@ -16,6 +16,7 @@ import torch
 
 from pcbworld.environment import PCBRouterEnv
 from models.router_policy import PCBRouterNet, select_deterministic_action, lookahead_select_action
+from models.fast_lookahead import FastDistancePredictor, fast_lookahead_select_action
 
 
 def evaluate_policy(
@@ -33,6 +34,9 @@ def evaluate_policy(
     use_lookahead: bool = False,
     lookahead_top_k: int = 4,
     lookahead_horizon: int = 4,
+    use_fast_lookahead: bool = False,
+    fast_lookahead_predictor: "FastDistancePredictor | None" = None,
+    fast_lookahead_top_k: int = 4,
 ) -> Dict[str, Any]:
     """Run deterministic evaluation of policy over test boards.
 
@@ -53,6 +57,13 @@ def evaluate_policy(
     step (~lookahead_top_k*lookahead_horizon extra env steps and forward
     passes per real decision) -- expect a full 1000-board sweep to take
     noticeably longer than the plain-argmax version.
+
+    use_fast_lookahead swaps in fast_lookahead_select_action instead (see
+    models/fast_lookahead.py) -- a small trained MLP predicts each candidate
+    action's future distance-to-target instead of simulating it, so this
+    should run close to plain-argmax speed. Not proven as reliable as
+    use_lookahead yet; requires fast_lookahead_predictor. Mutually exclusive
+    with use_lookahead (the caller picks one).
     """
     model.eval()
     dev = torch.device(device)
@@ -102,6 +113,11 @@ def evaluate_policy(
                 action = lookahead_select_action(
                     model, env, obs_np, device, forbidden,
                     top_k=lookahead_top_k, horizon=lookahead_horizon,
+                )
+            elif use_fast_lookahead:
+                action = fast_lookahead_select_action(
+                    model, fast_lookahead_predictor, env, obs_np, device, forbidden,
+                    top_k=fast_lookahead_top_k,
                 )
             else:
                 obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=dev).unsqueeze(0)

@@ -20,6 +20,7 @@ from training.train import train_single_net_policy
 from training.evaluation import evaluate_policy
 from pcbworld.environment import PCBRouterEnv
 from models.router_policy import PCBRouterNet
+from models.fast_lookahead import FastDistancePredictor
 
 # One new axis of difficulty per stage. enable_layer_via stays False through
 # stage 3 -- board_generator.py sets tgt_layer = src_layer for these stages,
@@ -44,6 +45,24 @@ def action_dim_for_stage(stage_cfg: dict) -> int:
     return 96 if stage_cfg["enable_layer_via"] else 24
 
 
+def _load_fast_lookahead_predictor(checkpoint_path: str, device_str: str) -> FastDistancePredictor:
+    """Loads a FastDistancePredictor (models/fast_lookahead.py) checkpoint
+    saved by scripts/train_fast_lookahead.py. Architecture args come from
+    the checkpoint's own saved metadata, not re-derived from --stage, so a
+    predictor trained with e.g. --no-target-token still loads correctly."""
+    chk = torch.load(checkpoint_path, map_location=device_str, weights_only=False)
+    predictor = FastDistancePredictor(
+        d_model=chk.get("d_model", 256),
+        action_dim=chk["action_dim"],
+        use_target_token=chk.get("use_target_token", True),
+        hidden_dim=chk.get("hidden_dim", 128),
+    )
+    predictor.load_state_dict(chk["model_state_dict"])
+    predictor.to(device_str)
+    predictor.eval()
+    return predictor
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train AI PCB Router Platform (PCBRouterNet)")
     parser.add_argument("--timesteps", type=int, default=30_000, help="Total training steps")
@@ -65,12 +84,23 @@ def main():
     parser.add_argument("--lookahead", action="store_true", help="Use lookahead_select_action instead of plain deterministic argmax for the eval/benchmark run -- see models/router_policy.py. Confirmed on individual seeds to resolve oscillation-loop failures a plain argmax cannot escape; this is how to check whether that holds at benchmark scale. Materially slower per step.")
     parser.add_argument("--lookahead-top-k", type=int, default=4, help="How many of the policy's top candidate actions to simulate forward under --lookahead.")
     parser.add_argument("--lookahead-horizon", type=int, default=4, help="How many steps to simulate forward per candidate under --lookahead.")
+    parser.add_argument("--fast-lookahead", action="store_true", help="Use fast_lookahead_select_action instead of plain deterministic argmax -- see models/fast_lookahead.py. A small trained MLP predicts each candidate action's future distance-to-target from the already-computed encoder output, instead of simulating it via real environment steps like --lookahead does. Dramatically cheaper (no env copies, no repeated full-network passes) but not yet proven as reliable as --lookahead -- validate against known hard seeds and the full benchmark before trusting it as the default. Requires --fast-lookahead-checkpoint. Mutually exclusive with --lookahead.")
+    parser.add_argument("--fast-lookahead-checkpoint", type=str, default=None, help="Path to a FastDistancePredictor checkpoint saved by scripts/train_fast_lookahead.py.")
+    parser.add_argument("--fast-lookahead-top-k", type=int, default=4, help="How many of the policy's top candidate actions to score under --fast-lookahead.")
     args = parser.parse_args()
+    if args.lookahead and args.fast_lookahead:
+        raise SystemExit("--lookahead and --fast-lookahead are incompatible -- pick one action selector.")
+    if args.fast_lookahead and not args.fast_lookahead_checkpoint:
+        raise SystemExit("--fast-lookahead requires --fast-lookahead-checkpoint")
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
 
     stage_cfg = STAGE_CONFIG[args.stage]
     action_dim = action_dim_for_stage(stage_cfg)
+
+    fast_lookahead_predictor = None
+    if args.fast_lookahead:
+        fast_lookahead_predictor = _load_fast_lookahead_predictor(args.fast_lookahead_checkpoint, device_str)
 
     if args.eval_only:
         print(f"Loading checkpoint from: {args.checkpoint}")
@@ -79,7 +109,7 @@ def main():
             chk = torch.load(args.checkpoint, map_location=device_str, weights_only=False)
             model.load_state_dict(chk["model_state_dict"])
         model.to(device_str)
-        evaluate_policy(model, num_eval_episodes=args.num_eval_episodes, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, use_lookahead=args.lookahead, lookahead_top_k=args.lookahead_top_k, lookahead_horizon=args.lookahead_horizon, **stage_cfg)
+        evaluate_policy(model, num_eval_episodes=args.num_eval_episodes, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, use_lookahead=args.lookahead, lookahead_top_k=args.lookahead_top_k, lookahead_horizon=args.lookahead_horizon, use_fast_lookahead=args.fast_lookahead, fast_lookahead_predictor=fast_lookahead_predictor, fast_lookahead_top_k=args.fast_lookahead_top_k, **stage_cfg)
         return
 
     print("=" * 80)
@@ -106,7 +136,7 @@ def main():
     )
 
     print("\nRunning post-training benchmark evaluation...")
-    evaluate_policy(model, num_eval_episodes=args.num_eval_episodes, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, use_lookahead=args.lookahead, lookahead_top_k=args.lookahead_top_k, lookahead_horizon=args.lookahead_horizon, **stage_cfg)
+    evaluate_policy(model, num_eval_episodes=args.num_eval_episodes, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, use_lookahead=args.lookahead, lookahead_top_k=args.lookahead_top_k, lookahead_horizon=args.lookahead_horizon, use_fast_lookahead=args.fast_lookahead, fast_lookahead_predictor=fast_lookahead_predictor, fast_lookahead_top_k=args.fast_lookahead_top_k, **stage_cfg)
 
 
 if __name__ == "__main__":

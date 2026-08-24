@@ -24,7 +24,8 @@ import torch
 from pcbworld.environment import PCBRouterEnv
 from pcbworld.renderer import render_grid_board
 from models.router_policy import PCBRouterNet, select_deterministic_action, lookahead_select_action
-from scripts.train_ai_router import STAGE_CONFIG, action_dim_for_stage
+from models.fast_lookahead import fast_lookahead_select_action
+from scripts.train_ai_router import STAGE_CONFIG, action_dim_for_stage, _load_fast_lookahead_predictor
 
 
 def main():
@@ -42,9 +43,18 @@ def main():
     parser.add_argument("--lookahead", action="store_true", help="Use lookahead_select_action instead of plain deterministic argmax: simulates --lookahead-horizon steps ahead for the top --lookahead-top-k candidate actions (continuing greedily with the same policy) and commits to whichever gets closest to the target, instead of the single best immediate action. Meant for targeted investigation of boards where the plain policy gets stuck oscillating -- materially slower per step, not for bulk benchmarking. Incompatible with --stochastic.")
     parser.add_argument("--lookahead-top-k", type=int, default=4, help="How many of the policy's top candidate actions to simulate forward under --lookahead.")
     parser.add_argument("--lookahead-horizon", type=int, default=4, help="How many steps to simulate forward per candidate under --lookahead.")
+    parser.add_argument("--fast-lookahead", action="store_true", help="Use fast_lookahead_select_action instead of plain deterministic argmax -- see models/fast_lookahead.py. Scores each candidate action with a small trained MLP against the already-computed encoder output instead of --lookahead's real simulation. Requires --fast-lookahead-checkpoint. Incompatible with --stochastic and --lookahead.")
+    parser.add_argument("--fast-lookahead-checkpoint", type=str, default=None, help="Path to a FastDistancePredictor checkpoint saved by scripts/train_fast_lookahead.py.")
+    parser.add_argument("--fast-lookahead-top-k", type=int, default=4, help="How many of the policy's top candidate actions to score under --fast-lookahead.")
     args = parser.parse_args()
     if args.lookahead and args.stochastic:
         raise SystemExit("--lookahead and --stochastic are incompatible -- lookahead is a deterministic search over the policy's own distribution.")
+    if args.fast_lookahead and args.stochastic:
+        raise SystemExit("--fast-lookahead and --stochastic are incompatible -- fast-lookahead is a deterministic search over the policy's own distribution.")
+    if args.fast_lookahead and args.lookahead:
+        raise SystemExit("--fast-lookahead and --lookahead are incompatible -- pick one action selector.")
+    if args.fast_lookahead and not args.fast_lookahead_checkpoint:
+        raise SystemExit("--fast-lookahead requires --fast-lookahead-checkpoint")
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     stage_cfg = STAGE_CONFIG[args.stage]
@@ -55,6 +65,10 @@ def main():
     model.load_state_dict(chk["model_state_dict"])
     model.to(device_str)
     model.eval()
+
+    fast_lookahead_predictor = None
+    if args.fast_lookahead:
+        fast_lookahead_predictor = _load_fast_lookahead_predictor(args.fast_lookahead_checkpoint, device_str)
 
     env = PCBRouterEnv(
         grid_size=256,
@@ -88,6 +102,11 @@ def main():
             action = lookahead_select_action(
                 model, env, obs_np, device_str, forbidden,
                 top_k=args.lookahead_top_k, horizon=args.lookahead_horizon,
+            )
+        elif args.fast_lookahead:
+            action = fast_lookahead_select_action(
+                model, fast_lookahead_predictor, env, obs_np, device_str, forbidden,
+                top_k=args.fast_lookahead_top_k,
             )
         else:
             with torch.no_grad():
