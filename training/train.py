@@ -120,6 +120,13 @@ def train_single_net_policy(
     # flatten this into max_steps_per_net regardless of how the policy is
     # actually doing.
     steps_to_complete_window: List[float] = []
+    # Whether restart-on-jam is even firing -- select_deterministic_action's
+    # retry-avoidance alone may resolve most jams before
+    # max_consecutive_collisions triggers a restart, in which case the
+    # dead-zone signal (see environment.py's _net_dead_zones) never gets
+    # exercised during training regardless of how many steps are spent.
+    restarts_window: List[int] = []
+    total_restarts_seen = 0
     curr_ep_reward = 0.0
     global_step = 0
     start_time = time.time()
@@ -185,6 +192,12 @@ def train_single_net_policy(
                     steps_to_complete_window.append(float(step_info.get("total_steps", 0)))
                     if len(steps_to_complete_window) > 40:
                         steps_to_complete_window.pop(0)
+
+                ep_restarts = step_info.get("total_restarts", 0)
+                total_restarts_seen += ep_restarts
+                restarts_window.append(ep_restarts)
+                if len(restarts_window) > 40:
+                    restarts_window.pop(0)
 
                 # Progressive Distance Curriculum, gated on measured success
                 dist_curriculum_window.append(is_comp)
@@ -290,11 +303,16 @@ def train_single_net_policy(
         # Print live stream
         progress_pct = (global_step / total_timesteps) * 100.0
         steps_to_complete_str = f"{avg_steps_to_complete:5.1f}" if steps_to_complete_window else "  n/a"
+        restarts_str = ""
+        if max_net_restarts > 0:
+            avg_restarts = float(np.mean(restarts_window)) if restarts_window else 0.0
+            restarts_str = f"Restarts: {avg_restarts:.2f}/ep (total {total_restarts_seen}) | "
         status_line = (
             f"[{progress_pct:5.1f}%] Step {global_step:>6d}/{total_timesteps} | "
             f"Success: {avg_comp:5.1f}% | "
             f"Reward: {avg_rew:6.1f} | "
             f"Steps/net: {steps_to_complete_str} | "
+            f"{restarts_str}"
             f"Ent: {current_ent_coef:.4f} | "
             f"Loss: [π={p_loss:6.3f}, V={v_loss:6.3f}] | "
             f"Speed: {fps:>4d} steps/s"

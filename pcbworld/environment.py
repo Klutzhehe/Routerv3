@@ -124,6 +124,7 @@ class PCBRouterEnv(gym.Env):
         self.net_restart_count: int = 0
         self._net_dead_zones: set = set()
         self.total_steps: int = 0
+        self.total_restarts_this_episode: int = 0
         self.completed_nets: List[int] = []
         self.failed_nets: List[int] = []
 
@@ -188,6 +189,12 @@ class PCBRouterEnv(gym.Env):
         self.wirelength_per_net = {net.net_id: 0.0 for net in self.board.nets}
         self.vias_per_net = {net.net_id: 0 for net in self.board.nets}
         self.total_steps = 0
+        # Episode-lifetime count, unlike net_restart_count which resets per
+        # net -- lets a caller (train.py) see whether restarts are firing at
+        # all, since select_deterministic_action's retry-avoidance alone
+        # may resolve most jams before max_consecutive_collisions triggers
+        # one.
+        self.total_restarts_this_episode = 0
 
         self._init_current_net()
         self._precompute_static_caches()
@@ -233,6 +240,7 @@ class PCBRouterEnv(gym.Env):
         attempt saw there.
         """
         active_net = self.board.nets[self.current_net_idx]
+        self.total_restarts_this_episode += 1
         self._net_dead_zones.add((self.head_x, self.head_y))
         if self._last_rejected_pos is not None:
             self._net_dead_zones.add(self._last_rejected_pos)
@@ -669,4 +677,5 @@ class PCBRouterEnv(gym.Env):
             "vias": sum(self.vias_per_net.values()),
             "total_wirelength": sum(self.wirelength_per_net.values()),
             "total_steps": self.total_steps,
+            "total_restarts": self.total_restarts_this_episode,
         }
