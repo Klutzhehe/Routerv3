@@ -49,9 +49,11 @@ def evaluate_policy(
     straight_line_dist = 0.0
     total_vias = 0
     total_collisions = 0
+    failed_seeds: List[int] = []
 
     for ep in range(num_eval_episodes):
-        obs_np, info = env.reset(seed=9000 + ep)
+        seed = 9000 + ep
+        obs_np, info = env.reset(seed=seed)
         done = False
 
         # Compute straight line reference
@@ -87,6 +89,7 @@ def evaluate_policy(
         total_wirelength += step_info.get("total_wirelength", 0.0)
         if step_info.get("failed_nets", 0) > 0:
             total_collisions += 1
+            failed_seeds.append(seed)
 
     completion_rate = (completed_nets / max(1, total_nets)) * 100.0
     wl_ratio = (total_wirelength / max(1e-3, straight_line_dist)) if straight_line_dist > 0 else 1.0
@@ -100,6 +103,9 @@ def evaluate_policy(
     print(f"Wirelength Ratio:             {wl_ratio:.2f}x (actual / straight-line)")
     print(f"Total Vias Used:              {total_vias}")
     print(f"Collision / Failure Rate:     {(total_collisions / num_eval_episodes) * 100.0:.2f}%")
+    if failed_seeds:
+        print(f"Failed Board Seeds:           {failed_seeds}")
+        print(f"  -> inspect with: python scripts/render_episode.py --seed {failed_seeds[0]} --checkpoint <path> --stage <N>")
     print("=" * 70)
 
     return {
@@ -108,4 +114,5 @@ def evaluate_policy(
         "total_vias": total_vias,
         "completed_nets": completed_nets,
         "total_nets": total_nets,
+        "failed_seeds": failed_seeds,
     }
