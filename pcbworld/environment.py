@@ -416,6 +416,18 @@ class PCBRouterEnv(gym.Env):
         actually in the way. The reactive collision/retry path is what
         actually guarantees safety regardless of how this is tuned; this
         only shapes which direction gets tried at dir_idx=0.
+
+        Tapered to zero near the target, regardless of that 0.7 -- fixed
+        damping is a pursuit-curve lag problem right at the target: a
+        single step can be longer than the remaining distance, so the true
+        bearing needs to swing hard and fast on the final approach, and a
+        head still smoothing overshoots, then has to swing back around.
+        Measured directly: a head that closed to within 7 cells (inside
+        snap_radius) swung back out past 18 and orbited the target twice
+        instead of connecting -- the exact shape of too much filter lag in
+        a closed-loop pursuit. max(DIST_STEPS) is the natural scale for
+        where that risk starts: inside a few step-lengths of the target,
+        smoothing has no business slowing down the turn.
         """
         raw_gdx, raw_gdy = self._geo_descent_dir(state.geodesic_cache, x, y)
         if raw_gdx == 0.0 and raw_gdy == 0.0:
@@ -426,7 +438,9 @@ class PCBRouterEnv(gym.Env):
         if state.smoothed_descent_dir is None:
             smoothed = (raw_gdx, raw_gdy)
         else:
-            ema = 0.7
+            near_target_radius = float(max(DIST_STEPS)) * 3.0
+            dist_to_target = self._geo_dist_at(state.geodesic_cache, x, y)
+            ema = 0.7 * min(1.0, dist_to_target / near_target_radius)
             pgdx, pgdy = state.smoothed_descent_dir
             sgdx = ema * pgdx + (1.0 - ema) * raw_gdx
             sgdy = ema * pgdy + (1.0 - ema) * raw_gdy
