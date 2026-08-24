@@ -56,6 +56,7 @@ def train_single_net_policy(
     checkpoint_dir: str = "/content/drive/MyDrive/pcb_ai_router/checkpoints",
     device_str: Optional[str] = None,
     plot_interval: int = 1024,
+    init_checkpoint: Optional[str] = None,
 ) -> PCBRouterNet:
     """Train a routing agent (Milestone 1 target: >95% routing success on stage 1).
 
@@ -89,6 +90,13 @@ def train_single_net_policy(
     # 2. Instantiate Model & Optimizer
     action_dim = 96 if enable_layer_via else 24
     model = PCBRouterNet(in_channels=10, action_dim=action_dim, d_model=256, num_transformer_layers=2, num_heads=4).to(device)
+    if init_checkpoint:
+        print(f"   Resuming weights from: {init_checkpoint}")
+        chk = torch.load(init_checkpoint, map_location=device_str, weights_only=False)
+        model.load_state_dict(chk["model_state_dict"])
+    # Fresh optimizer even when resuming -- this is a fine-tune (new
+    # env config, e.g. restarts newly enabled) not a literal continuation,
+    # and stale Adam momentum from the old objective would fight the new one.
     optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
 
     buffer = RolloutBuffer(

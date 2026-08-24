@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--eval-seed-offset", type=int, default=9000, help="First board seed of the num_eval_episodes-sized block used for the post-training/--eval-only benchmark. Every stage-2 result so far has been measured against the default (9000-9049) -- pass a different offset (e.g. 20000) to check generalization against boards that specific block was never explicitly re-tuned against.")
     parser.add_argument("--eval-only", action="store_true", help="Run evaluation only")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint for evaluation")
+    parser.add_argument("--init-checkpoint", type=str, default=None, help="Resume TRAINING from this checkpoint's weights instead of a fresh random init (optimizer state and entropy schedule still restart fresh). Use to fine-tune an already-trained checkpoint under a new env config, e.g. turning --max-net-restarts on after it was trained with restarts off.")
     args = parser.parse_args()
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -90,6 +91,7 @@ def main():
         target_success_rate=args.target_success_rate,
         checkpoint_dir=args.checkpoint_dir,
         device_str=device_str,
+        init_checkpoint=args.init_checkpoint,
         **stage_cfg,
     )
 
