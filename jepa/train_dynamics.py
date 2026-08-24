@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -137,6 +138,7 @@ def print_diagnostics(epoch: int, diag: Dict[str, float]) -> None:
     print(f"    action vs state sensitivity -- action: {diag['action_sensitivity']:.4f}  "
           f"state: {diag['state_sensitivity']:.4f}  ratio: {diag['action_to_state_sensitivity_ratio']:.4f}"
           f"  {'*** PREDICTOR MAY BE IGNORING ACTION INPUT ***' if diag['action_to_state_sensitivity_ratio'] < 0.05 else ''}")
+    sys.stdout.flush()
 
 
 def train(
@@ -166,6 +168,7 @@ def train(
         cols[k] = cols[k][mask]
     n_total = len(cols["action"])
     print(f"Loaded {n_total} transitions ({'including' if include_terminal else 'excluding'} terminal steps) from {data_dir}")
+    sys.stdout.flush()
 
     dist_t_norm_np = np.clip(cols["dist_t"] / MAX_GEO_DIST, 0.0, 1.0).astype(np.float32)
     dist_next_norm_np = np.clip(cols["dist_next"] / MAX_GEO_DIST, 0.0, 1.0).astype(np.float32)
@@ -174,6 +177,7 @@ def train(
     print(f"Episode split: {len(np.unique(cols['episode_idx'][train_mask]))} train episodes, "
           f"{len(np.unique(cols['episode_idx'][val_mask]))} val episodes "
           f"({train_mask.sum()} train / {val_mask.sum()} val transitions)")
+    sys.stdout.flush()
 
     device = torch.device(device_str)
 
@@ -254,6 +258,7 @@ def train(
         elapsed = time.time() - start_time
         print(f"[epoch {epoch}/{epochs}] train: pred_loss={train_loss_pred:.4f} aux_loss={train_loss_aux:.4f} | "
               f"val: pred_loss={val_loss_pred:.4f} aux_loss={val_loss_aux:.4f} | elapsed={elapsed:.0f}s")
+        sys.stdout.flush()
         print_diagnostics(epoch, diag)
 
         history["epoch"].append(epoch)
@@ -290,6 +295,7 @@ def train(
     print(f"Done. Best val loss (pred + {aux_weight}*aux): {best_val_loss:.4f}")
     print(f"Checkpoints + diagnostics written to {chk_path}")
     print("=" * 70)
+    sys.stdout.flush()
 
 
 def plot_curves(history: Dict[str, List[float]], save_path: Path) -> None:

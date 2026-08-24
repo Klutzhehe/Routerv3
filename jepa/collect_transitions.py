@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List
@@ -99,6 +100,7 @@ def collect(
             failed=np.asarray(buf["failed"], dtype=np.bool_),
         )
         print(f"  wrote {path} ({len(buf['action'])} transitions)")
+        sys.stdout.flush()
         shard_idx += 1
         for k in buf:
             buf[k] = []
@@ -208,13 +210,14 @@ def collect(
         if step_info.get("completed_nets", 0) > 0:
             total_completed_episodes += 1
 
-        if (ep + 1) % 50 == 0:
+        if (ep + 1) % 10 == 0:
             elapsed = time.time() - start_time
             print(
                 f"[{ep + 1}/{num_episodes}] transitions={total_transitions} "
                 f"completed_episodes={total_completed_episodes}/{ep + 1} "
                 f"elapsed={elapsed:.0f}s"
             )
+            sys.stdout.flush()
 
     flush()
     print("=" * 70)
@@ -223,6 +226,7 @@ def collect(
     print(f"Action histogram (top 10 by count): "
           f"{sorted(enumerate(action_hist.tolist()), key=lambda kv: -kv[1])[:10]}")
     print("=" * 70)
+    sys.stdout.flush()
 
 
 def main():
