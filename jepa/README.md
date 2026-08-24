@@ -96,9 +96,48 @@ logged `z_t` vectors -- no new environment rollouts needed. Reports
 correlation with `dist_t` (expected notably negative if value tracks
 progress-to-target).
 
-- [ ] Run `inspect_value_head.py` against the real checkpoint + data and
-      read the verdict before deciding whether to switch the auxiliary
-      anchor to it.
+**Result, run against the real checkpoint + full dataset**: `value_head(z_t)`
+ranges from 0.2014 to 0.2088 across all 26,070 timesteps -- a spread of
+0.0074 on a base of ~0.205, i.e. under 2% relative variation, across boards
+with wildly different obstacle layouts, head positions, and progress through
+the episode. Correlation with distance: 0.02, essentially zero. This is
+functionally a constant, even though the script's own hardcoded
+`std < 1e-4` collapse threshold didn't fire on it (0.0037 std) -- that
+threshold was too strict for what's clearly a degenerate result in any
+practical sense, worth noting so this printed verdict isn't over-trusted
+literally.
+
+**This is now a THIRD independent negative result** (linear probe, MLP
+probe, and the CO-TRAINED value_head itself) all failing to extract any
+meaningful state-dependent signal from `z_t` as logged. This is bigger than
+"picked the wrong auxiliary anchor" -- it suggests the globally mean-pooled
+`global_latent`, as extracted and logged, may not carry a usable
+state-differentiating scalar signal at all, for ANY downstream head,
+including one trained end-to-end with the encoder via thousands of PPO
+updates. Yet the POLICY (also fed only this same pooled vector) clearly
+DOES differentiate states well enough to solve stage 2 to 100% -- so the
+embedding isn't information-free in general, just seemingly not in a form
+any of these three scalar-decoding attempts could extract.
+
+**This is a genuine decision point, not a code problem to keep patching.**
+Live options, not yet decided:
+  1. One more cheap, decisive test before deciding further: try decoding
+     something simpler and more direct than geodesic distance (e.g. raw
+     head (x,y) position from Channel 3, or straight-line Euclidean
+     distance rather than the obstacle-aware geodesic field) -- this
+     disentangles "is ANY positional information surviving the pool" from
+     "is specifically the nonlinear geodesic-distance function of position
+     unrecoverable."
+  2. A bigger redesign: use the encoder's per-token `encoded_tokens`
+     (256 spatial patches, pre-pooling) instead of the pooled
+     `global_latent` -- pooling is exactly what's suspected of destroying
+     the local/spatial signal. Meaningfully larger scope (more storage,
+     more architecture work) than anything built so far.
+  3. Per the original plan's own stated exit criterion: if this doesn't pan
+     out, delete `jepa/` and stay on the proven, working `--lookahead` path,
+     moving on to stage 3 instead.
+
+- [ ] Decide between the above before writing more code.
 - [ ] Fast action-selector (`jepa_lookahead_select_action`) -- **not built
       yet, deliberately**. Building a selector against an unvalidated
       predictor would mean debugging two unknowns (does the predictor work?
