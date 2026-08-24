@@ -9,6 +9,7 @@ Calculates step-wise and episodic rewards for RL agent actions:
 - Via placement penalty (-5.0 per via)
 - Congestion / corridor blocking penalty (-50.0)
 - Revisit penalty for re-crossing this net's own earlier path (-3.0)
+- Net-failure terminal penalty, applied once by the env on timeout/jam-out (-1000)
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ class RewardCalculator:
         via_penalty: float = 5.0,
         congestion_penalty_scale: float = 2.0,
         revisit_penalty: float = 3.0,
+        failure_penalty: float = 1000.0,
     ):
         self.connect_bonus = connect_bonus
         self.collision_penalty = collision_penalty
@@ -39,6 +41,20 @@ class RewardCalculator:
         self.via_penalty = via_penalty
         self.congestion_penalty_scale = congestion_penalty_scale
         self.revisit_penalty = revisit_penalty
+        # Applied once, directly by PCBRouterEnv.step() (not here -- unlike
+        # connect_bonus, which REPLACES the step's own reward, this ADDS to
+        # whatever the final step's normal reward already was, since a net
+        # that times out or jams-out on an otherwise good step should still
+        # get correct credit for that step's own progress/alignment/etc.).
+        # Matched to connect_bonus's magnitude deliberately: dist_reward
+        # alone (delta_dist * dist_scale) accumulates to 1000-2000+ over a
+        # typical episode, dwarfing every other per-step term (e.g.
+        # length_penalty_scale is ~750x smaller per step than dist_reward
+        # for an aligned move) -- without a terminal penalty on this same
+        # scale, a net that gets most of the way and then fails could still
+        # net POSITIVE total reward, which is a real incentive to attempt
+        # something failure-prone rather than something reliable.
+        self.failure_penalty = failure_penalty
 
     def compute_step_reward(
         self,

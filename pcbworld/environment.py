@@ -690,6 +690,11 @@ class PCBRouterEnv(gym.Env):
 
         if net_done and not is_connected:
             self.failed_nets.append(active_net.net_id)
+            # One-time terminal penalty, added on top of this step's own
+            # reward (not replacing it -- see RewardCalculator.failure_penalty)
+            # so accumulated progress reward from a mostly-successful attempt
+            # can't make failing net positive overall.
+            reward -= self.reward_calc.failure_penalty
 
         acted_net_id = active_net.net_id
         acted_head_pos = (state.head_x, state.head_y, state.head_layer)
