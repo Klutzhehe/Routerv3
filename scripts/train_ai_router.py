@@ -50,6 +50,7 @@ def main():
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3, 4], help="Curriculum stage (1=single net, 2=+obstacles, 3=+multinet, 4=+via/layer)")
     parser.add_argument("--max-steps", type=int, default=120, help="Per-net step budget (max_steps_per_net) -- how many moves the head gets to reach one target before that net times out. Applies to both training and the post-training eval, so they stay comparable.")
     parser.add_argument("--max-net-restarts", type=int, default=0, help="On top of retrying single steps from the same stuck position (always on), restart the WHOLE net from its source pad this many times before giving up, once every local alternative from a jam has been exhausted. 0 (default) disables this -- a jammed net fails immediately, the original behavior.")
+    parser.add_argument("--max-no-progress-steps", type=int, default=20, help="Give up (or restart, if --max-net-restarts is set) after this many CONSECUTIVE steps without the head's cost-to-go improving -- catches a head oscillating between two valid, non-colliding cells, which never trips the collision-based jam check at all since neither move is ever rejected.")
     parser.add_argument("--target-steps-per-net", type=float, default=None, help="If set, --timesteps becomes a safety cap instead of the stopping rule: training keeps going (up to that cap) until the rolling average Steps/net for SUCCESSFUL nets drops to this value or below, at --target-success-rate or higher. Use this to train for efficiency, not just completion.")
     parser.add_argument("--target-success-rate", type=float, default=0.95, help="Success rate required (in addition to --target-steps-per-net) before training is allowed to stop early. Ignored unless --target-steps-per-net is set.")
     parser.add_argument("--checkpoint-dir", type=str, default="/content/drive/MyDrive/pcb_ai_router/checkpoints", help="Directory to save model checkpoints")
@@ -70,7 +71,7 @@ def main():
             chk = torch.load(args.checkpoint, map_location=device_str, weights_only=False)
             model.load_state_dict(chk["model_state_dict"])
         model.to(device_str)
-        evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, eval_seed_offset=args.eval_seed_offset, device=device_str, **stage_cfg)
+        evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, **stage_cfg)
         return
 
     print("=" * 80)
@@ -84,6 +85,7 @@ def main():
         total_timesteps=args.timesteps,
         max_steps_per_net=args.max_steps,
         max_net_restarts=args.max_net_restarts,
+        max_no_progress_steps=args.max_no_progress_steps,
         target_steps_per_net=args.target_steps_per_net,
         target_success_rate=args.target_success_rate,
         checkpoint_dir=args.checkpoint_dir,
@@ -92,7 +94,7 @@ def main():
     )
 
     print("\nRunning post-training benchmark evaluation...")
-    evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, eval_seed_offset=args.eval_seed_offset, device=device_str, **stage_cfg)
+    evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, **stage_cfg)
 
 
 if __name__ == "__main__":

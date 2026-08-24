@@ -27,6 +27,7 @@ def evaluate_policy(
     enable_layer_via: bool = True,
     max_steps_per_net: int = 120,
     max_net_restarts: int = 0,
+    max_no_progress_steps: int = 20,
     eval_seed_offset: int = 9000,
     device: str = "cpu",
 ) -> Dict[str, Any]:
@@ -49,6 +50,7 @@ def evaluate_policy(
         num_obstacles=num_obstacles,
         max_steps_per_net=max_steps_per_net,
         max_net_restarts=max_net_restarts,
+        max_no_progress_steps=max_no_progress_steps,
         snap_radius=6,
         enable_layer_via=enable_layer_via,
     )

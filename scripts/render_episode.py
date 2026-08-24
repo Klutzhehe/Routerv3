@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help="Board seed -- vary this to look at different boards")
     parser.add_argument("--max-steps", type=int, default=120, help="Per-net step budget for this render. Training and evaluate_policy both use 120 -- pass something lower only to deliberately reproduce a truncated view.")
     parser.add_argument("--max-net-restarts", type=int, default=0, help="Restart the whole net from its source pad this many times on a jam, instead of failing immediately. 0 (default) matches evaluate_policy's default.")
+    parser.add_argument("--max-no-progress-steps", type=int, default=20, help="Give up (or restart) after this many consecutive steps without the cost-to-go improving -- catches oscillation between two valid cells, which never trips the collision-based jam check.")
     parser.add_argument("--stochastic", action="store_true", help="Sample actions like training's rollout collection does, instead of the deterministic argmax evaluate_policy uses.")
     parser.add_argument("--out", default="episode_render.png")
     args = parser.parse_args()
@@ -52,6 +53,7 @@ def main():
         grid_size=256,
         max_steps_per_net=args.max_steps,
         max_net_restarts=args.max_net_restarts,
+        max_no_progress_steps=args.max_no_progress_steps,
         snap_radius=6,
         **stage_cfg,
     )

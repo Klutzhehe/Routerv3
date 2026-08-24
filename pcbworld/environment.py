@@ -10,6 +10,7 @@ Implements sequential multi-net growth on a 10-channel 256x256 spatial grid:
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Optional, Tuple, Dict, Any, List
 import gymnasium as gym
 from gymnasium import spaces
@@ -41,6 +42,7 @@ class PCBRouterEnv(gym.Env):
         enable_layer_via: bool = True,
         max_consecutive_collisions: Optional[int] = None,
         max_net_restarts: int = 0,
+        max_no_progress_steps: int = 20,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -77,6 +79,15 @@ class PCBRouterEnv(gym.Env):
         # Default 0 (disabled) -- opt in explicitly; existing behavior stays
         # unchanged unless requested.
         self.max_net_restarts = max_net_restarts
+        # "jammed" above only fires on REJECTED moves -- a head oscillating
+        # between two valid, non-colliding cells never collides, so
+        # collision_run stays at 0 forever and the net just burns the whole
+        # max_steps_per_net budget looping. Observed directly: a rendered
+        # failed board showed the head alternating between two adjacent
+        # spots near an obstacle corner, both legal, neither leading
+        # anywhere. Tracked separately from collisions -- see
+        # _no_progress_run in step().
+        self.max_no_progress_steps = max_no_progress_steps
         # board_generator.py sets tgt_layer = src_layer for these stages, and
         # the head starts on the source pad's layer -- so a policy that never
         # touches via/layer is already correctly aligned, and every toggle
@@ -123,6 +134,13 @@ class PCBRouterEnv(gym.Env):
         self._visited_cells: set = set()
         self.net_restart_count: int = 0
         self._net_dead_zones: set = set()
+        self._best_dist_this_attempt: float = float("inf")
+        self._no_progress_run: int = 0
+        # Last few positions, for marking a whole oscillation LOOP as a dead
+        # zone on restart, not just the one cell the head happened to be on
+        # when the stall triggered -- a 2-cycle needs both ends marked, or
+        # the restarted attempt is still free to bounce to the other half.
+        self._recent_positions: deque = deque(maxlen=8)
         self.total_steps: int = 0
         self.total_restarts_this_episode: int = 0
         self.completed_nets: List[int] = []
@@ -217,6 +235,13 @@ class PCBRouterEnv(gym.Env):
             self._last_rejected_pos = None
             self._visited_cells = {(self.head_x, self.head_y)}
             self.net_restart_count = 0
+            # inf, not _geo_dist_at(source): the geodesic cache for THIS
+            # net's target hasn't been (re)built yet at this point in
+            # reset()/step()'s call order -- the first real step()
+            # establishes the true baseline.
+            self._best_dist_this_attempt = float("inf")
+            self._no_progress_run = 0
+            self._recent_positions = deque(maxlen=8)
             # Persists ACROSS restarts (unlike everything above), reset only
             # here at a genuinely new net -- see _restart_current_net().
             self._net_dead_zones: set = set()
@@ -241,9 +266,11 @@ class PCBRouterEnv(gym.Env):
         """
         active_net = self.board.nets[self.current_net_idx]
         self.total_restarts_this_episode += 1
+        self._net_dead_zones.update(self._recent_positions)
         self._net_dead_zones.add((self.head_x, self.head_y))
         if self._last_rejected_pos is not None:
             self._net_dead_zones.add(self._last_rejected_pos)
+        self._recent_positions = deque(maxlen=8)
         for layer_grid in self.board.copper_grid:
             layer_grid[layer_grid == active_net.net_id] = 0
         self.wirelength_per_net[active_net.net_id] = 0.0
@@ -255,6 +282,11 @@ class PCBRouterEnv(gym.Env):
         self.collision_run = 0
         self._last_rejected_pos = None
         self._visited_cells = {(self.head_x, self.head_y)}
+        # Unlike _init_current_net(), the geodesic cache for this net is
+        # already built at this point (the net was already in progress) --
+        # use the real starting distance rather than inf.
+        self._best_dist_this_attempt = self._geo_dist_at(self.head_x, self.head_y)
+        self._no_progress_run = 0
 
     def _precompute_static_caches(self):
         """Precompute obstacle masks, clearance field, and initial congestion."""
@@ -427,7 +459,19 @@ class PCBRouterEnv(gym.Env):
             self._visited_cells.update(new_points)
             self.head_x = new_x
             self.head_y = new_y
+            self._recent_positions.append((new_x, new_y))
             self.wirelength_per_net[active_net.net_id] += step_len
+
+            # Progress tracking -- separate from collisions entirely.
+            # Oscillating between two valid, non-colliding cells never
+            # collides, so it would otherwise be invisible to "jammed"
+            # below and just burn the whole step budget looping. 1.0-cell
+            # tolerance for float/geodesic noise, not a real threshold.
+            if curr_dist_geo < self._best_dist_this_attempt - 1.0:
+                self._best_dist_this_attempt = curr_dist_geo
+                self._no_progress_run = 0
+            else:
+                self._no_progress_run += 1
 
             if curr_dist <= self.snap_radius and (self.head_layer == target.layer):
                 is_connected = True
@@ -487,7 +531,8 @@ class PCBRouterEnv(gym.Env):
         # Only give up once actually stuck: several consecutive rejected
         # moves in a row, not one.
         self.collision_run = self.collision_run + 1 if is_collided else 0
-        jammed = self.collision_run >= self.max_consecutive_collisions
+        stalled = self._no_progress_run >= self.max_no_progress_steps
+        jammed = (self.collision_run >= self.max_consecutive_collisions) or stalled
         # WHERE the rejection landed, for Channel 9 -- cleared the instant a
         # move succeeds, so this is strictly "what just happened", not a
         # lingering mark.
