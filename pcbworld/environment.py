@@ -683,9 +683,31 @@ class PCBRouterEnv(gym.Env):
                 y += sy
         return points
 
+    @staticmethod
+    def _canonical_corner(x0: int, y0: int, x1: int, y1: int) -> Optional[Tuple[int, int]]:
+        """The single corner point connecting (x0,y0) to (x1,y1) using only
+        horizontal/vertical/45-degree segments -- diagonal first for
+        whichever axis has less distance to cover, then straight for the
+        remainder on the other axis. None if the direct segment is already
+        canonical (dx==0, dy==0, or |dx|==|dy|) and needs no corner at all.
+
+        Real PCB traces are conventionally built from exactly these angles,
+        never an arbitrary-angle cut -- and since raw routed step deltas are
+        essentially never already canonical (see simplify_net_path), a
+        shortcut has to go through a corner like this one to look like a
+        trace instead of a diagonal ruler-line.
+        """
+        dx, dy = x1 - x0, y1 - y0
+        if dx == 0 or dy == 0 or abs(dx) == abs(dy):
+            return None
+        diag = min(abs(dx), abs(dy))
+        sx = 1 if dx > 0 else -1
+        sy = 1 if dy > 0 else -1
+        return (x0 + diag * sx, y0 + diag * sy)
+
     def simplify_net_path(self, net_id: int) -> List[Tuple[int, int, int]]:
         """Collapse a completed net's raw stepped waypoints into a minimal
-        set of straight segments, for rendering/export only.
+        set of straight, canonical-angle segments, for rendering/export only.
 
         The raw path in completed_net_paths is exactly what the policy
         walked -- correct, but its "toward target" direction is re-derived
@@ -701,15 +723,15 @@ class PCBRouterEnv(gym.Env):
         a manufacturable trace" (this).
 
         Greedy farthest line-of-sight shortcut: from each kept waypoint,
-        skip ahead as far as possible to the farthest later waypoint whose
-        direct straight segment stays collision-free (obstacles, foreign
-        copper, foreign pads -- via _check_line_collision, an exact Bresenham
-        raster check), falling back to the immediate next waypoint (always
-        safe -- it's literally the step the policy already took) if no
-        farther shortcut clears. Every accepted segment is therefore
-        provably at least as valid as the raw path it replaces; no direction
-        constraint is imposed since the raw path isn't constrained to one
-        either.
+        try the farthest later waypoint first and work backward, connecting
+        through _canonical_corner's single corner point (or directly, if
+        already canonical) -- accept the first candidate where every
+        resulting segment is collision-free (obstacles, foreign copper,
+        foreign pads -- via _check_line_collision, an exact Bresenham raster
+        check). Falls back to the immediate next waypoint (always safe --
+        it's literally the step the policy already took) if no farther
+        shortcut clears. Every accepted segment is therefore both
+        provably valid and drawn at one of the router's canonical angles.
         """
         raw = self.completed_net_paths.get(net_id)
         if not raw or len(raw) < 3:
@@ -721,14 +743,26 @@ class PCBRouterEnv(gym.Env):
         while i < n - 1:
             x0, y0, l0 = raw[i]
             chosen = i + 1
+            corner_point: Optional[Tuple[int, int, int]] = None
             for j in range(n - 1, i, -1):
                 x1, y1, l1 = raw[j]
                 if l1 != l0:
                     continue
-                if self._check_line_collision(x0, y0, x1, y1, l0, net_id):
+                corner = self._canonical_corner(x0, y0, x1, y1)
+                if corner is None:
+                    if self._check_line_collision(x0, y0, x1, y1, l0, net_id):
+                        continue
+                    chosen, corner_point = j, None
+                    break
+                cx, cy = corner
+                if self._check_line_collision(x0, y0, cx, cy, l0, net_id):
                     continue
-                chosen = j
+                if self._check_line_collision(cx, cy, x1, y1, l0, net_id):
+                    continue
+                chosen, corner_point = j, (cx, cy, l0)
                 break
+            if corner_point is not None:
+                simplified.append(corner_point)
             simplified.append(raw[chosen])
             i = chosen
         return simplified
