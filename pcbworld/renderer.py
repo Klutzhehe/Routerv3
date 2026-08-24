@@ -7,7 +7,7 @@ routing heads, and congestion heatmaps into clean publication-quality PNG images
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, List
+from typing import Dict, Optional, List, Tuple
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -36,8 +36,15 @@ def render_grid_board(
     save_path: Optional[str | Path] = None,
     title: str = "AI PCB Router Grid State",
     dpi: int = 120,
+    simplified_paths: Optional[Dict[int, List[Tuple[int, int, int]]]] = None,
 ) -> plt.Figure:
-    """Render 3-panel display: Top Layer (F_Cu), Bottom Layer (B_Cu), and Composite/Congestion."""
+    """Render 3-panel display: Top Layer (F_Cu), Bottom Layer (B_Cu), and Composite/Congestion.
+
+    simplified_paths, if given (see PCBRouterEnv.simplify_net_path), draws
+    that net as clean connected line segments instead of the raw scatter of
+    rasterized copper cells -- cosmetic only, any net_id not present still
+    falls back to the raster scatter (e.g. a failed net has no simplified
+    path to show)."""
     fig, axes = plt.subplots(1, 3, figsize=(18, 6), dpi=dpi)
     fig.patch.set_facecolor("#101216")
 
@@ -73,17 +80,38 @@ def render_grid_board(
                     facecolor="#3d2222", edgecolor="#ff4444", linewidth=1.0, alpha=0.5
                 ))
 
-    # 2. Draw copper traces
+    # 2. Draw copper traces -- nets with a simplified path draw as clean
+    # connected lines instead, so skip their raster cells here.
+    simplified_paths = simplified_paths or {}
     for l_idx in range(min(2, copper_grid.shape[0])):
         c_layer = copper_grid[l_idx]
         unique_nets = np.unique(c_layer)
         for nid in unique_nets:
-            if nid <= 0:
+            if nid <= 0 or nid in simplified_paths:
                 continue
             color = NET_COLORS[(nid - 1) % len(NET_COLORS)]
             y_indices, x_indices = np.where(c_layer == nid)
             axes[l_idx].scatter(x_indices, y_indices, c=color, s=2.0, alpha=0.9, marker="s")
             axes[2].scatter(x_indices, y_indices, c=color, s=1.5, alpha=0.7, marker="s")
+
+    # 2b. Draw simplified traces as clean connected line segments, split at
+    # layer changes (a via) so a segment never draws straight across layers.
+    for nid, path in simplified_paths.items():
+        if len(path) < 2:
+            continue
+        color = NET_COLORS[(nid - 1) % len(NET_COLORS)]
+        run_x, run_y, run_layer = [path[0][0]], [path[0][1]], path[0][2]
+        for x, y, layer in path[1:]:
+            if layer != run_layer:
+                if len(run_x) >= 2 and run_layer < 2:
+                    axes[run_layer].plot(run_x, run_y, c=color, linewidth=1.6, alpha=0.95, solid_capstyle="round")
+                    axes[2].plot(run_x, run_y, c=color, linewidth=1.3, alpha=0.85, solid_capstyle="round")
+                run_x, run_y, run_layer = [run_x[-1]], [run_y[-1]], layer
+            run_x.append(x)
+            run_y.append(y)
+        if len(run_x) >= 2 and run_layer < 2:
+            axes[run_layer].plot(run_x, run_y, c=color, linewidth=1.6, alpha=0.95, solid_capstyle="round")
+            axes[2].plot(run_x, run_y, c=color, linewidth=1.3, alpha=0.85, solid_capstyle="round")
 
     # 3. Draw Pads
     for pad in pads:

@@ -148,6 +148,12 @@ class PCBRouterEnv(gym.Env):
 
         self.wirelength_per_net: Dict[int, float] = {}
         self.vias_per_net: Dict[int, int] = {}
+        # Ordered (x, y, layer) waypoints for the net currently being routed,
+        # and the frozen copy for each net that's finished -- purely for
+        # rendering/export (see simplify_net_path). Not read by _build_observation
+        # or compute_step_reward, so tracking it costs nothing training-relevant.
+        self._current_net_waypoints: List[Tuple[int, int, int]] = []
+        self.completed_net_paths: Dict[int, List[Tuple[int, int, int]]] = {}
 
         self._obs_cache: Optional[np.ndarray] = None
         self._congestion_cache: Optional[np.ndarray] = None
@@ -206,6 +212,7 @@ class PCBRouterEnv(gym.Env):
         self.failed_nets = []
         self.wirelength_per_net = {net.net_id: 0.0 for net in self.board.nets}
         self.vias_per_net = {net.net_id: 0 for net in self.board.nets}
+        self.completed_net_paths = {}
         self.total_steps = 0
         # Episode-lifetime count, unlike net_restart_count which resets per
         # net -- lets a caller (train.py) see whether restarts are firing at
@@ -234,6 +241,7 @@ class PCBRouterEnv(gym.Env):
             self.collision_run = 0
             self._last_rejected_pos = None
             self._visited_cells = {(self.head_x, self.head_y)}
+            self._current_net_waypoints = [(self.head_x, self.head_y, self.head_layer)]
             self.net_restart_count = 0
             # inf, not _geo_dist_at(source): the geodesic cache for THIS
             # net's target hasn't been (re)built yet at this point in
@@ -282,6 +290,7 @@ class PCBRouterEnv(gym.Env):
         self.collision_run = 0
         self._last_rejected_pos = None
         self._visited_cells = {(self.head_x, self.head_y)}
+        self._current_net_waypoints = [(self.head_x, self.head_y, self.head_layer)]
         # Unlike _init_current_net(), the geodesic cache for this net is
         # already built at this point (the net was already in progress) --
         # use the real starting distance rather than inf.
@@ -460,6 +469,7 @@ class PCBRouterEnv(gym.Env):
             self.head_x = new_x
             self.head_y = new_y
             self._recent_positions.append((new_x, new_y))
+            self._current_net_waypoints.append((new_x, new_y, self.head_layer))
             self.wirelength_per_net[active_net.net_id] += step_len
 
             # Progress tracking -- separate from collisions entirely.
@@ -479,6 +489,8 @@ class PCBRouterEnv(gym.Env):
                 self._rasterize_line(
                     self.head_x, self.head_y, target.x, target.y, target.layer, active_net.net_id
                 )
+                self._current_net_waypoints.append((target.x, target.y, target.layer))
+                self.completed_net_paths[active_net.net_id] = list(self._current_net_waypoints)
                 self.completed_nets.append(active_net.net_id)
 
         # Check bend
@@ -626,6 +638,56 @@ class PCBRouterEnv(gym.Env):
                 err += dx
                 y += sy
         return points
+
+    def simplify_net_path(self, net_id: int) -> List[Tuple[int, int, int]]:
+        """Collapse a completed net's raw stepped waypoints into a minimal
+        set of straight segments, for rendering/export only.
+
+        The raw path in completed_net_paths is exactly what the policy
+        walked -- correct, but its "toward target" direction is re-derived
+        every step from a coarse, downsampled geodesic field gradient (see
+        _geo_descent_dir), which wobbles even along what should be a
+        straight run, AND dir_idx is an offset from that continuously
+        varying bearing (not one of a fixed set of compass directions -- see
+        _relative_direction_vector), so raw step deltas are essentially
+        never exactly axis/diagonal-aligned. This does not touch the copper
+        grid, reward, or any training-facing state -- it's a pure post-hoc
+        geometry cleanup, the same separation real grid autorouters draw
+        between "found a valid path" (the RL policy's job) and "looks like
+        a manufacturable trace" (this).
+
+        Greedy farthest line-of-sight shortcut: from each kept waypoint,
+        skip ahead as far as possible to the farthest later waypoint whose
+        direct straight segment stays collision-free (obstacles, foreign
+        copper, foreign pads -- via _check_line_collision, an exact Bresenham
+        raster check), falling back to the immediate next waypoint (always
+        safe -- it's literally the step the policy already took) if no
+        farther shortcut clears. Every accepted segment is therefore
+        provably at least as valid as the raw path it replaces; no direction
+        constraint is imposed since the raw path isn't constrained to one
+        either.
+        """
+        raw = self.completed_net_paths.get(net_id)
+        if not raw or len(raw) < 3:
+            return list(raw) if raw else []
+
+        simplified = [raw[0]]
+        i = 0
+        n = len(raw)
+        while i < n - 1:
+            x0, y0, l0 = raw[i]
+            chosen = i + 1
+            for j in range(n - 1, i, -1):
+                x1, y1, l1 = raw[j]
+                if l1 != l0:
+                    continue
+                if self._check_line_collision(x0, y0, x1, y1, l0, net_id):
+                    continue
+                chosen = j
+                break
+            simplified.append(raw[chosen])
+            i = chosen
+        return simplified
 
     def _build_observation(self) -> np.ndarray:
         """Construct the (10, 256, 256) spatial observation tensor."""

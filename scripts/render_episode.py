@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--max-net-restarts", type=int, default=0, help="Restart the whole net from its source pad this many times on a jam, instead of failing immediately. 0 (default) matches evaluate_policy's default.")
     parser.add_argument("--max-no-progress-steps", type=int, default=20, help="Give up (or restart) after this many consecutive steps without the cost-to-go improving -- catches oscillation between two valid cells, which never trips the collision-based jam check.")
     parser.add_argument("--stochastic", action="store_true", help="Sample actions like training's rollout collection does, instead of the deterministic argmax evaluate_policy uses.")
+    parser.add_argument("--raw", action="store_true", help="Draw the raw rasterized copper (every stepped cell) instead of the simplified straight-segment trace. Use this to compare against the cleaned-up default.")
     parser.add_argument("--out", default="episode_render.png")
     args = parser.parse_args()
 
@@ -79,6 +80,9 @@ def main():
           f"vias={info['vias']}  mode={'stochastic' if args.stochastic else 'deterministic'}")
 
     pads = [p for net in env.board.nets for p in (net.source_pad, net.target_pad)]
+    simplified_paths = None
+    if not args.raw:
+        simplified_paths = {nid: env.simplify_net_path(nid) for nid in env.completed_net_paths}
     render_grid_board(
         copper_grid=env.board.copper_grid,
         pads=pads,
@@ -86,6 +90,7 @@ def main():
         heads=[],
         save_path=args.out,
         title=f"Stage {args.stage} -- seed {args.seed} -- {'stochastic' if args.stochastic else 'deterministic'}",
+        simplified_paths=simplified_paths,
     )
     print(f"saved: {os.path.abspath(args.out)}")
 
