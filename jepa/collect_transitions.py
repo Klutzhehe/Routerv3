@@ -47,11 +47,18 @@ def collect(
     output_dir: str,
     shard_size: int,
     device_str: str,
+    log_every: int,
 ) -> None:
     stage_cfg = STAGE_CONFIG[stage]
     action_dim = action_dim_for_stage(stage_cfg)
     enable_layer_via = stage_cfg["enable_layer_via"]
 
+    # Print EVERY setup step, before it runs, not after -- a silent multi-
+    # minute gap here (e.g. torch.load()'ing a checkpoint over a Drive-FUSE
+    # mount, which can be much slower than a local read) looks identical to
+    # "nothing is happening" from outside, and was reported as exactly that.
+    print(f"Loading checkpoint from {checkpoint} ...")
+    sys.stdout.flush()
     device = torch.device(device_str)
     model = PCBRouterNet(in_channels=10, action_dim=action_dim, d_model=256, num_transformer_layers=2, num_heads=4)
     chk = torch.load(checkpoint, map_location=device_str, weights_only=False)
@@ -59,6 +66,8 @@ def collect(
     model.to(device)
     model.eval()
     model.requires_grad_(False)
+    print(f"Checkpoint loaded onto {device_str}. Building environment (stage {stage}: {stage_cfg}) ...")
+    sys.stdout.flush()
 
     env = PCBRouterEnv(
         grid_size=256,
@@ -71,6 +80,9 @@ def collect(
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Starting collection: {num_episodes} episodes, seeds {seed_offset}-{seed_offset + num_episodes - 1}, "
+          f"writing shards to {out_dir}")
+    sys.stdout.flush()
 
     # Column buffers, flushed to a shard file every `shard_size` transitions.
     buf: Dict[str, List] = {
@@ -223,7 +235,7 @@ def collect(
         if step_info.get("completed_nets", 0) > 0:
             total_completed_episodes += 1
 
-        if (ep + 1) % 10 == 0:
+        if (ep + 1) % log_every == 0:
             elapsed = time.time() - start_time
             steps_per_sec = total_transitions / max(1e-6, elapsed)
             eta_sec = (num_episodes - (ep + 1)) * (elapsed / (ep + 1))
@@ -258,11 +270,13 @@ def main():
     parser.add_argument("--output-dir", type=str, default="/content/drive/MyDrive/pcb_ai_router/jepa_data")
     parser.add_argument("--shard-size", type=int, default=5000, help="Transitions per .npz shard file.")
     parser.add_argument("--seed-py", type=int, default=0, help="Python `random` seed for the exploration coin flips, for reproducibility.")
+    parser.add_argument("--log-every", type=int, default=1, help="Print a progress line every this many episodes. Default 1 (every episode) so there's never a long silent gap -- raise it only if the per-episode lines are too noisy for your log viewer.")
     args = parser.parse_args()
 
     random.seed(args.seed_py)
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device_str}")
+    sys.stdout.flush()
 
     collect(
         checkpoint=args.checkpoint,
@@ -277,6 +291,7 @@ def main():
         output_dir=args.output_dir,
         shard_size=args.shard_size,
         device_str=device_str,
+        log_every=args.log_every,
     )
 
 

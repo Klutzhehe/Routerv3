@@ -160,6 +160,11 @@ def train(
     enable_layer_via = stage_cfg["enable_layer_via"]
     action_dim = action_dim_for_stage(stage_cfg)
 
+    # Print BEFORE the (potentially slow, e.g. over a Drive-FUSE mount)
+    # shard load, not after -- a silent multi-minute gap here looks
+    # identical to "nothing is happening" from outside the process.
+    print(f"Loading shards from {data_dir} ...")
+    sys.stdout.flush()
     cols = load_shards(data_dir)
     mask = np.ones(len(cols["action"]), dtype=bool)
     if not include_terminal:
