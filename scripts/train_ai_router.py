@@ -58,6 +58,8 @@ def main():
     parser.add_argument("--eval-only", action="store_true", help="Run evaluation only")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint for evaluation")
     parser.add_argument("--init-checkpoint", type=str, default=None, help="Resume TRAINING from this checkpoint's weights instead of a fresh random init (optimizer state and entropy schedule still restart fresh). Use to fine-tune an already-trained checkpoint under a new env config, e.g. turning --max-net-restarts on after it was trained with restarts off.")
+    parser.add_argument("--ent-coef-final", type=float, default=0.001, help="Entropy coefficient at the END of training (decays linearly from --ent-coef over --timesteps). Lower means the policy commits harder to whatever it currently prefers by the end of the run -- e.g. always taking the largest step distance, which is efficient in open space but too coarse to thread a tight gap that only a smaller step can fit through. Raise this if late-training failures cluster on boards whose only solution needs sustained small, careful steps rather than the default large stride.")
+    parser.add_argument("--ent-coef", type=float, default=0.01, help="Entropy coefficient at the START of training, decaying to --ent-coef-final over --timesteps.")
     args = parser.parse_args()
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -92,6 +94,8 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         device_str=device_str,
         init_checkpoint=args.init_checkpoint,
+        ent_coef=args.ent_coef,
+        ent_coef_final=args.ent_coef_final,
         **stage_cfg,
     )
 
