@@ -61,6 +61,10 @@ def main():
     parser.add_argument("--ent-coef-final", type=float, default=0.001, help="Entropy coefficient at the END of training (decays linearly from --ent-coef over --timesteps). Lower means the policy commits harder to whatever it currently prefers by the end of the run -- e.g. always taking the largest step distance, which is efficient in open space but too coarse to thread a tight gap that only a smaller step can fit through. Raise this if late-training failures cluster on boards whose only solution needs sustained small, careful steps rather than the default large stride.")
     parser.add_argument("--ent-coef", type=float, default=0.01, help="Entropy coefficient at the START of training, decaying to --ent-coef-final over --timesteps.")
     parser.add_argument("--failure-penalty", type=float, default=1000.0, help="One-time penalty added when a net times out or exhausts its restarts without connecting (see RewardCalculator.failure_penalty). Default (1000.0) matches connect_bonus for a symmetric structure. Raising it strengthens the terminal signal a failing trajectory backpropagates via GAE, at the cost of pushing the policy toward more caution generally -- untested above the default as of this flag's introduction.")
+    parser.add_argument("--num-eval-episodes", type=int, default=50, help="How many boards (starting at --eval-seed-offset) the --eval-only / post-training benchmark covers. Default (50) matches this project's canonical comparison set -- pass e.g. 1000 for a larger sweep.")
+    parser.add_argument("--lookahead", action="store_true", help="Use lookahead_select_action instead of plain deterministic argmax for the eval/benchmark run -- see models/router_policy.py. Confirmed on individual seeds to resolve oscillation-loop failures a plain argmax cannot escape; this is how to check whether that holds at benchmark scale. Materially slower per step.")
+    parser.add_argument("--lookahead-top-k", type=int, default=4, help="How many of the policy's top candidate actions to simulate forward under --lookahead.")
+    parser.add_argument("--lookahead-horizon", type=int, default=4, help="How many steps to simulate forward per candidate under --lookahead.")
     args = parser.parse_args()
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -75,7 +79,7 @@ def main():
             chk = torch.load(args.checkpoint, map_location=device_str, weights_only=False)
             model.load_state_dict(chk["model_state_dict"])
         model.to(device_str)
-        evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, **stage_cfg)
+        evaluate_policy(model, num_eval_episodes=args.num_eval_episodes, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, use_lookahead=args.lookahead, lookahead_top_k=args.lookahead_top_k, lookahead_horizon=args.lookahead_horizon, **stage_cfg)
         return
 
     print("=" * 80)
@@ -102,7 +106,7 @@ def main():
     )
 
     print("\nRunning post-training benchmark evaluation...")
-    evaluate_policy(model, num_eval_episodes=50, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, **stage_cfg)
+    evaluate_policy(model, num_eval_episodes=args.num_eval_episodes, max_steps_per_net=args.max_steps, max_net_restarts=args.max_net_restarts, max_no_progress_steps=args.max_no_progress_steps, eval_seed_offset=args.eval_seed_offset, device=device_str, use_lookahead=args.lookahead, lookahead_top_k=args.lookahead_top_k, lookahead_horizon=args.lookahead_horizon, **stage_cfg)
 
 
 if __name__ == "__main__":

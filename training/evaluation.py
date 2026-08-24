@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from pcbworld.environment import PCBRouterEnv
-from models.router_policy import PCBRouterNet, select_deterministic_action
+from models.router_policy import PCBRouterNet, select_deterministic_action, lookahead_select_action
 
 
 def evaluate_policy(
@@ -30,6 +30,9 @@ def evaluate_policy(
     max_no_progress_steps: int = 20,
     eval_seed_offset: int = 9000,
     device: str = "cpu",
+    use_lookahead: bool = False,
+    lookahead_top_k: int = 4,
+    lookahead_horizon: int = 4,
 ) -> Dict[str, Any]:
     """Run deterministic evaluation of policy over test boards.
 
@@ -40,6 +43,16 @@ def evaluate_policy(
     against boards in general. Passing a different offset (e.g. 20000) is
     the cheap way to ask "does this generalize, or did it just get good at
     the 50 boards we keep testing on."
+
+    use_lookahead swaps select_deterministic_action's single-step argmax
+    for lookahead_select_action's shallow forward search -- see that
+    function's docstring. Confirmed on render_episode.py traces to resolve
+    oscillation-loop failures a plain argmax cannot escape; use_lookahead
+    here is what checks whether that holds at benchmark scale, not just on
+    the handful of seeds it was diagnosed against. Materially slower per
+    step (~lookahead_top_k*lookahead_horizon extra env steps and forward
+    passes per real decision) -- expect a full 1000-board sweep to take
+    noticeably longer than the plain-argmax version.
     """
     model.eval()
     dev = torch.device(device)
@@ -82,12 +95,19 @@ def evaluate_policy(
         # current_net_idx on every step() call.
         forbidden_by_net: Dict[int, set] = {}
         while not done:
-            obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=dev).unsqueeze(0)
             acting_idx = env.current_net_idx
             prev_head = (env.head_x, env.head_y)
-            with torch.no_grad():
-                dist, _ = model(obs_t)
-                action = select_deterministic_action(dist, forbidden_by_net.get(acting_idx, set()))
+            forbidden = forbidden_by_net.get(acting_idx, set())
+            if use_lookahead:
+                action = lookahead_select_action(
+                    model, env, obs_np, device, forbidden,
+                    top_k=lookahead_top_k, horizon=lookahead_horizon,
+                )
+            else:
+                obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=dev).unsqueeze(0)
+                with torch.no_grad():
+                    dist, _ = model(obs_t)
+                    action = select_deterministic_action(dist, forbidden)
 
             obs_np, reward, term, trunc, step_info = env.step(action)
             done = term or trunc
