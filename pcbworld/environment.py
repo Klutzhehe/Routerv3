@@ -122,6 +122,7 @@ class PCBRouterEnv(gym.Env):
         # penalized for the path the FAILED attempt already took.
         self._visited_cells: set = set()
         self.net_restart_count: int = 0
+        self._net_dead_zones: set = set()
         self.total_steps: int = 0
         self.completed_nets: List[int] = []
         self.failed_nets: List[int] = []
@@ -209,6 +210,9 @@ class PCBRouterEnv(gym.Env):
             self._last_rejected_pos = None
             self._visited_cells = {(self.head_x, self.head_y)}
             self.net_restart_count = 0
+            # Persists ACROSS restarts (unlike everything above), reset only
+            # here at a genuinely new net -- see _restart_current_net().
+            self._net_dead_zones: set = set()
 
     def _restart_current_net(self):
         """Wipe THIS net's progress and try it again from its source pad.
@@ -217,8 +221,21 @@ class PCBRouterEnv(gym.Env):
         net_restart_count -- those are what bound how many restarts a net
         gets before max_steps_per_net or max_net_restarts ends it for real,
         same overall budget, just a fresh attempt within it.
+
+        Also deliberately does NOT reset _net_dead_zones -- a restart with
+        an otherwise identical starting observation and an empty local
+        retry-history would make a DETERMINISTIC policy retrace the exact
+        same path into the exact same jam, every time, for zero benefit.
+        Recording the trap location HERE, before it's wiped below, is what
+        makes a restart actually different from the attempt that just
+        failed: the observation the restarted attempt sees, once it
+        re-approaches this spot, is not identical to what the failed
+        attempt saw there.
         """
         active_net = self.board.nets[self.current_net_idx]
+        self._net_dead_zones.add((self.head_x, self.head_y))
+        if self._last_rejected_pos is not None:
+            self._net_dead_zones.add(self._last_rejected_pos)
         for layer_grid in self.board.copper_grid:
             layer_grid[layer_grid == active_net.net_id] = 0
         self.wirelength_per_net[active_net.net_id] = 0.0
@@ -621,12 +638,24 @@ class PCBRouterEnv(gym.Env):
         # analogue of an LLM seeing a DRC error before its next move rather
         # than only being reachable through the reward gradient over many
         # future episodes.
+        y_coords, x_coords = np.ogrid[:self.grid_size, :self.grid_size]
         if self._last_rejected_pos is not None:
             lx, ly = self._last_rejected_pos
             intensity = min(1.0, self.collision_run / max(1, self.max_consecutive_collisions))
-            y_coords, x_coords = np.ogrid[:self.grid_size, :self.grid_size]
             dist_sq = (x_coords - lx) ** 2 + (y_coords - ly) ** 2
             obs[9] = (intensity * np.exp(-0.5 * dist_sq / 16.0)).astype(np.float32)
+
+        # Same channel also carries permanent dead-zone markers -- spots a
+        # PREVIOUS restart attempt of this net got jammed at, at full
+        # intensity (1.0, more severe than a fresh in-progress rejection,
+        # since these are confirmed dead ends rather than a single bad try).
+        # Without this, a restart's starting observation is bit-identical to
+        # the failed attempt's, and a deterministic policy would just
+        # retrace the exact same path into the exact same jam -- see
+        # _restart_current_net().
+        for dx, dy in self._net_dead_zones:
+            dist_sq = (x_coords - dx) ** 2 + (y_coords - dy) ** 2
+            obs[9] = np.maximum(obs[9], np.exp(-0.5 * dist_sq / 16.0).astype(np.float32))
 
         return obs
 
