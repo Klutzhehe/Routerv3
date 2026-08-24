@@ -116,16 +116,25 @@ def collect(
         done = False
         forbidden_by_net: Dict[int, set] = {}
 
+        # Carry the CURRENT observation's embedding forward across steps
+        # instead of re-encoding it at the top of every iteration -- the
+        # "next" embedding computed at the end of step i is EXACTLY the
+        # "current" embedding step i+1 would otherwise redundantly
+        # recompute from the same array. Halves the CNN+Transformer forward
+        # passes (and GPU<->CPU syncs) per transition -- this was the single
+        # biggest avoidable cost in this script.
+        obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
+        with torch.no_grad():
+            current_latent, _ = model.encoder(obs_t)
+
         while not done:
             idx = env.current_net_idx
             state = env.net_states[idx]
             forbidden = forbidden_by_net.get(idx, set())
 
-            obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
-                pcb_latent, _ = model.encoder(obs_t)
-                action_logits = model.policy_head(pcb_latent)
-            z_t = pcb_latent.squeeze(0).cpu().numpy()
+                action_logits = model.policy_head(current_latent)
+            z_t = current_latent.squeeze(0).cpu().numpy()
             dist_t_val = env._geo_dist_at(state.geodesic_cache, state.head_x, state.head_y)
 
             logits = action_logits.squeeze(0)
@@ -172,7 +181,13 @@ def collect(
             # stage 3+.
             rotated_away = (not done) and (env.current_net_idx != idx)
             if rotated_away:
-                obs_np = obs_next_np
+                # A DIFFERENT net is current next (num_nets > 1 only) --
+                # re-encode its observation fresh, since current_latent's
+                # cached value belongs to the net that just acted, not
+                # whichever net takes the next real turn.
+                obs_next_t = torch.as_tensor(obs_next_np, dtype=torch.float32, device=device).unsqueeze(0)
+                with torch.no_grad():
+                    current_latent, _ = model.encoder(obs_next_t)
                 continue
 
             if done:
@@ -186,8 +201,8 @@ def collect(
             else:
                 obs_next_t = torch.as_tensor(obs_next_np, dtype=torch.float32, device=device).unsqueeze(0)
                 with torch.no_grad():
-                    pcb_latent_next, _ = model.encoder(obs_next_t)
-                z_next = pcb_latent_next.squeeze(0).cpu().numpy()
+                    current_latent, _ = model.encoder(obs_next_t)
+                z_next = current_latent.squeeze(0).cpu().numpy()
 
             dist_next_val = env._geo_dist_at(state.geodesic_cache, state.head_x, state.head_y)
 
@@ -205,17 +220,17 @@ def collect(
             if len(buf["action"]) >= shard_size:
                 flush()
 
-            obs_np = obs_next_np
-
         if step_info.get("completed_nets", 0) > 0:
             total_completed_episodes += 1
 
         if (ep + 1) % 10 == 0:
             elapsed = time.time() - start_time
+            steps_per_sec = total_transitions / max(1e-6, elapsed)
+            eta_sec = (num_episodes - (ep + 1)) * (elapsed / (ep + 1))
             print(
                 f"[{ep + 1}/{num_episodes}] transitions={total_transitions} "
                 f"completed_episodes={total_completed_episodes}/{ep + 1} "
-                f"elapsed={elapsed:.0f}s"
+                f"elapsed={elapsed:.0f}s steps/s={steps_per_sec:.1f} ETA={eta_sec:.0f}s"
             )
             sys.stdout.flush()
 
