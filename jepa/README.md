@@ -161,11 +161,30 @@ which is a different image region entirely). Strong signal the redesign
 direction is mechanically sound; real validation still needs the actual
 trained checkpoint and real-scale data.
 
-- [ ] Run `probe_token_features.py` against the real v7 checkpoint (fresh
-      short rollouts, not the existing shards -- this needs per-token
-      features that were never logged before) and confirm `head_token` (or
-      `head_token + target_token`) clearly beats the pooled control on real
-      data, not just this smoke test.
+**First real run (200 episodes, plain deterministic policy) came back
+negative** -- all four representations tied to baseline (0.1204-0.1209).
+But the collection used plain deterministic action selection, which this
+project's history documents as prone to oscillation-trap failures in under
+20 steps; this run averaged only ~16.5 steps/episode, suspiciously matching
+that signature. A dataset dominated by short, stuck episodes under-samples
+the "closer to target" end of the distance range and could suppress ANY
+representation's apparent decodability regardless of whether per-token
+features are useful -- a real confound, not just a guess, so this result
+was not trustworthy as-is.
+
+**Fixed**: `probe_token_features.py` now uses the SAME exploring top-k
+behavior policy `collect_transitions.py` uses (proven to reach 997/1000
+completions on this checkpoint), and reports completion rate + avg
+steps/episode directly so this can be checked going forward instead of
+inferred after the fact. Re-smoke-tested (random-init checkpoint): same
+strong `head_token` result as before (ridge 0.0373 vs baseline 0.1184).
+
+- [ ] Run the FIXED `probe_token_features.py` against the real v7
+      checkpoint (fresh rollouts with the exploring policy, not the
+      existing shards -- this needs per-token features that were never
+      logged before) and confirm `head_token` (or `head_token +
+      target_token`) clearly beats the pooled control AND that the
+      completion rate is reasonable this time, not just this smoke test.
 - [ ] If confirmed: rewrite `collect_transitions.py` to log `head_token`/
       `target_token` (not the pooled `global_latent`) and rebuild
       `dynamics_model.py`/`train_dynamics.py` around that representation.

@@ -31,24 +31,31 @@ methodology as probe_distance_from_embedding.py:
      carries enough signal by itself, or whether the target's token is
      load-bearing too.
 
-Runs FRESH short episodes with the trained checkpoint's plain deterministic
-policy (no lookahead, no action-exploration complexity needed -- this only
-needs (representation, ground-truth distance) pairs, not full transitions
-for dynamics training) -- does not read or write collect_transitions.py's
-existing shards, and does not modify anything outside this file.
+Runs FRESH episodes with the SAME exploring top-k behavior policy
+collect_transitions.py uses (proven to reach 997/1000 completions on this
+checkpoint) -- an earlier version of this script used plain deterministic
+action selection instead, which produced a suspiciously short ~16.5
+steps/episode average matching this project's own documented
+oscillation-trap failure signature (fails in under 20 steps). A dataset
+dominated by short, stuck episodes would under-sample the "closer to
+target" end of the distance distribution and could suppress ANY
+representation's apparent decodability regardless of whether per-token
+features are actually useful -- ruling that out before trusting a negative
+result here. Does not read or write collect_transitions.py's existing
+shards, and does not modify anything outside this file.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from typing import Dict, Tuple
 
 import numpy as np
 import torch
-from torch.distributions import Categorical
 
 from pcbworld.environment import PCBRouterEnv
-from models.router_policy import PCBRouterNet, select_deterministic_action
+from models.router_policy import PCBRouterNet
 from scripts.train_ai_router import STAGE_CONFIG, action_dim_for_stage
 from jepa.probe_distance_from_embedding import ridge_probe, SimpleDistanceProbe
 from jepa.train_dynamics import MAX_GEO_DIST, episode_split
@@ -79,6 +86,8 @@ def collect_probe_data(
     max_steps: int,
     max_net_restarts: int,
     max_no_progress_steps: int,
+    top_k: int,
+    explore_eps: float,
     device_str: str,
 ) -> Dict[str, np.ndarray]:
     stage_cfg = STAGE_CONFIG[stage]
@@ -86,6 +95,7 @@ def collect_probe_data(
     device = torch.device(device_str)
 
     print(f"Loading checkpoint from {checkpoint} ...")
+    sys.stdout.flush()
     model = PCBRouterNet(in_channels=10, action_dim=action_dim, d_model=256, num_transformer_layers=2, num_heads=4)
     chk = torch.load(checkpoint, map_location=device_str, weights_only=False)
     model.load_state_dict(chk["model_state_dict"])
@@ -103,9 +113,24 @@ def collect_probe_data(
     )
 
     pooled_list, head_tok_list, target_tok_list, dist_list, episode_idx_list = [], [], [], [], []
+    completed_episodes = 0
 
-    print(f"Collecting {num_episodes} episodes (deterministic policy, no exploration -- "
-          f"this probe only needs representative (state, distance) pairs) ...")
+    # Same exploring top-k behavior policy as collect_transitions.py (proven
+    # to reach 997/1000 completions on this checkpoint), NOT plain
+    # deterministic argmax -- an earlier version of this script used plain
+    # deterministic action selection and got a suspiciously short ~16.5
+    # steps/episode average, matching this project's own documented
+    # oscillation-trap failure signature ("every failure ended the net in
+    # under 20 steps"). A dataset dominated by short, early, stuck episodes
+    # would suppress ANY representation's apparent decodability regardless
+    # of whether per-token features are actually useful, since it under-
+    # samples the "closer to target" end of the distance distribution --
+    # a confound that has to be ruled out before trusting a negative result
+    # here, same evidence-first discipline as everything else in jepa/.
+    print(f"Collecting {num_episodes} episodes (exploring top-k policy, top_k={top_k}, "
+          f"explore_eps={explore_eps} -- matches collect_transitions.py's behavior policy, "
+          f"for good coverage across the full distance range) ...")
+    sys.stdout.flush()
     for ep in range(num_episodes):
         seed = seed_offset + ep
         obs_np, info = env.reset(seed=seed)
@@ -121,7 +146,15 @@ def collect_probe_data(
             with torch.no_grad():
                 pooled, tokens = model.encoder(obs_t)  # pooled (1,d), tokens (1,256,d)
                 action_logits = model.policy_head(pooled)
-            action = select_deterministic_action(Categorical(logits=action_logits), forbidden)
+            logits = action_logits.squeeze(0)
+            ranked = [a for a in torch.argsort(logits, descending=True).tolist() if a not in forbidden]
+            if not ranked:
+                ranked = torch.argsort(logits, descending=True).tolist()
+            candidates = ranked[:top_k]
+            if len(candidates) > 1 and np.random.random() < explore_eps:
+                action = int(np.random.choice(candidates[1:]))
+            else:
+                action = candidates[0]
 
             dist_t_val = env._geo_dist_at(state.geodesic_cache, state.head_x, state.head_y)
             h_idx = patch_token_index(state.head_x, state.head_y, env.grid_size)
@@ -143,8 +176,22 @@ def collect_probe_data(
                 forbidden_by_net[idx] = set()
             obs_np = obs_next_np
 
+        if step_info.get("completed_nets", 0) > 0:
+            completed_episodes += 1
+
         if (ep + 1) % max(1, num_episodes // 10) == 0:
-            print(f"  [{ep + 1}/{num_episodes}] {len(dist_list)} timesteps collected so far")
+            print(f"  [{ep + 1}/{num_episodes}] {len(dist_list)} timesteps collected so far, "
+                  f"{completed_episodes}/{ep + 1} episodes completed "
+                  f"(avg {len(dist_list) / (ep + 1):.1f} steps/episode)")
+            sys.stdout.flush()
+
+    completion_rate = completed_episodes / num_episodes
+    print(f"\nCompletion rate: {completed_episodes}/{num_episodes} ({completion_rate * 100:.1f}%), "
+          f"{len(dist_list) / num_episodes:.1f} avg steps/episode")
+    if completion_rate < 0.5:
+        print("*** LOW COMPLETION RATE -- state distribution may be dominated by short, stuck ***")
+        print("*** episodes rather than a good spread across the full distance range. Any    ***")
+        print("*** decodability result below should be read with that in mind.               ***")
 
     return {
         "pooled": np.stack(pooled_list).astype(np.float32),
@@ -196,10 +243,11 @@ def probe_one(name: str, z: np.ndarray, y: np.ndarray, train_mask: np.ndarray, v
 
 
 def run(checkpoint: str, stage: int, num_episodes: int, seed_offset: int, max_steps: int,
-        max_net_restarts: int, max_no_progress_steps: int, val_frac: float, l2: float,
-        mlp_epochs: int, batch_size: int, lr: float, seed: int, device_str: str) -> None:
+        max_net_restarts: int, max_no_progress_steps: int, top_k: int, explore_eps: float,
+        val_frac: float, l2: float, mlp_epochs: int, batch_size: int, lr: float, seed: int,
+        device_str: str) -> None:
     data = collect_probe_data(checkpoint, stage, num_episodes, seed_offset, max_steps,
-                               max_net_restarts, max_no_progress_steps, device_str)
+                               max_net_restarts, max_no_progress_steps, top_k, explore_eps, device_str)
     n = len(data["dist_t"])
     print(f"\nCollected {n} timesteps across {num_episodes} episodes.")
 
@@ -234,6 +282,8 @@ def main():
     parser.add_argument("--max-steps", type=int, default=120)
     parser.add_argument("--max-net-restarts", type=int, default=2)
     parser.add_argument("--max-no-progress-steps", type=int, default=20)
+    parser.add_argument("--top-k", type=int, default=4, help="Matches collect_transitions.py's default -- behavior policy candidate pool size.")
+    parser.add_argument("--explore-eps", type=float, default=0.3, help="Matches collect_transitions.py's default.")
     parser.add_argument("--val-frac", type=float, default=0.2)
     parser.add_argument("--l2", type=float, default=1.0)
     parser.add_argument("--mlp-epochs", type=int, default=30)
@@ -248,9 +298,9 @@ def main():
     run(
         checkpoint=args.checkpoint, stage=args.stage, num_episodes=args.num_episodes,
         seed_offset=args.seed_offset, max_steps=args.max_steps, max_net_restarts=args.max_net_restarts,
-        max_no_progress_steps=args.max_no_progress_steps, val_frac=args.val_frac, l2=args.l2,
-        mlp_epochs=args.mlp_epochs, batch_size=args.batch_size, lr=args.lr, seed=args.seed,
-        device_str=device_str,
+        max_no_progress_steps=args.max_no_progress_steps, top_k=args.top_k, explore_eps=args.explore_eps,
+        val_frac=args.val_frac, l2=args.l2, mlp_epochs=args.mlp_epochs, batch_size=args.batch_size,
+        lr=args.lr, seed=args.seed, device_str=device_str,
     )
 
 
