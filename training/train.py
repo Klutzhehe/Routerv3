@@ -27,6 +27,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from pcbworld.environment import PCBRouterEnv
+from pcbworld.reward import RewardCalculator
 from models.router_policy import PCBRouterNet
 from training.replay_buffer import RolloutBuffer
 from training.reward_scaling import RewardScaler
@@ -57,6 +58,7 @@ def train_single_net_policy(
     device_str: Optional[str] = None,
     plot_interval: int = 1024,
     init_checkpoint: Optional[str] = None,
+    failure_penalty: float = 1000.0,
 ) -> PCBRouterNet:
     """Train a routing agent (Milestone 1 target: >95% routing success on stage 1).
 
@@ -85,6 +87,7 @@ def train_single_net_policy(
         max_no_progress_steps=max_no_progress_steps,
         snap_radius=6,
         enable_layer_via=enable_layer_via,
+        reward_calculator=RewardCalculator(failure_penalty=failure_penalty),
     )
 
     # 2. Instantiate Model & Optimizer
