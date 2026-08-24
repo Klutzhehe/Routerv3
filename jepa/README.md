@@ -18,10 +18,48 @@ path (100% on the full benchmark, just slow) is exactly as it was.
 - [x] Predictor architecture + combined objective + collapse diagnostics
       implemented and smoke-tested (mechanical correctness only -- random
       init, tiny synthetic run, not a real training result).
-- [ ] Real data collection run (needs a GPU + the trained stage-2 checkpoint
-      -- see "Running this on Colab" below).
+- [x] Real data collection run: 1000 episodes, seeds 100000-100999, stage 2,
+      v7 checkpoint -- 26,070 transitions (997/1000 completed).
+- [x] First real training run (50 epochs, same data) -- diagnosed a real
+      issue, described below, not yet re-validated after the fix.
+
+### Known issue (found in the first real run, fixed, not yet re-validated)
+
+The first real 50-epoch run showed `pred_loss` collapsing to ~0.0000 by
+epoch 2-3 while `aux dist MAE` stayed flat at ~0.123-0.127 for all 50
+epochs -- statistically indistinguishable from the "predict the dataset
+mean" baseline (0.1237) the entire time. No outright representational
+collapse (`z_hat_std` stayed non-zero, action-vs-state sensitivity ratio
+stayed ~0.8-1.07), but this is still the hollow-victory failure mode
+section 4 above exists to catch: the predictor satisfied the cosine
+predictive loss almost for free (one router step barely moves the state, so
+`delta -> 0` -- "predict no change" -- nearly solves it without learning
+anything about the action), and the auxiliary anchor that was supposed to
+catch that wasn't extracting any real signal either.
+
+Root cause: the frozen encoder's `global_latent` (mean-pooled over 256
+post-LayerNorm patch tokens) turned out to have surprisingly small scale
+across the dataset (~0.01-0.02 std) -- averaging many roughly-independent
+unit-scale token vectors shrinks the aggregate. `DynamicsPredictor` and
+`DistanceHead` were plain `nn.Linear` stacks with PyTorch's default init,
+which implicitly assumes ~unit-scale input -- the same class of bug this
+repo already hit once before in `models/router_policy.py`'s policy head
+(the `gain=0.01` vs `0.1` story). Compounding it: `ActionEncoder`'s
+freshly-initialized embeddings sit at the default ~unit scale, ~70x larger
+than `z_t` -- concatenated together, the action channel likely dominated
+the predictor's first layer.
+
+Fix applied (`dynamics_model.py`): both modules now `LayerNorm`-normalize
+their input before their MLPs; `DynamicsPredictor` additionally applies a
+learnable `delta_scale` (initialized small) so the residual itself starts
+close to `z_t`'s own natural scale rather than being swamped by an
+internally-normalized (~unit-scale) delta from the first step of training.
+This does NOT require re-collecting data -- only re-running
+`train_dynamics.py` on the existing shards. **Not yet re-validated against
+a real run** -- next step is exactly that.
+
 - [ ] Real training run + collapse diagnostic actually checked against real
-      data.
+      data, WITH the input-normalization fix above.
 - [ ] Fast action-selector (`jepa_lookahead_select_action`) -- **not built
       yet, deliberately**. Building a selector against an unvalidated
       predictor would mean debugging two unknowns (does the predictor work?

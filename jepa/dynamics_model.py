@@ -78,26 +78,50 @@ class DynamicsPredictor(nn.Module):
     to the whole board, so z_{t+1} is expected to sit close to z_t in
     embedding space, and a residual target is the easier one for a small MLP
     to fit than reconstructing an unrelated-looking 256-d vector per step.
+
+    Input normalization (measured necessary, not precautionary -- see a real
+    run's diagnostics in jepa/README.md's "known issue" note): the frozen
+    PCBEncoder's global_latent (mean-pooled over 256 post-LayerNorm patch
+    tokens) turned out to have surprisingly small scale across the whole
+    dataset (~0.01-0.02 std), while ActionEncoder's freshly-initialized
+    embeddings sit at PyTorch's default ~unit scale -- concatenating the two
+    let the action channel dominate the first layer by ~2 orders of
+    magnitude, and a plain nn.Linear stack (default init assumes ~unit-scale
+    input) couldn't get useful gradient signal from the much smaller z_t
+    component. Same class of bug this repo already hit once before in
+    models/router_policy.py's policy_head (gain=0.01 vs 0.1 story) -- a real
+    signal too small for downstream layers calibrated to a different scale.
+
+    `input_norm` gives the MLP a properly-scaled VIEW of z_t for computing
+    delta; `delta_scale` (a single learnable scalar, initialized small)
+    keeps the RESIDUAL itself close to z_t's own natural scale at the start
+    of training, so the "next state is close to current state" prior isn't
+    violated by delta's internal LayerNorm-normalized (roughly unit-scale)
+    output overwhelming a ~0.01-scale z_t the moment training starts.
     """
 
     def __init__(self, d_model: int = 256, enable_layer_via: bool = False, hidden: int = 512):
         super().__init__()
         self.d_model = d_model
         self.action_encoder = ActionEncoder(enable_layer_via)
+        self.input_norm = nn.LayerNorm(d_model)
         in_dim = d_model + self.action_encoder.out_dim
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, d_model),
         )
+        self.delta_scale = nn.Parameter(torch.tensor(0.01))
 
     def forward(self, z_t: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         a_emb = self.action_encoder(actions)
-        x = torch.cat([z_t, a_emb], dim=-1)
+        x = torch.cat([self.input_norm(z_t), a_emb], dim=-1)
         delta = self.net(x)
-        return z_t + delta
+        return z_t + self.delta_scale * delta
 
 
 class DistanceHead(nn.Module):
@@ -107,18 +131,25 @@ class DistanceHead(nn.Module):
     to the PREDICTOR's output during training, never to the frozen target
     directly, since anchoring the target would do nothing to keep the
     predictor itself honest.
+
+    Same input-scale reasoning as DynamicsPredictor's input_norm -- z_hat
+    inherits z_t's small natural scale (see there), and a plain nn.Linear
+    stack can't extract much from a signal ~70x smaller than its default
+    init assumes.
     """
 
     def __init__(self, d_model: int = 256, hidden: int = 128):
         super().__init__()
+        self.input_norm = nn.LayerNorm(d_model)
         self.net = nn.Sequential(
             nn.Linear(d_model, hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 1),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z).squeeze(-1)
+        return self.net(self.input_norm(z)).squeeze(-1)
 
 
 def predictive_loss(z_hat: torch.Tensor, z_target: torch.Tensor) -> torch.Tensor:
