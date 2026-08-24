@@ -1,6 +1,6 @@
 """Gymnasium-Compatible PCB Routing Grid Environment (PCBRouterEnv).
 
-Implements sequential multi-net growth on a 10-channel 256x256 spatial grid:
+Implements round-robin multi-net growth on a 10-channel 256x256 spatial grid:
 - 10-channel spatial observation space (Box(0.0, 1.0, (10, 256, 256), float32))
 - 96 discrete actions per net growth step (8 directions x 3 distances x 2 layers x 2 vias)
 - Fast line-raster collision & clearance checks
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any, List
 import gymnasium as gym
 from gymnasium import spaces
@@ -22,6 +23,44 @@ from pcbworld.reward import RewardCalculator
 
 
 DIST_STEPS = [2, 4, 8]  # Step distances for fast grid traversal
+
+
+@dataclass
+class _NetState:
+    """One net's own routing state.
+
+    Round-robin gives every unfinished net one step, then rotates to the
+    next, so several nets are mid-route at once -- each one's head position,
+    local retry/stall history, and geodesic field have to survive the OTHER
+    nets' turns in between, instead of living in singular env-level
+    attributes the way they could when exactly one net was ever in progress.
+    """
+    head_x: int = 0
+    head_y: int = 0
+    head_layer: int = 0
+    head_prev_dir: Optional[int] = None
+    steps_taken: int = 0
+    collision_run: int = 0
+    # Where the last rejected move tried to land, or None if the last step
+    # on THIS net was clean -- see Channel 9.
+    last_rejected_pos: Optional[Tuple[int, int]] = None
+    visited_cells: set = field(default_factory=set)
+    restart_count: int = 0
+    dead_zones: set = field(default_factory=set)
+    best_dist_this_attempt: float = float("inf")
+    no_progress_run: int = 0
+    recent_positions: deque = field(default_factory=lambda: deque(maxlen=8))
+    # Ordered (x, y, layer) waypoints for this net's current attempt, for
+    # rendering/export (see PCBRouterEnv.simplify_net_path). Not read by
+    # _build_observation or compute_step_reward.
+    waypoints: List[Tuple[int, int, int]] = field(default_factory=list)
+    # Obstacle-aware cost-to-go to THIS net's target. Depends only on the
+    # target position and the (static, shared) obstacle grid -- never on
+    # other nets' copper or which net is currently acting -- so it is
+    # computed once when the net first starts (or restarts) and simply
+    # reused every time round-robin rotates back to it, not recomputed
+    # per step. See compute_geodesic_distance_field.
+    geodesic_cache: Optional[np.ndarray] = None
 
 
 class PCBRouterEnv(gym.Env):
@@ -70,12 +109,12 @@ class PCBRouterEnv(gym.Env):
         )
         # On jam (max_consecutive_collisions exhausted), wipe this net's
         # progress and retry it from its source pad instead of abandoning it
-        # outright -- see _restart_current_net(). Retrying single steps from
-        # the SAME stuck position (above) only searches alternatives at that
-        # one point; if every local option from there is bad, exhausting
-        # them cannot help, because they are all evaluated from inside the
-        # same trap. Restarting is a bounded, well-defined form of "back up
-        # and try a different path" without needing per-step undo history.
+        # outright -- see _restart_net(). Retrying single steps from the
+        # SAME stuck position (above) only searches alternatives at that one
+        # point; if every local option from there is bad, exhausting them
+        # cannot help, because they are all evaluated from inside the same
+        # trap. Restarting is a bounded, well-defined form of "back up and
+        # try a different path" without needing per-step undo history.
         # Default 0 (disabled) -- opt in explicitly; existing behavior stays
         # unchanged unless requested.
         self.max_net_restarts = max_net_restarts
@@ -86,7 +125,7 @@ class PCBRouterEnv(gym.Env):
         # failed board showed the head alternating between two adjacent
         # spots near an obstacle corner, both legal, neither leading
         # anywhere. Tracked separately from collisions -- see
-        # _no_progress_run in step().
+        # no_progress_run in step().
         self.max_no_progress_steps = max_no_progress_steps
         # board_generator.py sets tgt_layer = src_layer for these stages, and
         # the head starts on the source pad's layer -- so a policy that never
@@ -114,33 +153,16 @@ class PCBRouterEnv(gym.Env):
         self.action_space = spaces.Discrete(96 if enable_layer_via else 24)
 
         self.board: Optional[BoardState] = None
-        self.current_net_idx: int = 0
-        self.head_x: int = 0
-        self.head_y: int = 0
-        self.head_layer: int = 0
-        self.head_prev_dir: Optional[int] = None
+        # Which board-index net acts on the NEXT step() call, or None once
+        # every net has finished (completed or failed out of restarts).
+        self.current_net_idx: Optional[int] = None
+        # One _NetState per net, keyed by board index -- see _NetState.
+        self.net_states: Dict[int, _NetState] = {}
+        # Round-robin queue of not-yet-finished net indices. The net at the
+        # front acts next; after it acts it's popped, and re-appended at the
+        # back unless it just finished -- see step().
+        self._active_order: deque = deque()
 
-        self.steps_taken_current_net: int = 0
-        self.collision_run: int = 0
-        # Where the last rejected move tried to land, or None if the last
-        # step was clean. The ONLY place the policy can perceive its own
-        # last mistake -- there is no recurrence/frame history here, so
-        # anything not in THIS observation is invisible to it, no matter how
-        # informative the reward gradient eventually is. See Channel 9.
-        self._last_rejected_pos: Optional[Tuple[int, int]] = None
-        # Cells this net's head has already passed through, this attempt --
-        # reset on a genuinely new net AND on a restart, so a restart isn't
-        # penalized for the path the FAILED attempt already took.
-        self._visited_cells: set = set()
-        self.net_restart_count: int = 0
-        self._net_dead_zones: set = set()
-        self._best_dist_this_attempt: float = float("inf")
-        self._no_progress_run: int = 0
-        # Last few positions, for marking a whole oscillation LOOP as a dead
-        # zone on restart, not just the one cell the head happened to be on
-        # when the stall triggered -- a 2-cycle needs both ends marked, or
-        # the restarted attempt is still free to bounce to the other half.
-        self._recent_positions: deque = deque(maxlen=8)
         self.total_steps: int = 0
         self.total_restarts_this_episode: int = 0
         self.completed_nets: List[int] = []
@@ -148,25 +170,38 @@ class PCBRouterEnv(gym.Env):
 
         self.wirelength_per_net: Dict[int, float] = {}
         self.vias_per_net: Dict[int, int] = {}
-        # Ordered (x, y, layer) waypoints for the net currently being routed,
-        # and the frozen copy for each net that's finished -- purely for
-        # rendering/export (see simplify_net_path). Not read by _build_observation
-        # or compute_step_reward, so tracking it costs nothing training-relevant.
-        self._current_net_waypoints: List[Tuple[int, int, int]] = []
+        # Frozen waypoint copy for each net that's finished -- purely for
+        # rendering/export (see simplify_net_path).
         self.completed_net_paths: Dict[int, List[Tuple[int, int, int]]] = {}
 
         self._obs_cache: Optional[np.ndarray] = None
         self._congestion_cache: Optional[np.ndarray] = None
         self._clearance_cache: Optional[np.ndarray] = None
         self._obs_grid: Optional[np.ndarray] = None
-        # Obstacle-aware cost-to-go for the ACTIVE net's target, rebuilt once
-        # per net (not per step -- same amortization as _refresh_static_segments
-        # in line_route_env.py). This is what lets a detour pay off before the
-        # collision fires, instead of only after -- see compute_geodesic_distance_field.
-        self._geodesic_cache: Optional[np.ndarray] = None
 
         if seed is not None:
             self.reset(seed=seed)
+
+    @property
+    def head_x(self) -> int:
+        """Convenience read for whichever net is about to act next. For
+        per-net bookkeeping across step() calls (e.g. deterministic-eval
+        retry avoidance), use info["acted_net_id"] / info["acted_head_pos"]
+        instead -- under round-robin a DIFFERENT net is "current" on every
+        call, so this property alone can't tell you what a specific net's
+        head just did."""
+        state = self.net_states.get(self.current_net_idx) if self.current_net_idx is not None else None
+        return state.head_x if state is not None else 0
+
+    @property
+    def head_y(self) -> int:
+        state = self.net_states.get(self.current_net_idx) if self.current_net_idx is not None else None
+        return state.head_y if state is not None else 0
+
+    @property
+    def head_layer(self) -> int:
+        state = self.net_states.get(self.current_net_idx) if self.current_net_idx is not None else None
+        return state.head_layer if state is not None else 0
 
     def decode_action(self, action: int) -> Tuple[int, int, int, int]:
         """Decode a discrete action into (dir_idx, dist_idx, layer_change, via_flag).
@@ -207,63 +242,62 @@ class PCBRouterEnv(gym.Env):
             seed=board_seed,
         )
 
-        self.current_net_idx = 0
         self.completed_nets = []
         self.failed_nets = []
         self.wirelength_per_net = {net.net_id: 0.0 for net in self.board.nets}
         self.vias_per_net = {net.net_id: 0 for net in self.board.nets}
         self.completed_net_paths = {}
         self.total_steps = 0
-        # Episode-lifetime count, unlike net_restart_count which resets per
-        # net -- lets a caller (train.py) see whether restarts are firing at
-        # all, since select_deterministic_action's retry-avoidance alone
-        # may resolve most jams before max_consecutive_collisions triggers
-        # one.
+        # Episode-lifetime count, unlike a net's own restart_count which is
+        # per net -- lets a caller (train.py) see whether restarts are
+        # firing at all, since select_deterministic_action's retry-avoidance
+        # alone may resolve most jams before max_consecutive_collisions
+        # triggers one.
         self.total_restarts_this_episode = 0
 
-        self._init_current_net()
+        # Obstacle grid must exist before any net's geodesic field can be
+        # built, so this runs before _init_net_state.
         self._precompute_static_caches()
-        self._update_geodesic_cache()
+
+        self.net_states = {}
+        for idx in range(len(self.board.nets)):
+            self._init_net_state(idx)
+        self._active_order = deque(range(len(self.board.nets)))
+        self.current_net_idx = self._active_order[0] if self._active_order else None
+
+        self._update_congestion_cache()
 
         obs = self._build_observation()
         info = self._get_info()
         return obs, info
 
-    def _init_current_net(self):
-        """Initialize head for the active unrouted net."""
-        if self.current_net_idx < len(self.board.nets):
-            active_net = self.board.nets[self.current_net_idx]
-            self.head_x = active_net.source_pad.x
-            self.head_y = active_net.source_pad.y
-            self.head_layer = active_net.source_pad.layer
-            self.head_prev_dir = None
-            self.steps_taken_current_net = 0
-            self.collision_run = 0
-            self._last_rejected_pos = None
-            self._visited_cells = {(self.head_x, self.head_y)}
-            self._current_net_waypoints = [(self.head_x, self.head_y, self.head_layer)]
-            self.net_restart_count = 0
-            # inf, not _geo_dist_at(source): the geodesic cache for THIS
-            # net's target hasn't been (re)built yet at this point in
-            # reset()/step()'s call order -- the first real step()
-            # establishes the true baseline.
-            self._best_dist_this_attempt = float("inf")
-            self._no_progress_run = 0
-            self._recent_positions = deque(maxlen=8)
-            # Persists ACROSS restarts (unlike everything above), reset only
-            # here at a genuinely new net -- see _restart_current_net().
-            self._net_dead_zones: set = set()
+    def _init_net_state(self, idx: int):
+        """Build a fresh _NetState for the net at board index idx -- head at
+        its source pad, empty retry/stall history, and this net's own
+        geodesic field computed once up front (see _NetState.geodesic_cache)."""
+        net = self.board.nets[idx]
+        state = _NetState()
+        state.head_x = net.source_pad.x
+        state.head_y = net.source_pad.y
+        state.head_layer = net.source_pad.layer
+        state.visited_cells = {(state.head_x, state.head_y)}
+        state.waypoints = [(state.head_x, state.head_y, state.head_layer)]
+        state.geodesic_cache = compute_geodesic_distance_field(
+            self.grid_size, net.target_pad.x, net.target_pad.y, self._obs_grid
+        )
+        state.best_dist_this_attempt = self._geo_dist_at(state.geodesic_cache, state.head_x, state.head_y)
+        self.net_states[idx] = state
 
-    def _restart_current_net(self):
+    def _restart_net(self, idx: int):
         """Wipe THIS net's progress and try it again from its source pad.
 
-        Deliberately does NOT touch steps_taken_current_net or
-        net_restart_count -- those are what bound how many restarts a net
-        gets before max_steps_per_net or max_net_restarts ends it for real,
-        same overall budget, just a fresh attempt within it.
+        Deliberately does NOT touch steps_taken or restart_count -- those
+        are what bound how many restarts a net gets before max_steps_per_net
+        or max_net_restarts ends it for real, same overall budget, just a
+        fresh attempt within it.
 
-        Also deliberately does NOT reset _net_dead_zones -- a restart with
-        an otherwise identical starting observation and an empty local
+        Also deliberately does NOT reset dead_zones -- a restart with an
+        otherwise identical starting observation and an empty local
         retry-history would make a DETERMINISTIC policy retrace the exact
         same path into the exact same jam, every time, for zero benefit.
         Recording the trap location HERE, before it's wiped below, is what
@@ -272,34 +306,34 @@ class PCBRouterEnv(gym.Env):
         re-approaches this spot, is not identical to what the failed
         attempt saw there.
         """
-        active_net = self.board.nets[self.current_net_idx]
+        net = self.board.nets[idx]
+        state = self.net_states[idx]
         self.total_restarts_this_episode += 1
-        self._net_dead_zones.update(self._recent_positions)
-        self._net_dead_zones.add((self.head_x, self.head_y))
-        if self._last_rejected_pos is not None:
-            self._net_dead_zones.add(self._last_rejected_pos)
-        self._recent_positions = deque(maxlen=8)
+        state.dead_zones.update(state.recent_positions)
+        state.dead_zones.add((state.head_x, state.head_y))
+        if state.last_rejected_pos is not None:
+            state.dead_zones.add(state.last_rejected_pos)
+        state.recent_positions = deque(maxlen=8)
         for layer_grid in self.board.copper_grid:
-            layer_grid[layer_grid == active_net.net_id] = 0
-        self.wirelength_per_net[active_net.net_id] = 0.0
-        self.vias_per_net[active_net.net_id] = 0
-        self.head_x = active_net.source_pad.x
-        self.head_y = active_net.source_pad.y
-        self.head_layer = active_net.source_pad.layer
-        self.head_prev_dir = None
-        self.collision_run = 0
-        self._last_rejected_pos = None
-        self._visited_cells = {(self.head_x, self.head_y)}
-        self._current_net_waypoints = [(self.head_x, self.head_y, self.head_layer)]
-        # Unlike _init_current_net(), the geodesic cache for this net is
-        # already built at this point (the net was already in progress) --
-        # use the real starting distance rather than inf.
-        self._best_dist_this_attempt = self._geo_dist_at(self.head_x, self.head_y)
-        self._no_progress_run = 0
+            layer_grid[layer_grid == net.net_id] = 0
+        self.wirelength_per_net[net.net_id] = 0.0
+        self.vias_per_net[net.net_id] = 0
+        state.head_x = net.source_pad.x
+        state.head_y = net.source_pad.y
+        state.head_layer = net.source_pad.layer
+        state.head_prev_dir = None
+        state.collision_run = 0
+        state.last_rejected_pos = None
+        state.visited_cells = {(state.head_x, state.head_y)}
+        state.waypoints = [(state.head_x, state.head_y, state.head_layer)]
+        state.best_dist_this_attempt = self._geo_dist_at(state.geodesic_cache, state.head_x, state.head_y)
+        state.no_progress_run = 0
 
     def _precompute_static_caches(self):
-        """Precompute obstacle masks, clearance field, and initial congestion."""
-        # 1. Obstacle grid
+        """Precompute obstacle masks and clearance field. Congestion is NOT
+        computed here -- it depends on current_net_idx (to exclude whichever
+        net is about to act), which isn't set yet at this point in reset();
+        the caller computes it explicitly once net state exists."""
         obs_grid = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         for obs in self.board.obstacles:
             x1 = max(0, obs.x1)
@@ -310,45 +344,31 @@ class PCBRouterEnv(gym.Env):
 
         self._clearance_cache = compute_clearance_field(self.grid_size, obs_grid)
         self._obs_grid = obs_grid
-        self._update_congestion_cache()
 
-    def _update_geodesic_cache(self):
-        """Rebuild the cost-to-go field for whichever net is active now.
-
-        Only the target moves between nets; the obstacle grid does not, so
-        `self._obs_grid` from `_precompute_static_caches` is reused rather
-        than rebuilt.
-        """
-        if self.current_net_idx >= len(self.board.nets):
-            self._geodesic_cache = None
-            return
-        target = self.board.nets[self.current_net_idx].target_pad
-        self._geodesic_cache = compute_geodesic_distance_field(
-            self.grid_size, target.x, target.y, self._obs_grid
-        )
-
-    def _geo_dist_at(self, x: float, y: float) -> float:
-        if self._geodesic_cache is None:
+    def _geo_dist_at(self, geodesic_cache: Optional[np.ndarray], x: float, y: float) -> float:
+        if geodesic_cache is None:
             return 0.0
         gx = int(np.clip(round(x), 0, self.grid_size - 1))
         gy = int(np.clip(round(y), 0, self.grid_size - 1))
-        return float(self._geodesic_cache[gy, gx])
+        return float(geodesic_cache[gy, gx])
 
-    def _geo_descent_dir(self, x: float, y: float) -> Tuple[float, float]:
+    def _geo_descent_dir(self, geodesic_cache: Optional[np.ndarray], x: float, y: float) -> Tuple[float, float]:
         """Which way the cost-to-go field decreases fastest -- the direction
         that walks around whatever is in the way instead of into it."""
-        if self._geodesic_cache is None:
+        if geodesic_cache is None:
             return (0.0, 0.0)
         gx = int(np.clip(round(x), 1, self.grid_size - 2))
         gy = int(np.clip(round(y), 1, self.grid_size - 2))
-        ddx = self._geodesic_cache[gy, gx - 1] - self._geodesic_cache[gy, gx + 1]
-        ddy = self._geodesic_cache[gy - 1, gx] - self._geodesic_cache[gy + 1, gx]
+        ddx = geodesic_cache[gy, gx - 1] - geodesic_cache[gy, gx + 1]
+        ddy = geodesic_cache[gy - 1, gx] - geodesic_cache[gy + 1, gx]
         norm = math.hypot(ddx, ddy)
         if norm < 1e-6:
             return (0.0, 0.0)
         return (ddx / norm, ddy / norm)
 
-    def _relative_direction_vector(self, dir_idx: int, x: float, y: float, target_x: float, target_y: float) -> Tuple[float, float]:
+    def _relative_direction_vector(
+        self, geodesic_cache: Optional[np.ndarray], dir_idx: int, x: float, y: float, target_x: float, target_y: float
+    ) -> Tuple[float, float]:
         """dir_idx=0 means 'toward the target' (or around whatever the
         geodesic field says is in the way, when one exists) -- the same free
         baseline `pcbworld/env/line_route_env.py`'s bearing-relative frame
@@ -363,7 +383,7 @@ class PCBRouterEnv(gym.Env):
         dir_idx counts 45-degree steps around from there, covering the same
         full circle DIR_VECTORS did.
         """
-        gdx, gdy = self._geo_descent_dir(x, y) if self._geodesic_cache is not None else (0.0, 0.0)
+        gdx, gdy = self._geo_descent_dir(geodesic_cache, x, y) if geodesic_cache is not None else (0.0, 0.0)
         if gdx == 0.0 and gdy == 0.0:
             gdx, gdy = target_x - x, target_y - y
             norm = math.hypot(gdx, gdy)
@@ -385,10 +405,15 @@ class PCBRouterEnv(gym.Env):
         docs/AI_ARCHITECTURE.md's reserve-plane rule: this signal is for
         space LATER nets will need, and must not tax the net currently
         being routed for occupying its own path.
+
+        Recomputed every step under round-robin (cheap -- downsampled,
+        vectorized, see compute_net_demand_heatmap) rather than only at net
+        transitions, since both "which nets are unrouted" and "which net is
+        excluded as active" can change on every single step now.
         """
         active_id = (
             self.board.nets[self.current_net_idx].net_id
-            if self.current_net_idx < len(self.board.nets)
+            if self.current_net_idx is not None
             else None
         )
         unrouted = [
@@ -401,25 +426,29 @@ class PCBRouterEnv(gym.Env):
         self._congestion_cache = compute_net_demand_heatmap(self.grid_size, unrouted, obs_mask)
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        idx = self.current_net_idx
+        if idx is None:
+            raise RuntimeError("step() called with no active net -- check terminated/truncated before calling again")
+        state = self.net_states[idx]
+        active_net = self.board.nets[idx]
+        target = active_net.target_pad
+
         dir_idx, dist_idx, layer_change, via_flag = self.decode_action(action)
         step_dist = DIST_STEPS[dist_idx]
 
-        active_net = self.board.nets[self.current_net_idx]
-        target = active_net.target_pad
-
-        prev_x, prev_y, prev_layer = self.head_x, self.head_y, self.head_layer
-        dir_x, dir_y = self._relative_direction_vector(dir_idx, prev_x, prev_y, target.x, target.y)
+        prev_x, prev_y, prev_layer = state.head_x, state.head_y, state.head_layer
+        dir_x, dir_y = self._relative_direction_vector(state.geodesic_cache, dir_idx, prev_x, prev_y, target.x, target.y)
         # Obstacle-aware cost-to-go, not straight-line -- a straight-line
         # potential pays off walking INTO whatever is in the way right up
         # until the collision fires. See compute_geodesic_distance_field.
-        prev_dist = self._geo_dist_at(prev_x, prev_y)
+        prev_dist = self._geo_dist_at(state.geodesic_cache, prev_x, prev_y)
 
         # 1. Execute via / layer change
         is_via = False
         if via_flag == 1 or layer_change == 1:
             new_layer = 1 - prev_layer  # Switch between Layer 0 and Layer 1
             is_via = True
-            self.head_layer = new_layer
+            state.head_layer = new_layer
             self.vias_per_net[active_net.net_id] += 1
 
         # 2. Compute new head coordinate. Rounded to int: _rasterize_line's
@@ -430,7 +459,7 @@ class PCBRouterEnv(gym.Env):
         new_y = int(round(prev_y + dir_y * step_dist))
 
         step_len = math.hypot(new_x - prev_x, new_y - prev_y)
-        self.steps_taken_current_net += 1
+        state.steps_taken += 1
         self.total_steps += 1
 
         # 3. Check for boundary collision
@@ -442,21 +471,21 @@ class PCBRouterEnv(gym.Env):
         is_collided = out_of_bounds
         if not is_collided:
             is_collided = self._check_line_collision(
-                prev_x, prev_y, new_x, new_y, self.head_layer, active_net.net_id
+                prev_x, prev_y, new_x, new_y, state.head_layer, active_net.net_id
             )
 
         # 5. Check if target pad reached -- physical proximity, so Euclidean
         # is correct here even though the reward below uses the geodesic
         # distance (near the pad the two coincide anyway).
         curr_dist = math.hypot(new_x - target.x, new_y - target.y)
-        curr_dist_geo = self._geo_dist_at(new_x, new_y)
+        curr_dist_geo = self._geo_dist_at(state.geodesic_cache, new_x, new_y)
         is_connected = False
 
         is_revisit = False
         if not is_collided:
             # Draw line segment into copper grid
             self._rasterize_line(
-                prev_x, prev_y, new_x, new_y, self.head_layer, active_net.net_id
+                prev_x, prev_y, new_x, new_y, state.head_layer, active_net.net_id
             )
             # Revisit check: did this step cross any cell THIS net has
             # already been through (excluding prev_x,prev_y itself, which is
@@ -464,12 +493,12 @@ class PCBRouterEnv(gym.Env):
             # around an obstacle does not re-cross its own earlier path, so
             # this only fires on genuine backtracking/looping.
             new_points = self._get_line_points(prev_x, prev_y, new_x, new_y)[1:]
-            is_revisit = any(p in self._visited_cells for p in new_points)
-            self._visited_cells.update(new_points)
-            self.head_x = new_x
-            self.head_y = new_y
-            self._recent_positions.append((new_x, new_y))
-            self._current_net_waypoints.append((new_x, new_y, self.head_layer))
+            is_revisit = any(p in state.visited_cells for p in new_points)
+            state.visited_cells.update(new_points)
+            state.head_x = new_x
+            state.head_y = new_y
+            state.recent_positions.append((new_x, new_y))
+            state.waypoints.append((new_x, new_y, state.head_layer))
             self.wirelength_per_net[active_net.net_id] += step_len
 
             # Progress tracking -- separate from collisions entirely.
@@ -477,25 +506,25 @@ class PCBRouterEnv(gym.Env):
             # collides, so it would otherwise be invisible to "jammed"
             # below and just burn the whole step budget looping. 1.0-cell
             # tolerance for float/geodesic noise, not a real threshold.
-            if curr_dist_geo < self._best_dist_this_attempt - 1.0:
-                self._best_dist_this_attempt = curr_dist_geo
-                self._no_progress_run = 0
+            if curr_dist_geo < state.best_dist_this_attempt - 1.0:
+                state.best_dist_this_attempt = curr_dist_geo
+                state.no_progress_run = 0
             else:
-                self._no_progress_run += 1
+                state.no_progress_run += 1
 
-            if curr_dist <= self.snap_radius and (self.head_layer == target.layer):
+            if curr_dist <= self.snap_radius and (state.head_layer == target.layer):
                 is_connected = True
                 # Connect directly to target pad center
                 self._rasterize_line(
-                    self.head_x, self.head_y, target.x, target.y, target.layer, active_net.net_id
+                    state.head_x, state.head_y, target.x, target.y, target.layer, active_net.net_id
                 )
-                self._current_net_waypoints.append((target.x, target.y, target.layer))
-                self.completed_net_paths[active_net.net_id] = list(self._current_net_waypoints)
+                state.waypoints.append((target.x, target.y, target.layer))
+                self.completed_net_paths[active_net.net_id] = list(state.waypoints)
                 self.completed_nets.append(active_net.net_id)
 
         # Check bend
-        is_bend = (self.head_prev_dir is not None) and (self.head_prev_dir != dir_idx)
-        self.head_prev_dir = dir_idx
+        is_bend = (state.head_prev_dir is not None) and (state.head_prev_dir != dir_idx)
+        state.head_prev_dir = dir_idx
 
         # Heading alignment against the field's descent direction, not the
         # straight bearing to the pad -- this is what actually rewards
@@ -503,7 +532,7 @@ class PCBRouterEnv(gym.Env):
         # straight bearing only where the field has no local gradient (e.g.
         # against the board edge).
         act_norm = math.hypot(dir_x, dir_y)
-        gdx, gdy = self._geo_descent_dir(prev_x, prev_y)
+        gdx, gdy = self._geo_descent_dir(state.geodesic_cache, prev_x, prev_y)
         if act_norm > 1e-4 and (abs(gdx) > 1e-6 or abs(gdy) > 1e-6):
             heading_alignment = float((gdx * dir_x + gdy * dir_y) / act_norm)
         else:
@@ -542,46 +571,61 @@ class PCBRouterEnv(gym.Env):
         # vector env ("a colliding head is not jammed, it is contouring").
         # Only give up once actually stuck: several consecutive rejected
         # moves in a row, not one.
-        self.collision_run = self.collision_run + 1 if is_collided else 0
-        stalled = self._no_progress_run >= self.max_no_progress_steps
-        jammed = (self.collision_run >= self.max_consecutive_collisions) or stalled
+        state.collision_run = state.collision_run + 1 if is_collided else 0
+        stalled = state.no_progress_run >= self.max_no_progress_steps
+        jammed = (state.collision_run >= self.max_consecutive_collisions) or stalled
         # WHERE the rejection landed, for Channel 9 -- cleared the instant a
         # move succeeds, so this is strictly "what just happened", not a
         # lingering mark.
-        self._last_rejected_pos = (new_x, new_y) if is_collided else None
+        state.last_rejected_pos = (new_x, new_y) if is_collided else None
 
         # Every local option from the stuck position has now been tried and
         # failed (see max_consecutive_collisions). Restarting from the
         # source pad is a bounded way to "back up and try a different path"
         # instead of only ever searching alternatives from inside the same
-        # trap -- see _restart_current_net(). Still bounded by
-        # max_steps_per_net below, so this cannot run forever.
-        if jammed and self.net_restart_count < self.max_net_restarts:
-            self.net_restart_count += 1
-            self._restart_current_net()
+        # trap -- see _restart_net(). Still bounded by max_steps_per_net
+        # below, so this cannot run forever.
+        if jammed and state.restart_count < self.max_net_restarts:
+            state.restart_count += 1
+            self._restart_net(idx)
             jammed = False
 
-        # Transition / Termination logic
-        net_timeout = self.steps_taken_current_net >= self.max_steps_per_net
+        # Transition logic
+        net_timeout = state.steps_taken >= self.max_steps_per_net
         net_done = is_connected or jammed or net_timeout
 
         if net_done and not is_connected:
             self.failed_nets.append(active_net.net_id)
 
-        terminated = False
+        acted_net_id = active_net.net_id
+        acted_head_pos = (state.head_x, state.head_y, state.head_layer)
+
+        # Round-robin: this net's turn is over regardless of net_done -- if
+        # it isn't finished, it goes to the BACK of the queue instead of
+        # getting another immediate turn, so every active net grows
+        # interleaved rather than one being fully resolved before the next
+        # even starts.
+        self._active_order.popleft()
+        if not net_done:
+            self._active_order.append(idx)
+
+        terminated = len(self._active_order) == 0
         truncated = False
 
-        if net_done:
-            self.current_net_idx += 1
-            if self.current_net_idx < len(self.board.nets):
-                self._init_current_net()
-                self._update_congestion_cache()
-                self._update_geodesic_cache()
-            else:
-                terminated = True
+        if not terminated:
+            self.current_net_idx = self._active_order[0]
+            self._update_congestion_cache()
+        else:
+            self.current_net_idx = None
 
         obs = self._build_observation()
         info = self._get_info()
+        # What THIS step actually did, independent of whichever net is now
+        # "current" for the next call -- a caller doing per-net bookkeeping
+        # across steps (e.g. deterministic-eval retry avoidance) needs this,
+        # not head_x/head_y, since a different net is current every call.
+        info["acted_net_id"] = acted_net_id
+        info["acted_head_pos"] = acted_head_pos
         return obs, reward, terminated, truncated, info
 
     def _check_line_collision(
@@ -690,33 +734,42 @@ class PCBRouterEnv(gym.Env):
         return simplified
 
     def _build_observation(self) -> np.ndarray:
-        """Construct the (10, 256, 256) spatial observation tensor."""
+        """Construct the (10, 256, 256) spatial observation tensor, for
+        whichever net is current_net_idx (about to act next)."""
         obs = np.zeros((10, self.grid_size, self.grid_size), dtype=np.float32)
 
-        active_net = None
-        if self.current_net_idx < len(self.board.nets):
-            active_net = self.board.nets[self.current_net_idx]
+        idx = self.current_net_idx
+        active_net = self.board.nets[idx] if idx is not None else None
+        state = self.net_states.get(idx) if idx is not None else None
+
+        head_x = state.head_x if state is not None else 0
+        head_y = state.head_y if state is not None else 0
+        head_layer = state.head_layer if state is not None else 0
+        geodesic_cache = state.geodesic_cache if state is not None else None
+        last_rejected_pos = state.last_rejected_pos if state is not None else None
+        collision_run = state.collision_run if state is not None else 0
+        dead_zones = state.dead_zones if state is not None else set()
 
         # Channel 0: Existing copper (binary/normalized)
-        obs[0] = (self.board.copper_grid[self.head_layer] > 0).astype(np.float32)
+        obs[0] = (self.board.copper_grid[head_layer] > 0).astype(np.float32)
 
         # Channel 1: Obstacles
         for obs_rect in self.board.obstacles:
-            if obs_rect.layer == -1 or obs_rect.layer == self.head_layer:
+            if obs_rect.layer == -1 or obs_rect.layer == head_layer:
                 obs[1, obs_rect.y1:obs_rect.y2, obs_rect.x1:obs_rect.x2] = 1.0
 
         # Channel 2: Pads (Source & Target)
         for net in self.board.nets:
             for pad in [net.source_pad, net.target_pad]:
-                if pad.layer == self.head_layer:
+                if pad.layer == head_layer:
                     y_coords, x_coords = np.ogrid[:self.grid_size, :self.grid_size]
                     mask = (x_coords - pad.x) ** 2 + (y_coords - pad.y) ** 2 <= pad.radius ** 2
                     obs[2, mask] = 1.0
 
         # Channel 3: Current Routing Head (Gaussian spot)
-        if 0 <= self.head_x < self.grid_size and 0 <= self.head_y < self.grid_size:
+        if 0 <= head_x < self.grid_size and 0 <= head_y < self.grid_size:
             y_coords, x_coords = np.ogrid[:self.grid_size, :self.grid_size]
-            dist_sq = (x_coords - self.head_x) ** 2 + (y_coords - self.head_y) ** 2
+            dist_sq = (x_coords - head_x) ** 2 + (y_coords - head_y) ** 2
             obs[3] = np.exp(-0.5 * dist_sq / 16.0).astype(np.float32)
 
         # Channel 4: Unrouted net demand heatmap
@@ -736,12 +789,12 @@ class PCBRouterEnv(gym.Env):
         # the same constant a Euclidean field would use, so the channel's
         # scale stays stationary across nets even though a detour's true
         # cost-to-go can exceed straight-line distance.
-        if self._geodesic_cache is not None:
+        if geodesic_cache is not None:
             max_dist = math.hypot(self.grid_size, self.grid_size)
-            obs[7] = np.clip(self._geodesic_cache / max_dist, 0.0, 1.0)
+            obs[7] = np.clip(geodesic_cache / max_dist, 0.0, 1.0)
 
         # Channel 8: Layer occupancy (1.0 on top layer, 0.0 on bottom)
-        obs[8].fill(1.0 if self.head_layer == 0 else 0.0)
+        obs[8].fill(1.0 if head_layer == 0 else 0.0)
 
         # Channel 9: Rejection feedback -- WHERE the last move was rejected
         # (Gaussian marker, same shape as the Channel 3 head spot) and HOW
@@ -754,9 +807,9 @@ class PCBRouterEnv(gym.Env):
         # than only being reachable through the reward gradient over many
         # future episodes.
         y_coords, x_coords = np.ogrid[:self.grid_size, :self.grid_size]
-        if self._last_rejected_pos is not None:
-            lx, ly = self._last_rejected_pos
-            intensity = min(1.0, self.collision_run / max(1, self.max_consecutive_collisions))
+        if last_rejected_pos is not None:
+            lx, ly = last_rejected_pos
+            intensity = min(1.0, collision_run / max(1, self.max_consecutive_collisions))
             dist_sq = (x_coords - lx) ** 2 + (y_coords - ly) ** 2
             obs[9] = (intensity * np.exp(-0.5 * dist_sq / 16.0)).astype(np.float32)
 
@@ -767,20 +820,23 @@ class PCBRouterEnv(gym.Env):
         # Without this, a restart's starting observation is bit-identical to
         # the failed attempt's, and a deterministic policy would just
         # retrace the exact same path into the exact same jam -- see
-        # _restart_current_net().
-        for dx, dy in self._net_dead_zones:
+        # _restart_net().
+        for dx, dy in dead_zones:
             dist_sq = (x_coords - dx) ** 2 + (y_coords - dy) ** 2
             obs[9] = np.maximum(obs[9], np.exp(-0.5 * dist_sq / 16.0).astype(np.float32))
 
         return obs
 
     def _get_info(self) -> Dict[str, Any]:
+        idx = self.current_net_idx
+        state = self.net_states.get(idx) if idx is not None else None
+        head_pos = (state.head_x, state.head_y, state.head_layer) if state is not None else (0, 0, 0)
         return {
             "completed_nets": len(self.completed_nets),
             "failed_nets": len(self.failed_nets),
             "total_nets": len(self.board.nets) if self.board else 0,
             "completion_rate": (len(self.completed_nets) / len(self.board.nets)) if self.board and len(self.board.nets) > 0 else 0.0,
-            "head_pos": (self.head_x, self.head_y, self.head_layer),
+            "head_pos": head_pos,
             "vias": sum(self.vias_per_net.values()),
             "total_wirelength": sum(self.wirelength_per_net.values()),
             "total_steps": self.total_steps,

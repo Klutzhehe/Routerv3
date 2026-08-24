@@ -75,25 +75,27 @@ def evaluate_policy(
                 net.target_pad.y - net.source_pad.y,
             )
 
-        # Rejected-action-avoidance state: reset whenever the head actually
-        # moves. See select_deterministic_action's docstring -- plain argmax
-        # retries an identical rejected move forever.
-        forbidden: set[int] = set()
-        prev_head = env.head_x, env.head_y
+        # Rejected-action-avoidance state: reset whenever a net's head
+        # actually moves. See select_deterministic_action's docstring --
+        # plain argmax retries an identical rejected move forever. Keyed per
+        # net (not one shared set) because round-robin makes a different net
+        # current_net_idx on every step() call.
+        forbidden_by_net: Dict[int, set] = {}
         while not done:
             obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=dev).unsqueeze(0)
+            acting_idx = env.current_net_idx
+            prev_head = (env.head_x, env.head_y)
             with torch.no_grad():
                 dist, _ = model(obs_t)
-                action = select_deterministic_action(dist, forbidden)
+                action = select_deterministic_action(dist, forbidden_by_net.get(acting_idx, set()))
 
             obs_np, reward, term, trunc, step_info = env.step(action)
             done = term or trunc
-            new_head = env.head_x, env.head_y
+            new_head = step_info["acted_head_pos"][:2]
             if new_head == prev_head:
-                forbidden.add(action)
+                forbidden_by_net[acting_idx] = forbidden_by_net.get(acting_idx, set()) | {action}
             else:
-                forbidden = set()
-            prev_head = new_head
+                forbidden_by_net[acting_idx] = set()
 
         completed_nets += step_info.get("completed_nets", 0)
         total_nets += step_info.get("total_nets", 0)

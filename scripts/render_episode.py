@@ -61,19 +61,27 @@ def main():
     obs_np, info = env.reset(seed=args.seed)
 
     done = False
-    forbidden: set[int] = set()
-    prev_head = env.head_x, env.head_y
+    # Round-robin means a DIFFERENT net can be current_net_idx on every
+    # step() call, so retry-avoidance has to be tracked per net -- a
+    # forbidden set keyed by whichever net just acted, not one shared set
+    # that silently mixes different nets' rejected actions together.
+    forbidden_by_net: dict[int, set[int]] = {}
     while not done:
         obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device_str).unsqueeze(0)
+        acting_idx = env.current_net_idx
+        prev_head = (env.head_x, env.head_y)
         with torch.no_grad():
             dist, _ = model(obs_t)
+            forbidden = forbidden_by_net.get(acting_idx, set())
             action = int(dist.sample().item()) if args.stochastic else select_deterministic_action(dist, forbidden)
         obs_np, reward, term, trunc, info = env.step(action)
         done = term or trunc
-        new_head = env.head_x, env.head_y
         if not args.stochastic:
-            forbidden = forbidden | {action} if new_head == prev_head else set()
-        prev_head = new_head
+            new_head = info["acted_head_pos"][:2]
+            if new_head == prev_head:
+                forbidden_by_net[acting_idx] = forbidden_by_net.get(acting_idx, set()) | {action}
+            else:
+                forbidden_by_net[acting_idx] = set()
 
     print(f"completed_nets={info['completed_nets']}/{info['total_nets']}  "
           f"failed_nets={info['failed_nets']}  wirelength={info['total_wirelength']:.1f}  "
