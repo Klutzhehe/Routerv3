@@ -58,22 +58,31 @@ DIST_SAFETY_DIM = RAYCAST_NUM_DIRS * len(DIST_STEPS)
 # softmax/argmax) -- it only ever discriminates when it has real
 # information to add.
 #
-# Raised 8.0 -> 32.0 (2026-08-25): checkpoints_stage2_v9_collision's
-# converged entropy was ~0.001 (near-deterministic), meaning policy_head's
-# OWN learned logit gaps between actions can plausibly exceed 8.0 by
-# training's end -- in that regime this constant is a true-positive
-# collision flag that still loses to a policy_head that has learned (for
-# unrelated reasons) to strongly prefer the colliding action anyway, and
-# the 1.51% residual Rejected-Action Rate on the 1000-board benchmark could
-# be that, rather than the sensor being wrong. 32.0 is deliberately a big
-# jump (not a gentle nudge) specifically to falsify-or-confirm that in one
-# retrain: if Rejected-Action Rate drops sharply, magnitude was the
-# bottleneck; if it barely moves, the sensor itself must be wrong for the
-# remaining cases (e.g. its bearing reference is the raw, not smoothed,
-# geodesic gradient -- see _raycast_sensor's docstring -- which no amount
-# of suppression magnitude can fix, since dist_safe would read "safe" for
-# the wrong direction).
-DIST_SAFETY_SUPPRESSION = 32.0
+# Tried raising 8.0 -> 32.0 (2026-08-25, checkpoints_stage2_v10_suppress32):
+# a deliberately large jump to test whether policy_head's own learned logit
+# gaps (converged entropy ~0.001, i.e. near-deterministic) were simply
+# outscoring this constant. Result: Rejected-Action Rate on the 1000-board
+# benchmark did NOT improve (1.51% -> 1.81%, within run-to-run retrain
+# noise) -- magnitude was not the bottleneck, so reverted to 8.0. Confirms
+# the residual rejections are a false-negative problem (dist_safe reading
+# "safe" for a direction the action won't actually move along), not a
+# suppression-strength one -- see NEIGHBOR_SUPPRESSION_FRACTION below and
+# _raycast_sensor's bearing-reference docstring for the actual fix.
+DIST_SAFETY_SUPPRESSION = 8.0
+# A (direction, distance) pair whose OWN ray reads safe still gets a
+# partial suppression if either circularly-adjacent direction (same
+# distance) reads unsafe -- see router_policy.py's forward(). Exists
+# because _raycast_sensor's bearing reference is the RAW geodesic
+# gradient, while the env's actual movement bearing is an EMA-SMOOTHED
+# version (environment.py's _smoothed_descent_dir) that can lag by more
+# than half a 45-degree dir_idx bucket right at obstacle-corner kinks --
+# confirmed the likely cause after DIST_SAFETY_SUPPRESSION=32.0 (a pure
+# magnitude fix) failed to move the Rejected-Action Rate at all. 0.5 is a
+# starting point, not tuned: half-strength means a lone adjacent-unsafe
+# reading discourages but doesn't forbid a direction outright, since it
+# might genuinely be a bearing-mismatch false negative OR a genuinely
+# fine direction that just happens to sit next to a blocked one.
+NEIGHBOR_SUPPRESSION_FRACTION = 0.5
 
 
 def combined_latent_dim(d_model: int) -> int:

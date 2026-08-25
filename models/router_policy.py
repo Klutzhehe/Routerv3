@@ -27,6 +27,7 @@ from models.pcb_encoder import (
     RAYCAST_NUM_DIRS,
     DIST_SAFETY_DIM,
     DIST_SAFETY_SUPPRESSION,
+    NEIGHBOR_SUPPRESSION_FRACTION,
     combined_latent_dim,
 )
 from models.net_selector import NetSelectorHead
@@ -119,7 +120,10 @@ class PCBRouterNet(nn.Module):
         # exact (non-learned) boolean per (dir_idx, dist_idx) pair, so this
         # is a FIXED additive bias, not a learned Linear like the one above
         # -- see DIST_SAFETY_SUPPRESSION's docstring in pcb_encoder.py for
-        # why this one specifically should not be trainable away.
+        # why this one specifically should not be trainable away. forward()
+        # additionally widens this to circularly-adjacent directions at
+        # partial strength (NEIGHBOR_SUPPRESSION_FRACTION) to cover the
+        # sensor's own bearing uncertainty -- see that constant's docstring.
         assert action_dim % DIST_SAFETY_DIM == 0, (
             f"action_dim={action_dim} must be a multiple of {DIST_SAFETY_DIM} "
             "(one block of actions per (dir_idx, dist_idx) pair)"
@@ -179,7 +183,18 @@ class PCBRouterNet(nn.Module):
         action_logits = action_logits + dir_bias.repeat_interleave(self.actions_per_dir, dim=-1)
 
         B = dist_safe.shape[0]
-        distpair_bias = (dist_safe.reshape(B, -1) - 1.0) * DIST_SAFETY_SUPPRESSION  # (B, 24): 0 if safe, -SUPPRESSION if not
+        # unsafe: (B, 8, num_dists), 1.0 where THIS direction/distance
+        # collides. Widened with circularly-adjacent directions (dim=1,
+        # dir_idx wraps: 8 * 45deg = 360) at NEIGHBOR_SUPPRESSION_FRACTION
+        # strength -- see that constant's docstring in pcb_encoder.py for
+        # why: dist_safe's own bearing can be off by more than half a
+        # dir_idx bucket from the direction the action will actually move
+        # along, so a direction reading "safe" right next to one that
+        # collides is itself a plausible (partial-confidence) collision.
+        unsafe = 1.0 - dist_safe  # (B, 8, num_dists)
+        neighbor_unsafe = torch.roll(unsafe, shifts=1, dims=1) + torch.roll(unsafe, shifts=-1, dims=1)
+        widened_unsafe = torch.maximum(unsafe, (neighbor_unsafe > 0.5).float() * NEIGHBOR_SUPPRESSION_FRACTION)
+        distpair_bias = -widened_unsafe.reshape(B, -1) * DIST_SAFETY_SUPPRESSION  # (B, 24): 0 if safe, up to -SUPPRESSION if not
         action_logits = action_logits + distpair_bias.repeat_interleave(self.actions_per_distpair, dim=-1)
 
         dist = Categorical(logits=action_logits)
