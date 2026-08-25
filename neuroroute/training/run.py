@@ -31,6 +31,8 @@ from pathlib import Path
 
 import torch
 
+from dataclasses import replace
+
 from neuroroute.env.baselines import detour_action, greedy_safe_action, layer_hop_action
 from neuroroute.env.observation import FIELD_CHANNELS, head_feature_dim, net_feature_dim
 from neuroroute.env.rewards import terminal_reward
@@ -69,6 +71,16 @@ def build(args):
     )
     env = NeuroRouteEnv(stage_env_config(stage, world, EnvConfig(seed=args.seed)))
 
+    # A SEPARATE, wider environment for eval. Reusing the training env pins the
+    # eval set to `--batch` boards, and at stage 0 that made each board worth
+    # 6.25% of the reported number: 75.0% was 12/16 and 87.5% was 14/16, so
+    # real progress and one board of noise were indistinguishable. Eval is
+    # infrequent, so the extra memory is cheap.
+    eval_world = replace(world, batch_size=args.eval_boards)
+    eval_env = NeuroRouteEnv(
+        stage_env_config(stage, eval_world, EnvConfig(seed=args.seed + 10_000))
+    )
+
     L = stage.board.num_layers
     rules = stage.board.rules
     policy = NeuroRoutePolicy(
@@ -80,7 +92,7 @@ def build(args):
         num_width_classes=rules.num_width_classes,
         width=args.width,
     ).to(args.device)
-    return env, policy, stage
+    return env, eval_env, policy, stage
 
 
 @torch.no_grad()
@@ -159,12 +171,32 @@ def drc_check(env: NeuroRouteEnv, out_dir: Path, tag: str, n_boards: int = 2) ->
     }
 
 
+def _tune_backend(device: str) -> None:
+    """Cheap, safe CUDA backend settings.
+
+    `cudnn.benchmark` lets cuDNN pick the fastest algorithm per convolution
+    shape. It costs a few slow iterations while it probes, then pays for the
+    rest of the run -- and this workload has completely fixed shapes, which is
+    exactly the case it is designed for.
+
+    TF32 is a no-op on Turing (a T4 has no TF32 units) but a real speedup on
+    Ampere and later, so it is set unconditionally rather than gated on a
+    capability check that would just add a failure mode.
+    """
+    if not device.startswith("cuda"):
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
 def train(args) -> int:
     torch.manual_seed(args.seed)
+    _tune_backend(args.device)
     out = Path(args.checkpoint_dir)
     tel = Telemetry(out, run_name=f"stage{args.stage}")
 
-    env, policy, stage = build(args)
+    env, eval_env, policy, stage = build(args)
     dev = torch.device(args.device)
     n_params = sum(p.numel() for p in policy.parameters())
 
@@ -180,6 +212,10 @@ def train(args) -> int:
             "heads(K)": args.heads,
             "decisions/step": args.batch * args.heads,
             "rollout": args.rollout,
+            "ppo_chunk": f"{args.ppo_chunk}  ({args.ppo_chunk * args.batch} boards/pass)",
+            "amp": args.amp,
+            "eval_boards": args.eval_boards,
+            "entropy": f"{args.entropy} -> {args.entropy_final}",
             "updates": args.updates,
             "params_M": round(n_params / 1e6, 3),
             "lr": args.lr,
@@ -192,8 +228,11 @@ def train(args) -> int:
     ppo = PPOConfig(
         rollout_steps=args.rollout, lr=args.lr,
         store_device=args.store_device, entropy_coef=args.entropy,
+        entropy_final=args.entropy_final, chunk=args.ppo_chunk, amp=args.amp,
     )
     opt = torch.optim.Adam(policy.parameters(), lr=ppo.lr, eps=1e-5)
+    # fp16 GradScaler, only meaningful with --amp on CUDA.
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(args.amp and dev.type == "cuda"))
     buf = RolloutBuffer(ppo, dev)
 
     start_update = 0
@@ -251,7 +290,8 @@ def train(args) -> int:
 
             with tel.section("update"):
                 targets = episode_targets(env.world, latent_shape(env))
-                stats = ppo_update(policy, opt, buf, adv, ret, ppo, entropy_coef, targets)
+                stats = ppo_update(policy, opt, buf, adv, ret, ppo, entropy_coef,
+                                   targets, scaler=scaler)
 
             health = check_model_health(policy)
             for w in health.warnings:
@@ -300,8 +340,9 @@ def train(args) -> int:
             # -- eval -----------------------------------------------------
             if update > 0 and update % args.eval_every == 0:
                 with tel.section("eval"):
-                    seeds = list(range(args.eval_seed_base, args.eval_seed_base + args.batch))
-                    ev = evaluate(env, policy, seeds)
+                    seeds = list(range(args.eval_seed_base,
+                                       args.eval_seed_base + args.eval_boards))
+                    ev = evaluate(eval_env, policy, seeds)
                     with torch.no_grad():
                         gate = forecast_gate(
                             policy.act(obs).forecast,
@@ -310,8 +351,8 @@ def train(args) -> int:
                         )
 
                     tel.print("  " + "-" * 74)
-                    tel.print(f"  EVAL @ update {update}  (held-out seeds "
-                              f"{seeds[0]}..{seeds[-1]}, never trained on)")
+                    tel.print(f"  EVAL @ update {update}  ({args.eval_boards} held-out "
+                              f"boards, seeds {seeds[0]}..{seeds[-1]}, never trained on)")
                     tel.print(f"    policy     {ev['policy/completion']:6.1%}   "
                               f"rejected {ev['policy/rejected_action_rate']:6.2%}")
                     for nm in ("greedy", "detour", "layer_hop"):
@@ -329,7 +370,7 @@ def train(args) -> int:
                         f"{'BEATS baseline' if gate['beats_baseline'] else 'does NOT beat baseline'}"
                     )
 
-                    drc = drc_check(env, out / "drc", f"u{update}") if args.drc_every and \
+                    drc = drc_check(eval_env, out / "drc", f"u{update}") if args.drc_every and \
                         update % args.drc_every == 0 else {}
                     if drc:
                         if drc.get("drc/exporter_broken"):
@@ -357,10 +398,10 @@ def train(args) -> int:
                                 contact_sheet, learning_curves, render_board,
                             )
                             art = out / "renders"
-                            worst = int(env.world.completion().argmin())
-                            render_board(env.world, worst, art / f"u{update}_worst.png",
+                            worst = int(eval_env.world.completion().argmin())
+                            render_board(eval_env.world, worst, art / f"u{update}_worst.png",
                                          title=f"update {update}, worst board")
-                            contact_sheet(env.world, art / f"u{update}_sheet.png")
+                            contact_sheet(eval_env.world, art / f"u{update}_sheet.png")
                             learning_curves(tel.history, out / "curves.png")
                             tel.print(f"    renders -> {art}   curves -> {out/'curves.png'}")
                         except Exception as exc:  # rendering must never kill a run
@@ -432,6 +473,19 @@ def main() -> None:
     p.add_argument("--updates", type=int, default=500)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--entropy", type=float, default=0.01)
+    p.add_argument("--entropy-final", type=float, default=0.003,
+                   help="entropy coefficient floor. 0.001 let the policy go "
+                        "near-deterministic (H 2.1 -> 0.29) less than halfway "
+                        "through a run, locking in a via-less local optimum")
+    p.add_argument("--ppo-chunk", type=int, default=8,
+                   help="rollout timesteps folded into one forward/backward. "
+                        "The GPU utilisation knob; lower it first on OOM")
+    p.add_argument("--amp", action="store_true",
+                   help="fp16 autocast on CUDA. UNVERIFIED -- no GPU was "
+                        "available to test it; watch for [FATAL] non-finite")
+    p.add_argument("--eval-boards", type=int, default=64,
+                   help="held-out boards per eval. 16 gave 6.25%% resolution, "
+                        "too coarse to tell progress from noise")
     p.add_argument("--geodesic-refresh", type=int, default=0)
     p.add_argument("--store-device", default="cpu",
                    help="where rollout observations live; 'cpu' saves VRAM")

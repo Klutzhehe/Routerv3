@@ -31,6 +31,7 @@ ones with measured wins, and both are deliberately **not learned**:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -143,11 +144,30 @@ class NeuroRoutePolicy(nn.Module):
             nn.init.zeros_(head.bias)
         with torch.no_grad():
             self.h_dir.bias[0] = 2.0        # index 0 == down the geodesic gradient
-            # Strongly prefer staying. With L+1 options a bias of 2.0 still
-            # leaves ~52% of untrained actions attempting a via, and a via is
-            # an expensive, mostly-illegal action on a populated board. 4.0
-            # puts P(stay) near 0.9 at init while leaving vias reachable.
-            self.h_layer.bias[0] = 4.0      # index 0 == stay on this layer (no via)
+            # Index 0 == stay on this layer (no via). The bias is derived from
+            # the layer count so that P(stay) at init is ~0.75 REGARDLESS of L:
+            # softmax with `num_layers` via options and bias b gives
+            # P(stay) = e^b / (e^b + L), so b = log(3L) fixes P(stay) at 3/4.
+            #
+            # A fixed constant cannot do that. 4.0 was chosen when the problem
+            # was an untrained policy attempting mostly-impossible through-vias
+            # (92.6% rejected actions), and it over-corrected: it put P(stay)
+            # at ~0.97 on a 2-layer board, and under argmax -- which is what
+            # eval uses -- it meant "never place a via" until the learned
+            # logits could overcome 4.0.
+            #
+            # Measured consequence on stage 0: 4/16 boards have their two pads
+            # on different layers and are unroutable without a via, so a
+            # via-less policy is capped at exactly 75.0% -- which is precisely
+            # where held-out eval sat for three consecutive evals. The reward
+            # was never the problem: a correct via already scores +0.190
+            # against +0.021 for a lateral move. The policy simply never
+            # proposed one.
+            #
+            # The real defence against impossible vias is `via_safe`
+            # suppression in `_suppressed_layer_logits`, which is exact and
+            # non-learned. This bias only has to stop vias being the *default*.
+            self.h_layer.bias[0] = math.log(3.0 * self.num_layers)
             self.h_couple.bias[1] = 1.0     # keep differential pairs coupled by default
             # Index 0 means "the width this net actually requires" -- the
             # engine takes max(action, net_width), so class 0 is never a
@@ -274,9 +294,20 @@ class NeuroRoutePolicy(nn.Module):
             latent=z,
         )
 
-    def evaluate(self, obs: Observation, actions: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Re-score stored actions under the current parameters, for PPO."""
-        feat, g, _z, _f = self.encode(obs)
+    def evaluate(
+        self,
+        obs: Observation,
+        actions: dict[str, torch.Tensor],
+        return_forecast: bool = False,
+    ):
+        """Re-score stored actions under the current parameters, for PPO.
+
+        `return_forecast` hands back the forecaster output from the *same*
+        encode. The forecaster's supervised loss needs it, and encoding twice
+        would double the cost of the single most expensive part of the model
+        for information already computed.
+        """
+        feat, g, _z, forecast = self.encode(obs)
 
         d_dist = Categorical(logits=self._suppressed_dir_logits(feat, obs.safety))
         s_dist = Categorical(
@@ -292,6 +323,8 @@ class NeuroRoutePolicy(nn.Module):
             d_dist, s_dist, dists, actions, obs.head_is_pair, obs.head_mask
         )
         value = self.h_value(feat).squeeze(-1) * obs.head_mask.float()
+        if return_forecast:
+            return logp, entropy, value, forecast
         return logp, entropy, value
 
     def _score(self, d_dist, s_dist, dists, actions, is_pair, head_mask):
