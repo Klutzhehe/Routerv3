@@ -1,9 +1,14 @@
 """PCBRouterNet: Full Reinforcement Learning Actor-Critic Architecture.
 
 Combines:
-1. Spatial PCBEncoder (CNN + Transformer Backbone -> 512 latent)
+1. Spatial PCBEncoder (CNN + Transformer Backbone, plus local-attention
+   pool, non-learned raycast sensor, and local-crop CNN -- see
+   models/pcb_encoder.py and docs/WORLD_MODEL_SPATIAL_DESIGN.md -> combined
+   latent)
 2. NetSelectorHead (Optional Net Attention)
-3. 96-Action Router Policy Head (Categorical Action Distribution)
+3. 96-Action Router Policy Head (Categorical Action Distribution), plus a
+   direct raycast -> logit-bias path so a blocked direction is discouraged
+   by construction, not only by hoping the rest of the network learns it
 4. Value Critic Head (Scalar Board Return Estimate)
 """
 
@@ -15,7 +20,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
-from models.pcb_encoder import PCBEncoder
+from models.pcb_encoder import PCBEncoder, RAYCAST_NUM_DIRS, combined_latent_dim
 from models.net_selector import NetSelectorHead
 
 
@@ -43,9 +48,16 @@ class PCBRouterNet(nn.Module):
         # 2. Net Selector Head
         self.net_selector = NetSelectorHead(d_model=d_model)
 
+        # PCBEncoder now returns a wider latent (whole-board mean-pool +
+        # local-attention pool + raycast + local-crop CNN, see
+        # models/pcb_encoder.py) -- size the heads from that combined width
+        # instead of d_model directly, since it's derived, not d_model
+        # itself.
+        head_input_dim = combined_latent_dim(d_model)
+
         # 3. Router Action Policy Head (96 Discrete Growth Actions)
         self.policy_head = nn.Sequential(
-            nn.Linear(d_model, 256),
+            nn.Linear(head_input_dim, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
@@ -54,12 +66,41 @@ class PCBRouterNet(nn.Module):
 
         # 4. Value Critic Head (Predicts Future Expected PCB Return)
         self.value_head = nn.Sequential(
-            nn.Linear(d_model, 256),
+            nn.Linear(head_input_dim, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, 1),
         )
+
+        # 5. Direct raycast -> logit-bias path (see
+        # docs/WORLD_MODEL_SPATIAL_DESIGN.md's confidence assessment for why
+        # this is separate from policy_head rather than only concatenated
+        # into its input). action_dim must divide evenly by the 8 dir_idx
+        # values -- true for both the 24-action space (dir*3) and the
+        # 96-action space (dir*12).
+        assert action_dim % RAYCAST_NUM_DIRS == 0, (
+            f"action_dim={action_dim} must be a multiple of {RAYCAST_NUM_DIRS} "
+            "(one block of actions per dir_idx)"
+        )
+        self.actions_per_dir = action_dim // RAYCAST_NUM_DIRS
+        self.raycast_to_logit_bias = nn.Linear(RAYCAST_NUM_DIRS, RAYCAST_NUM_DIRS)
+        # Init so a direction's raycast reading directly discourages/favors
+        # its own dir_idx from step 0 -- raycast in [0,1] (0=blocked now,
+        # 1=free through the full cap), centered at 0.5 so a blocked
+        # direction gets a negative bias and a free one gets a positive
+        # bias, not just "less positive". scale=2.0 spans a ~7.4x
+        # (e^2) relative-weight swing between fully-blocked and fully-free
+        # -- a real nudge, same spirit as (and roughly the same order of
+        # magnitude as) the dir_idx==0 +0.5 tilt below, but per-board and
+        # per-step instead of a fixed constant. This does NOT depend on the
+        # rest of the network learning the "blocked direction -> avoid it"
+        # association -- it's structurally present before any training
+        # happens, and training only has to refine it.
+        with torch.no_grad():
+            nn.init.eye_(self.raycast_to_logit_bias.weight)
+            self.raycast_to_logit_bias.weight.mul_(2.0)
+            nn.init.constant_(self.raycast_to_logit_bias.bias, -1.0)
 
         # Initialize policy head near zero to prevent violent initial divergence.
         # gain=0.01 (not smaller) matters here in a way it wouldn't without
@@ -106,10 +147,12 @@ class PCBRouterNet(nn.Module):
             dist: Categorical distribution over 96 discrete actions
             value: (B, 1) state value estimate
         """
-        pcb_latent, _patch_tokens = self.encoder(obs)
+        pcb_latent, _patch_tokens, raycast_vector = self.encoder(obs)
 
         # Compute Action Logits & Distribution
         action_logits = self.policy_head(pcb_latent)
+        dir_bias = self.raycast_to_logit_bias(raycast_vector)  # (B, 8)
+        action_logits = action_logits + dir_bias.repeat_interleave(self.actions_per_dir, dim=-1)
         dist = Categorical(logits=action_logits)
 
         # Compute State Value

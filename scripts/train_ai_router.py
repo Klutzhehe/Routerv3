@@ -13,6 +13,7 @@ more than one at a time costs to debug.
 
 import argparse
 import os
+import subprocess
 import sys
 import torch
 
@@ -20,7 +21,27 @@ from training.train import train_single_net_policy
 from training.evaluation import evaluate_policy
 from pcbworld.environment import PCBRouterEnv
 from models.router_policy import PCBRouterNet
+from models.pcb_encoder import combined_latent_dim
 from models.fast_lookahead import FastDistancePredictor
+
+
+def _git_commit_str() -> str:
+    """Best-effort short commit hash + dirty flag, printed at the top of
+    every run so a returned log can be checked against `git log -1` before
+    trusting any number in it -- see memory project_pcb_router_workflow:
+    this repo has been burned by stale/ambiguous reports before. Falls back
+    to "unknown" rather than raising if git isn't available (e.g. a
+    from-a-tarball Colab checkout) -- this is a diagnostic nicety, not
+    something training should ever fail over.
+    """
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], stderr=subprocess.DEVNULL).decode().strip())
+        return f"{commit}{'-dirty' if dirty else ''}"
+    except Exception:
+        return "unknown"
 
 # One new axis of difficulty per stage. enable_layer_via stays False through
 # stage 3 -- board_generator.py sets tgt_layer = src_layer for these stages,
@@ -106,6 +127,8 @@ def main():
         fast_lookahead_predictor = _load_fast_lookahead_predictor(args.fast_lookahead_checkpoint, device_str)
 
     if args.eval_only:
+        print(f"Git commit: {_git_commit_str()} | Combined latent dim: {combined_latent_dim(256)} "
+              f"(raycast+local-crop+local-attn spatial encoder)")
         print(f"Loading checkpoint from: {args.checkpoint}")
         model = PCBRouterNet(in_channels=10, action_dim=action_dim, d_model=256, num_transformer_layers=2, num_heads=4)
         if args.checkpoint and os.path.exists(args.checkpoint):
@@ -118,8 +141,16 @@ def main():
     print("=" * 80)
     print(f"   STARTING MILESTONE {args.stage}: AI PCB ROUTER PLATFORM TRAINING")
     print(f"   Architecture: 10-Channel Grid + CNN-Transformer Policy (PCBRouterNet)")
+    print(f"     + spatial world model: 8-dir raycast (direct logit-bias),")
+    print(f"       local-attention pool, local-crop CNN -- combined latent dim {combined_latent_dim(256)}")
+    print(f"       (see docs/WORLD_MODEL_SPATIAL_DESIGN.md)")
+    print(f"   Git commit: {_git_commit_str()}")
     print(f"   Stage config: {stage_cfg}  |  max_steps_per_net: {args.max_steps}")
     print(f"   Device: {device_str.upper()} | Steps: {args.timesteps:,}")
+    if args.init_checkpoint:
+        print(f"   !! init_checkpoint={args.init_checkpoint} -- this will FAIL to load if that "
+              f"checkpoint predates the spatial world model (different architecture shape). "
+              f"Omit --init-checkpoint for a fresh run.")
     print("=" * 80)
 
     model = train_single_net_policy(
