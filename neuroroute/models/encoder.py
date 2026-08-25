@@ -233,7 +233,11 @@ class NetEncoder(nn.Module):
             d_model=width, nhead=heads, dim_feedforward=4 * width,
             batch_first=True, norm_first=True, dropout=0.0,
         )
-        self.blocks = nn.TransformerEncoder(enc, num_layers=layers)
+        # enable_nested_tensor=False on purpose: the nested-tensor fast path is
+        # incompatible with norm_first=True (which we want for training
+        # stability), and leaving it on emits a UserWarning on every
+        # construction that reads like a real error in a Colab log.
+        self.blocks = nn.TransformerEncoder(enc, num_layers=layers, enable_nested_tensor=False)
         self.out_dim = width
 
     def forward(self, nets: torch.Tensor, global_vec: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

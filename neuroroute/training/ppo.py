@@ -209,10 +209,10 @@ def ppo_update(
                 ent = (entropy * m).sum() / denom
                 total = total + pl + cfg.value_coef * vl - entropy_coef * ent
 
-                p_loss += float(pl)
-                v_loss += float(vl)
-                ent_term += float(ent)
-                clip_frac += float((((ratio - 1.0).abs() > cfg.clip).float() * m).sum() / denom)
+                p_loss += float(pl.detach())
+                v_loss += float(vl.detach())
+                ent_term += float(ent.detach())
+                clip_frac += float((((ratio - 1.0).abs() > cfg.clip).float() * m).sum().detach() / denom)
 
             # The forecaster is supervised, not reinforced. It is trained on
             # the *terminal* state of the episode this rollout came from, so
@@ -236,7 +236,7 @@ def ppo_update(
             stats["value_loss"] += v_loss / n
             stats["entropy"] += ent_term / n
             stats["clip_frac"] += clip_frac / n
-            stats["forecast"] += float(f_loss)
+            stats["forecast"] += float(f_loss.detach()) if torch.is_tensor(f_loss) else float(f_loss)
             n_updates += 1
 
     return {k: v / max(1, n_updates) for k, v in stats.items()}
