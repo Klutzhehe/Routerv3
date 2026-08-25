@@ -57,7 +57,23 @@ DIST_SAFETY_DIM = RAYCAST_NUM_DIRS * len(DIST_STEPS)
 # all of them and therefore changes nothing (a uniform shift never changes
 # softmax/argmax) -- it only ever discriminates when it has real
 # information to add.
-DIST_SAFETY_SUPPRESSION = 8.0
+#
+# Raised 8.0 -> 32.0 (2026-08-25): checkpoints_stage2_v9_collision's
+# converged entropy was ~0.001 (near-deterministic), meaning policy_head's
+# OWN learned logit gaps between actions can plausibly exceed 8.0 by
+# training's end -- in that regime this constant is a true-positive
+# collision flag that still loses to a policy_head that has learned (for
+# unrelated reasons) to strongly prefer the colliding action anyway, and
+# the 1.51% residual Rejected-Action Rate on the 1000-board benchmark could
+# be that, rather than the sensor being wrong. 32.0 is deliberately a big
+# jump (not a gentle nudge) specifically to falsify-or-confirm that in one
+# retrain: if Rejected-Action Rate drops sharply, magnitude was the
+# bottleneck; if it barely moves, the sensor itself must be wrong for the
+# remaining cases (e.g. its bearing reference is the raw, not smoothed,
+# geodesic gradient -- see _raycast_sensor's docstring -- which no amount
+# of suppression magnitude can fix, since dist_safe would read "safe" for
+# the wrong direction).
+DIST_SAFETY_SUPPRESSION = 32.0
 
 
 def combined_latent_dim(d_model: int) -> int:
