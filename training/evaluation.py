@@ -100,6 +100,18 @@ def evaluate_policy(
     total_vias = 0
     total_collisions = 0
     failed_seeds: List[int] = []
+    # Distinct from total_collisions above (which is actually a BOARD-level
+    # failure count, not a per-step one -- see its increment site below).
+    # This counts every individual step where the chosen action was
+    # rejected (head didn't move), across ALL boards regardless of whether
+    # that board ultimately succeeded. Completion rate alone can't show
+    # whether a collision-reduction change worked: a board can finish
+    # successfully after several wasted rejected-action retries, and that
+    # wouldn't move completion rate at all. Reuses the same
+    # `new_head == prev_head` rejection proxy select_deterministic_action's
+    # forbidden-set logic already depends on just below.
+    total_steps = 0
+    total_rejected_steps = 0
 
     for ep in range(num_eval_episodes):
         seed = eval_seed_offset + ep
@@ -147,8 +159,10 @@ def evaluate_policy(
             obs_np, reward, term, trunc, step_info = env.step(action)
             done = term or trunc
             new_head = step_info["acted_head_pos"][:2]
+            total_steps += 1
             if new_head == prev_head:
                 forbidden_by_net[acting_idx] = forbidden_by_net.get(acting_idx, set()) | {action}
+                total_rejected_steps += 1
             else:
                 forbidden_by_net[acting_idx] = set()
 
@@ -173,6 +187,9 @@ def evaluate_policy(
     print(f"Wirelength Ratio:             {wl_ratio:.2f}x (actual / straight-line)")
     print(f"Total Vias Used:              {total_vias}")
     print(f"Collision / Failure Rate:     {(total_collisions / num_eval_episodes) * 100.0:.2f}%")
+    rejected_rate = (total_rejected_steps / max(1, total_steps)) * 100.0
+    print(f"Rejected-Action Rate:         {rejected_rate:.2f}% ({total_rejected_steps}/{total_steps} steps -- "
+          f"self-inflicted illegal moves, NOT the same as board failure above)")
     if failed_seeds:
         print(f"Failed Board Seeds:           {failed_seeds}")
         print(f"  -> inspect with: python scripts/render_episode.py --seed {failed_seeds[0]} --checkpoint <path> --stage <N>")
