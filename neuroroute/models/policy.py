@@ -1,0 +1,364 @@
+"""`NeuroRoutePolicy` -- encoder, forecaster and the action heads.
+
+Action structure, and why it is what it is:
+
+* **Factorised, not a product space.** The flat product of every action
+  dimension is ~9k discrete actions; factorised it is ~31 logits. A 9k-way
+  softmax over a space where most combinations are nonsense is not a learnable
+  object.
+* **`step` is conditioned on `direction`.** These two are the one pair that
+  genuinely interacts: a direction can be clear for 2 cells and blocked at 8,
+  so independent marginals would call the pair "safe" while the specific move
+  collides. That exact gap is what `docs/WORLD_MODEL_SPATIAL_DESIGN.md`'s
+  addendum was written about (per-direction granularity was too coarse and
+  showed up as repeated same-spot rejections). Sampling direction first and
+  conditioning the step logits on it removes the problem structurally rather
+  than compensating for it with a penalty.
+* **Log-probs are masked to the dimensions that actually mattered.** When the
+  policy places a via, the engine ignores `direction`/`step`/`width`; counting
+  their log-probs would inject pure gradient noise on dimensions that had no
+  effect on the outcome.
+
+Two mechanisms are carried over from the raster thread because they are the
+ones with measured wins, and both are deliberately **not learned**:
+
+* the fixed per-(direction, step) safety suppression -- Rejected-Action Rate
+  1.51% -> 0.40% [LIVE];
+* the near-zero actor init, so an untrained policy emits action 0 and
+  therefore *is* the greedy router, starting training at the baseline instead
+  of below it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Categorical
+
+from neuroroute.env.observation import Observation
+from neuroroute.models.encoder import FieldEncoder, HeadCropEncoder, NetEncoder
+from neuroroute.models.forecaster import FORECAST_CHANNELS, Forecast, FutureFieldPredictor
+from neuroroute.world.spec import NUM_DIRECTIONS, NUM_STEPS
+
+#: Fixed, non-learned logit penalty for an action the geometry proves will
+#: collide. A constant, not an `nn.Parameter`: this project has direct prior
+#: history (`models/router_policy.py`'s init comment) of a learned bias being
+#: outgrown by the weight-driven logits it competed with, becoming negligible
+#: exactly when it mattered most. Applied after the head, so training can route
+#: around it but never erode it. If every option is unsafe the penalty is
+#: uniform, and a uniform shift changes neither softmax nor argmax -- so it can
+#: only ever discriminate when it has real information to add.
+SAFETY_SUPPRESSION = 8.0
+
+
+@dataclass
+class PolicyOutput:
+    actions: dict[str, torch.Tensor]
+    log_prob: torch.Tensor      # (B, K)
+    entropy: torch.Tensor       # (B, K)
+    value: torch.Tensor         # (B, K)
+    schedule_log_prob: torch.Tensor  # (B,)
+    forecast: Forecast
+    latent: torch.Tensor
+
+
+class NeuroRoutePolicy(nn.Module):
+    def __init__(
+        self,
+        field_channels: int,
+        head_features: int,
+        net_features: int,
+        num_layers: int,
+        num_via_classes: int,
+        num_width_classes: int,
+        width: int = 64,
+        head_width: int = 256,
+        crop: int = 16,
+        use_forecast: bool = True,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.use_forecast = use_forecast
+
+        self.field = FieldEncoder(field_channels, width=width)
+        self.crop = HeadCropEncoder(field_channels, num_layers, crop=crop)
+        self.nets = NetEncoder(net_features, self.field.global_dim)
+        self.forecaster = FutureFieldPredictor(width)
+
+        per_head = (
+            width                                  # latent gathered at the head cell
+            + self.crop.out_dim                    # native-resolution local crop
+            + head_features                        # exact geometry: raycast/safety/geodesic
+            + self.field.global_dim                # whole-board context
+            + (FORECAST_CHANNELS if use_forecast else 0)
+        )
+        self.trunk = nn.Sequential(
+            nn.Linear(per_head, head_width),
+            nn.SiLU(),
+            nn.Linear(head_width, head_width),
+            nn.SiLU(),
+            # LayerNorm is load-bearing, not decoration. The action heads are
+            # initialised at gain 0.01 so that the BIAS decides the untrained
+            # action -- that is what makes an untrained policy behave like the
+            # greedy router. Without normalisation the trunk's activations are
+            # large enough that 0.01 * sqrt(head_width) * |activation| still
+            # rivals the 2.0 direction bias, content noise wins the argmax, and
+            # the deterministic untrained policy collapses: measured at 84%
+            # rejected actions and 6.7% completion against greedy's 0.16% and
+            # 27.5%. With the norm the head start is real.
+            nn.LayerNorm(head_width),
+        )
+
+        self.h_dir = nn.Linear(head_width, NUM_DIRECTIONS)
+        self.dir_embed = nn.Embedding(NUM_DIRECTIONS, 32)
+        self.h_step = nn.Linear(head_width + 32, NUM_STEPS)
+        self.h_layer = nn.Linear(head_width, 1 + num_layers)
+        self.h_via = nn.Linear(head_width, num_via_classes)
+        self.h_width = nn.Linear(head_width, num_width_classes)
+        self.h_couple = nn.Linear(head_width, 2)
+        self.h_value = nn.Linear(head_width, 1)
+
+        self.h_schedule = nn.Sequential(
+            nn.Linear(self.nets.out_dim + self.field.global_dim, 128),
+            nn.SiLU(),
+            nn.Linear(128, 1),
+        )
+        self._init_actor()
+
+    def _init_actor(self) -> None:
+        """Near-zero weights, with the bias tilted toward the greedy action.
+
+        Every action head starts almost content-independent, and the bias
+        makes the resulting near-uniform-input choice be: go in the reference
+        bearing direction, stay on this layer, keep a pair coupled. That is
+        exactly the greedy baseline, so training starts *at* it. Losing this
+        init throws away a free head start -- which is the whole reason the
+        egocentric frame was chosen in the first place (docs/HANDOVER.md).
+        """
+        for head in (self.h_dir, self.h_step, self.h_layer, self.h_via, self.h_width, self.h_couple):
+            nn.init.orthogonal_(head.weight, gain=0.01)
+            nn.init.zeros_(head.bias)
+        with torch.no_grad():
+            self.h_dir.bias[0] = 2.0        # index 0 == down the geodesic gradient
+            # Strongly prefer staying. With L+1 options a bias of 2.0 still
+            # leaves ~52% of untrained actions attempting a via, and a via is
+            # an expensive, mostly-illegal action on a populated board. 4.0
+            # puts P(stay) near 0.9 at init while leaving vias reachable.
+            self.h_layer.bias[0] = 4.0      # index 0 == stay on this layer (no via)
+            self.h_couple.bias[1] = 1.0     # keep differential pairs coupled by default
+            # Index 0 means "the width this net actually requires" -- the
+            # engine takes max(action, net_width), so class 0 is never a
+            # violation. Without this bias the near-zero weights decide the
+            # argmax arbitrarily, and an untrained policy picked class 1 on
+            # 612 of 627 actions: 0.3 mm traces, three lattice cells wide,
+            # on a congested board. Almost everything collided (88% rejected
+            # actions) while `Observation.safety` -- computed at the net's
+            # REQUIRED width -- was still reporting those moves as clear.
+            # Widening is a real capability, but it has to be a decision the
+            # policy makes on purpose, not its default.
+            self.h_width.bias[0] = 2.0
+            self.h_via.bias[0] = 2.0        # smallest via unless asked otherwise
+            self.h_step.bias[0] = 0.5       # short steps are the safe default
+        nn.init.orthogonal_(self.h_value.weight, gain=1.0)
+        nn.init.zeros_(self.h_value.bias)
+
+    # -- feature assembly ---------------------------------------------------
+
+    def _gather_at_heads(self, grid: torch.Tensor, head_pos: torch.Tensor, fine_hw: tuple[int, int]) -> torch.Tensor:
+        """Sample a (B, C, L, h, w) grid at each head's cell. -> (B, K, C)"""
+        B, C, L, h, w = grid.shape
+        K = head_pos.shape[1]
+        sy = max(1, fine_hw[0] // h)
+        sx = max(1, fine_hw[1] // w)
+        b = torch.arange(B, device=grid.device).view(B, 1).expand(B, K)
+        lay = head_pos[..., 0].clamp(0, L - 1)
+        gy = (head_pos[..., 1] // sy).clamp(0, h - 1)
+        gx = (head_pos[..., 2] // sx).clamp(0, w - 1)
+        return grid[b, :, lay, gy, gx]
+
+    def encode(self, obs: Observation) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Forecast]:
+        z, g = self.field(obs.field)
+        forecast = self.forecaster(z)
+
+        B, K = obs.head_mask.shape
+        fine_hw = (obs.field.shape[-2], obs.field.shape[-1])
+
+        parts = [
+            self._gather_at_heads(z, obs.head_pos, fine_hw),
+            self.crop(obs.field, obs.head_pos, obs.head_mask),
+            obs.heads,
+            g.unsqueeze(1).expand(B, K, g.shape[-1]),
+        ]
+        if self.use_forecast:
+            # Detached: the forecaster is trained by its own supervised losses
+            # on completed episodes. Letting the RL gradient reshape it would
+            # turn a model of the future into whatever makes the critic's job
+            # easiest this update.
+            parts.append(self._gather_at_heads(forecast.as_channels().detach(), obs.head_pos, fine_hw))
+
+        feat = self.trunk(torch.cat(parts, dim=-1))
+        return feat, g, z, forecast
+
+    # -- action -------------------------------------------------------------
+
+    def _suppressed_dir_logits(self, feat: torch.Tensor, safety: torch.Tensor) -> torch.Tensor:
+        logits = self.h_dir(feat)
+        any_safe = safety.any(dim=-1)                       # (B, K, D)
+        return logits - SAFETY_SUPPRESSION * (~any_safe).float()
+
+    def _suppressed_layer_logits(self, feat: torch.Tensor, via_safe: torch.Tensor) -> torch.Tensor:
+        """Layer logits with impossible vias suppressed.
+
+        Index 0 is "stay", which is always available. Index `j+1` places a via
+        to layer `j`, and a through via has to be free on every layer at once
+        -- on a populated board most of those are impossible. Suppressing them
+        with the same fixed constant used for direction and step took the
+        untrained rejected-action rate from 92.6% to a fraction of that, and it
+        is not something the policy should have to learn from reward when the
+        geometry is available for free.
+        """
+        logits = self.h_layer(feat)
+        stay = torch.zeros_like(logits[..., :1])
+        via = -SAFETY_SUPPRESSION * (~via_safe).float()
+        return logits + torch.cat([stay, via], dim=-1)
+
+    def _suppressed_step_logits(
+        self, feat: torch.Tensor, safety: torch.Tensor, direction: torch.Tensor
+    ) -> torch.Tensor:
+        emb = self.dir_embed(direction)
+        logits = self.h_step(torch.cat([feat, emb], dim=-1))
+        chosen = safety.gather(
+            2, direction.unsqueeze(-1).unsqueeze(-1).expand(*direction.shape, 1, safety.shape[-1])
+        ).squeeze(2)                                        # (B, K, NUM_STEPS)
+        return logits - SAFETY_SUPPRESSION * (~chosen).float()
+
+    def act(self, obs: Observation, deterministic: bool = False) -> PolicyOutput:
+        feat, g, z, forecast = self.encode(obs)
+
+        dir_logits = self._suppressed_dir_logits(feat, obs.safety)
+        d_dist = Categorical(logits=dir_logits)
+        direction = dir_logits.argmax(-1) if deterministic else d_dist.sample()
+
+        step_logits = self._suppressed_step_logits(feat, obs.safety, direction)
+        s_dist = Categorical(logits=step_logits)
+        step = step_logits.argmax(-1) if deterministic else s_dist.sample()
+
+        dists = {
+            "layer": Categorical(logits=self._suppressed_layer_logits(feat, obs.via_safe)),
+            "via": Categorical(logits=self.h_via(feat)),
+            "width": Categorical(logits=self.h_width(feat)),
+            "couple": Categorical(logits=self.h_couple(feat)),
+        }
+        actions = {"direction": direction, "step": step}
+        for k, dist in dists.items():
+            actions[k] = dist.logits.argmax(-1) if deterministic else dist.sample()
+
+        logp, entropy = self._score(
+            d_dist, s_dist, dists, actions, obs.head_is_pair, obs.head_mask
+        )
+        value = self.h_value(feat).squeeze(-1) * obs.head_mask.float()
+
+        schedule, sched_logp = self._schedule(obs, g, deterministic)
+        actions["schedule"] = schedule
+
+        return PolicyOutput(
+            actions=actions,
+            log_prob=logp,
+            entropy=entropy,
+            value=value,
+            schedule_log_prob=sched_logp,
+            forecast=forecast,
+            latent=z,
+        )
+
+    def evaluate(self, obs: Observation, actions: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Re-score stored actions under the current parameters, for PPO."""
+        feat, g, _z, _f = self.encode(obs)
+
+        d_dist = Categorical(logits=self._suppressed_dir_logits(feat, obs.safety))
+        s_dist = Categorical(
+            logits=self._suppressed_step_logits(feat, obs.safety, actions["direction"])
+        )
+        dists = {
+            "layer": Categorical(logits=self._suppressed_layer_logits(feat, obs.via_safe)),
+            "via": Categorical(logits=self.h_via(feat)),
+            "width": Categorical(logits=self.h_width(feat)),
+            "couple": Categorical(logits=self.h_couple(feat)),
+        }
+        logp, entropy = self._score(
+            d_dist, s_dist, dists, actions, obs.head_is_pair, obs.head_mask
+        )
+        value = self.h_value(feat).squeeze(-1) * obs.head_mask.float()
+        return logp, entropy, value
+
+    def _score(self, d_dist, s_dist, dists, actions, is_pair, head_mask):
+        """Sum log-probs and entropies over the dimensions that had an effect.
+
+        `layer > 0` means a via was placed, and the engine then ignores
+        direction, step and width entirely. Including their log-probs would
+        credit or blame the policy for choices that provably did not influence
+        the outcome -- pure variance, and it grows with the number of action
+        dimensions, which is exactly the direction this action space went.
+        """
+        placed_via = actions["layer"] > 0
+        moved = ~placed_via
+        relevant = {
+            "direction": moved,
+            "step": moved,
+            "width": moved,
+            "via": placed_via,
+            "layer": torch.ones_like(placed_via),
+            "couple": is_pair,
+        }
+
+        logp = d_dist.log_prob(actions["direction"]) * relevant["direction"].float()
+        ent = d_dist.entropy() * relevant["direction"].float()
+        logp = logp + s_dist.log_prob(actions["step"]) * relevant["step"].float()
+        ent = ent + s_dist.entropy() * relevant["step"].float()
+        for k, dist in dists.items():
+            m = relevant[k].float()
+            logp = logp + dist.log_prob(actions[k]) * m
+            ent = ent + dist.entropy() * m
+
+        m = head_mask.float()
+        return logp * m, ent * m
+
+    # -- scheduler ----------------------------------------------------------
+
+    def _schedule(self, obs: Observation, g: torch.Tensor, deterministic: bool):
+        """Choose a pending net for each idle head slot.
+
+        Learned rather than shortest-first. At tens of nets ordering barely
+        matters and `docs/RL_PLAN.md` was right to fix it as a heuristic and
+        remove the combinatorial dimension; at thousands of nets it is most of
+        the problem, because the cost of routing a net is dominated by what was
+        routed before it.
+
+        Slots choose independently, which can pick the same net twice.
+        `BatchedRouterWorld.assign` drops the duplicate, so the only cost is a
+        wasted slot -- which the reward already penalises, so the policy has a
+        gradient telling it not to. That is much simpler than a
+        sample-without-replacement scheme and costs almost nothing.
+        """
+        B, K = obs.head_mask.shape
+        tokens = self.nets(obs.nets, g, obs.net_mask)
+        ctx = g.unsqueeze(1).expand(B, tokens.shape[1], g.shape[-1])
+        scores = self.h_schedule(torch.cat([tokens, ctx], dim=-1)).squeeze(-1)
+        scores = scores.masked_fill(~obs.net_mask, float("-inf"))
+
+        none_pending = ~obs.net_mask.any(dim=1)
+        safe = scores.masked_fill(none_pending.unsqueeze(1), 0.0)
+        dist = Categorical(logits=safe)
+
+        idle = ~obs.head_mask
+        picks = []
+        logp = torch.zeros(B, device=scores.device)
+        for k in range(K):
+            choice = safe.argmax(-1) if deterministic else dist.sample()
+            take = idle[:, k] & ~none_pending
+            picks.append(torch.where(take, choice, torch.full_like(choice, -1)))
+            logp = logp + dist.log_prob(choice) * take.float()
+        return torch.stack(picks, dim=1), logp
