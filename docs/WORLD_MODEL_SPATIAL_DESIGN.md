@@ -246,21 +246,94 @@ is cheap vectorized geometry, not a network) -- much smaller than
    `tests/test_grid_router.py` suite
    (4 tests, predates this change, uses a third `d_model=128` config) still
    passes unmodified.
-2. **Colab retrain**: fresh stage-2 curriculum run with the new
-   architecture, no lookahead wrapper (plain
-   `select_deterministic_action` only) -- this isolates whether the
-   architecture change alone closes the gap that used to need lookahead.
-3. **Eval**: known hard seeds first (9648, 9681, 9764, 9779, 9148, 9251,
-   9091, 9390, 9535, 9901 -- see memory), then the full 1000-board
-   benchmark (seeds 9000-9999), comparing completion % AND wall-clock
-   against both the current plain-argmax baseline and the
-   lookahead-wrapped 100%/~32min baseline. A win is: closes most/all of the
-   gap to 100% *without* the lookahead wrapper, at a fraction of its
-   wall-clock cost. If it doesn't fully close the gap, `--lookahead` and
-   `--analytic-lookahead` remain available on top of the new network too
-   (composable, not mutually exclusive with this change) -- that's a
-   legitimate fallback, not a failure of this design, per the same
-   discipline noted in `project_analytic_lookahead`.
+2. **Colab retrain, DONE (2026-08-25)**: fresh stage-2 run (30k steps,
+   Tesla T4, checkpoint `checkpoints_stage2_v8_spatial`), plain
+   `select_deterministic_action` only, no lookahead wrapper. Reached 100%
+   on the rolling training window by ~step 5000 -- notably fast, consistent
+   with the raycast->logit-bias path being structurally present from init
+   rather than something the network had to discover from scratch (see
+   the confidence assessment above).
+3. **Eval, DONE**: full 1000-board benchmark (seeds 9000-9999). **Plain
+   deterministic argmax alone: 99.90% (999/1000)** -- this is the win this
+   design targeted: the OLD architecture needed `--lookahead`
+   (~16x-slower-per-step real env-simulation) to close the same gap up to
+   checkpoint-v7's 100%/1000. Single remaining failure: seed 9764, one of
+   the 10 known hard seeds (9648, 9681, 9764, 9779, 9148, 9251, 9091, 9390,
+   9535, 9901) -- 9/10 of those are now solved without any wrapper.
+   `--analytic-lookahead` on this SAME checkpoint scored 99.60% (996/1000,
+   worse) failing on a disjoint seed set (9111, 9170, 9450, 9677) -- an
+   unexpected interaction between analytic_lookahead's replay and this
+   policy's own action ranking, not yet root-caused (see memory
+   `project_spatial_world_model` / `project_analytic_lookahead`). Not
+   urgent since plain alone already beats what used to require any
+   wrapper, but means `--analytic-lookahead` should not be assumed
+   better-or-equal by default on this checkpoint the way it was on v7.
+   `--lookahead` (the original, proven-but-slow wrapper) was not
+   separately re-run against this checkpoint yet.
+
+## Addendum: per-(direction, distance) collision reduction
+
+Added after the Colab result above, in response to a follow-up ask: even
+though plain deterministic hits 99.90%/1000, the eval trace for the one
+remaining failure (seed 9764, via `render_episode.py --verbose`) showed
+many REJECTED-collision steps even on nets that eventually succeed --
+e.g. the same position rejecting three different actions in a row before
+finding a legal one. That is a **granularity** problem in the raycast fix
+above, not a missing-information one: `raycast_to_logit_bias` discriminates
+only by `dir_idx` (8 values), so it applies the identical bias to all 3
+`dist_idx` choices (step sizes 2/4/8) within a direction. A direction that
+is clear for 2 cells but blocked at 8 reads as "fine" at the direction
+level while still colliding at the specific distance an action actually
+tries -- exactly the observed failure signature.
+
+Fix: `PCBEncoder._raycast_sensor` already computes, internally, whether
+each of the 8 sampled cells out to `RAYCAST_MAX_STEPS` is blocked, before
+collapsing that into the single per-direction `raycast` scalar. It now
+ALSO returns `dist_safe`: a `(B, 8, len(DIST_STEPS))` boolean -- for each
+direction AND each of the environment's actual 3 step distances, whether a
+hop of exactly that length lands before the first blocked cell. This is
+concatenated into the combined latent (24 more floats: `DIST_SAFETY_DIM =
+RAYCAST_NUM_DIRS * len(DIST_STEPS)`) AND, more importantly, added as a
+second direct bias in `PCBRouterNet` -- `dist_safe`'s flattened
+`(dir_idx, dist_idx)` ordering lines up exactly with both the 24-action
+space's `dir_idx*3 + dist_idx` encoding and (via `repeat_interleave` over
+the 4 layer/via combos) the 96-action space's `dir_idx*12 + dist_idx*4 +
+...` encoding, so no remapping is needed.
+
+Unlike `raycast_to_logit_bias` (a learned `Linear`, deliberately given a
+strong-but-adjustable init), this new bias uses a **fixed, non-learned**
+constant (`DIST_SAFETY_SUPPRESSION = 8.0`, in `pcb_encoder.py`): 0 for a
+safe `(dir_idx, dist_idx)`, `-8.0` for one the raycast proves will collide.
+This project has direct prior history (see `router_policy.py`'s
+policy_head-init comment) of a learned bias becoming negligible once the
+weight-driven logits it competed with grew large during training -- a
+fixed additive term added at the very end of `forward()`, after
+`policy_head`, cannot be trained away the same way. If every option at a
+fully boxed-in cell is unsafe, the constant is added uniformly across all
+of them, which changes nothing (a uniform shift never changes
+softmax/argmax) -- it only discriminates when it has real information to
+add, so it cannot force a bad choice in a genuinely no-good-options cell.
+
+**Scope note, same honesty as the raycast bearing caveat above**: this
+targets *self-inflicted collisions* (repeatedly proposing an action the
+policy's own geometry already proves illegal) -- a different failure class
+from seed 9764's actual root cause (a policy that needs to see 4 steps
+ahead to find a non-obvious corridor, which only `--lookahead`'s real
+multi-step simulation currently provides; see the Colab result above and
+memory `project_spatial_world_model`). This addendum should reduce wasted
+collision-retry steps and may improve wall-clock/steps-per-net efficiency,
+but is not expected to be what closes seed 9764 specifically -- that
+remains `--lookahead`'s job, a structurally different (external,
+decision-time search) mechanism, not something built into the model's
+forward pass at all.
+
+**Verification**: `scripts/verify_spatial_encoder.py` extended with a
+fourth check (`dist_safe` against an independently-written brute-force
+per-(direction,distance) reference). **Result: 12,000/12,000 decisions
+matched exactly** across all four checks (150 episodes x up to 80 steps),
+same as the original spatial-encoder validation. Requires a fresh retrain
+(new bias mechanism, not loadable into `checkpoints_stage2_v8_spatial`) to
+measure the actual collision-rate effect on Colab.
 
 ## File structure (new / modified)
 

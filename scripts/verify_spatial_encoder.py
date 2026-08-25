@@ -1,22 +1,28 @@
 """Validates models/pcb_encoder.py's new spatial-awareness pieces (head
-position recovery, raycast sensor, local-crop extraction) against
-independent brute-force reference implementations, BEFORE trusting them
-inside any training run -- same "verify cheaply before building on top of
-it" discipline as scripts/verify_analytic_lookahead.py.
+position recovery, raycast sensor, per-(direction,distance) safety mask,
+local-crop extraction) against independent brute-force reference
+implementations, BEFORE trusting them inside any training run -- same
+"verify cheaply before building on top of it" discipline as
+scripts/verify_analytic_lookahead.py.
 
 Needs no trained checkpoint and no GPU: everything here depends only on
 board/observation geometry (built via real PCBRouterEnv episodes, same as
 verify_analytic_lookahead.py) and the encoder's forward pass on random
 weights, not on any trained policy.
 
-Three independent checks:
+Four independent checks:
 1. Head position recovery: argmax over Channel 3 must exactly reproduce the
    env's own ground-truth (state.head_x, state.head_y).
 2. Raycast sensor: the vectorized torch implementation
    (PCBEncoder._raycast_sensor) must exactly match a brute-force Python
    pixel-walk along the same 8 bearings, written independently (loops, not
    gather) so the two implementations can't share a bug.
-3. Local-crop extraction: PCBEncoder._local_crop must exactly match a
+3. Per-(direction, distance) safety mask: same brute-force pixel-walk,
+   additionally checked against each of the environment's actual
+   DIST_STEPS values -- this is the finer-grained collision-reduction
+   signal (see DIST_SAFETY_SUPPRESSION in pcb_encoder.py), independent from
+   #2's coarser per-direction-only reading.
+4. Local-crop extraction: PCBEncoder._local_crop must exactly match a
    brute-force numpy pad+slice, including at board edges/corners (head near
    x=0/255 or y=0/255) where off-by-one errors are most likely.
 
@@ -37,12 +43,18 @@ import sys
 import numpy as np
 import torch
 
-from pcbworld.environment import PCBRouterEnv
+from pcbworld.environment import PCBRouterEnv, DIST_STEPS
 from models.pcb_encoder import PCBEncoder, RAYCAST_MAX_STEPS, RAYCAST_NUM_DIRS, LOCAL_CROP_PAD, LOCAL_CROP_SIZE
 from models.router_policy import PCBRouterNet
 
 
 def brute_force_raycast(obs: np.ndarray, head_x: int, head_y: int):
+    """Returns (raycast, dist_safe): raycast is the coarse per-direction
+    [0,1] reading; dist_safe[d][k] is whether a hop of DIST_STEPS[k] cells
+    along direction d is collision-free. Both derived from the same
+    independently-computed `first_blocked` per direction, matching
+    PCBEncoder._raycast_sensor's semantics exactly but via plain Python
+    loops instead of vectorized gather."""
     H, W = obs.shape[1], obs.shape[2]
 
     def clamp(v, lo, hi):
@@ -62,7 +74,8 @@ def brute_force_raycast(obs: np.ndarray, head_x: int, head_y: int):
         gdx, gdy = ddx / norm, ddy / norm
     ref_bearing = math.atan2(gdy, gdx)
 
-    result = []
+    raycast = []
+    dist_safe = []
     for d in range(RAYCAST_NUM_DIRS):
         angle = ref_bearing + d * (math.pi / 4.0)
         dx, dy = math.cos(angle), math.sin(angle)
@@ -75,8 +88,9 @@ def brute_force_raycast(obs: np.ndarray, head_x: int, head_y: int):
                 break
         if first_blocked is None:
             first_blocked = RAYCAST_MAX_STEPS + 1
-        result.append((first_blocked - 1) / float(RAYCAST_MAX_STEPS))
-    return result
+        raycast.append((first_blocked - 1) / float(RAYCAST_MAX_STEPS))
+        dist_safe.append([1.0 if first_blocked > step else 0.0 for step in DIST_STEPS])
+    return raycast, dist_safe
 
 
 def brute_force_crop(obs: np.ndarray, head_x: int, head_y: int) -> np.ndarray:
@@ -99,6 +113,7 @@ def check_geometry(num_episodes: int, max_steps: int, seed_offset: int, seed_py:
     total_checked = 0
     head_mismatches = []
     raycast_mismatches = []
+    dist_safe_mismatches = []
     crop_mismatches = []
 
     for ep in range(num_episodes):
@@ -115,7 +130,7 @@ def check_geometry(num_episodes: int, max_steps: int, seed_offset: int, seed_py:
             x_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 rec_x, rec_y = PCBEncoder._head_position(x_t)
-                raycast_t = encoder._raycast_sensor(x_t, rec_x, rec_y)
+                raycast_t, dist_safe_t = encoder._raycast_sensor(x_t, rec_x, rec_y)
                 crop_t = encoder._local_crop(x_t, rec_x, rec_y)
             rec_x, rec_y = int(rec_x.item()), int(rec_y.item())
 
@@ -123,10 +138,14 @@ def check_geometry(num_episodes: int, max_steps: int, seed_offset: int, seed_py:
             if (rec_x, rec_y) != (head_x, head_y):
                 head_mismatches.append((ep, step, (head_x, head_y), (rec_x, rec_y)))
 
-            expected_ray = brute_force_raycast(obs, head_x, head_y)
+            expected_ray, expected_dist_safe = brute_force_raycast(obs, head_x, head_y)
             got_ray = raycast_t.squeeze(0).tolist()
             if any(abs(a - b) > 1e-5 for a, b in zip(expected_ray, got_ray)):
                 raycast_mismatches.append((ep, step, expected_ray, got_ray))
+
+            got_dist_safe = dist_safe_t.squeeze(0).tolist()
+            if expected_dist_safe != got_dist_safe:
+                dist_safe_mismatches.append((ep, step, expected_dist_safe, got_dist_safe))
 
             expected_crop = brute_force_crop(obs, head_x, head_y)
             got_crop = crop_t.squeeze(0).numpy()
@@ -156,6 +175,14 @@ def check_geometry(num_episodes: int, max_steps: int, seed_offset: int, seed_py:
             print(f"  ep={m[0]} step={m[1]}\n    expected={m[2]}\n    got={m[3]}")
     else:
         print("Raycast sensor: all matched brute-force reference exactly.")
+
+    if dist_safe_mismatches:
+        ok = False
+        print(f"*** {len(dist_safe_mismatches)} DIST-SAFETY MISMATCHES ***")
+        for m in dist_safe_mismatches[:5]:
+            print(f"  ep={m[0]} step={m[1]}\n    expected={m[2]}\n    got={m[3]}")
+    else:
+        print("Per-(direction,distance) safety mask: all matched brute-force reference exactly.")
 
     if crop_mismatches:
         ok = False
@@ -192,7 +219,7 @@ def check_edge_positions() -> int:
         x_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             rec_x, rec_y = PCBEncoder._head_position(x_t)
-            raycast_t = encoder._raycast_sensor(x_t, rec_x, rec_y)
+            raycast_t, dist_safe_t = encoder._raycast_sensor(x_t, rec_x, rec_y)
             crop_t = encoder._local_crop(x_t, rec_x, rec_y)
         rec_x, rec_y = int(rec_x.item()), int(rec_y.item())
 
@@ -201,10 +228,15 @@ def check_edge_positions() -> int:
             ok = False
             continue
 
-        expected_ray = brute_force_raycast(obs, hx, hy)
+        expected_ray, expected_dist_safe = brute_force_raycast(obs, hx, hy)
         got_ray = raycast_t.squeeze(0).tolist()
         if any(abs(a - b) > 1e-5 for a, b in zip(expected_ray, got_ray)):
             print(f"*** EDGE RAYCAST MISMATCH at ({hx},{hy}): expected={expected_ray} got={got_ray} ***")
+            ok = False
+
+        got_dist_safe = dist_safe_t.squeeze(0).tolist()
+        if expected_dist_safe != got_dist_safe:
+            print(f"*** EDGE DIST-SAFETY MISMATCH at ({hx},{hy}): expected={expected_dist_safe} got={got_dist_safe} ***")
             ok = False
 
         expected_crop = brute_force_crop(obs, hx, hy)

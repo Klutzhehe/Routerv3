@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from pcbworld.environment import DIST_STEPS
+
 # Mirrors pcbworld/environment.py's DIST_STEPS = [2, 4, 8] -- the raycast
 # sensor's cap is the same "max useful lookahead distance" scale the env
 # itself uses for its largest discrete step.
@@ -31,16 +33,42 @@ PATCH_GRID = 16  # 256 / 16 downsample factor baked into cnn_extractor below
 LOCAL_CROP_SIZE = 48
 LOCAL_CROP_PAD = LOCAL_CROP_SIZE // 2
 LOCAL_CROP_OUT_DIM = 128  # local_crop_cnn's final channel count, after pooling
+# One safety bit per (direction, real DIST_STEPS distance) combination --
+# NOT per direction alone. A direction can be clear for 2 cells and blocked
+# by 8: RAYCAST_NUM_DIRS-only granularity cannot express that, and that
+# exact gap (a whole direction biased as "fine" while a specific distance
+# within it still collides) is what showed up as repeated same-spot
+# REJECTED-collision retries in checkpoints_stage2_v8_spatial's eval trace
+# on seed 9764 -- see docs/WORLD_MODEL_SPATIAL_DESIGN.md's collision
+# reduction addendum.
+DIST_SAFETY_DIM = RAYCAST_NUM_DIRS * len(DIST_STEPS)
+# Fixed (NOT learned) suppression magnitude for a (direction, distance)
+# combination the raycast sensor proves will collide. Deliberately a
+# constant, not an nn.Parameter: this project has direct prior history
+# (see the policy_head init comment below in router_policy.py) of a
+# LEARNED bias/logit-scale relationship drifting so far apart during
+# training that a once-meaningful constant became negligible relative to
+# the weight-driven logits it was supposed to compete with. A fixed
+# constant added at the very end of forward() can't be trained away --
+# training can still route AROUND it (e.g. never letting the safe options'
+# own logits get so large that avoiding an unsafe one stops mattering) but
+# can never erode the suppression itself. If every option in a fully
+# boxed-in cell is flagged unsafe, this constant is added uniformly across
+# all of them and therefore changes nothing (a uniform shift never changes
+# softmax/argmax) -- it only ever discriminates when it has real
+# information to add.
+DIST_SAFETY_SUPPRESSION = 8.0
 
 
 def combined_latent_dim(d_model: int) -> int:
     """Width of PCBEncoder.forward's first return value: whole-board
     mean-pool (d_model) + local-attention pool (d_model) + raycast (8) +
-    local-crop CNN (LOCAL_CROP_OUT_DIM). Callers that build policy/value
-    heads sized to the encoder's output should derive the width from here
-    rather than hardcode it, since different scripts construct PCBRouterNet
-    with different d_model."""
-    return 2 * d_model + RAYCAST_NUM_DIRS + LOCAL_CROP_OUT_DIM
+    per-(direction,distance) safety mask (DIST_SAFETY_DIM) + local-crop CNN
+    (LOCAL_CROP_OUT_DIM). Callers that build policy/value heads sized to
+    the encoder's output should derive the width from here rather than
+    hardcode it, since different scripts construct PCBRouterNet with
+    different d_model."""
+    return 2 * d_model + RAYCAST_NUM_DIRS + DIST_SAFETY_DIM + LOCAL_CROP_OUT_DIM
 
 
 class PCBEncoder(nn.Module):
@@ -174,7 +202,7 @@ class PCBEncoder(nn.Module):
 
     def _raycast_sensor(
         self, x: torch.Tensor, head_x: torch.Tensor, head_y: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Non-learned freespace sensor: for each of the 8 dir_idx bearings,
         how many cells (capped at RAYCAST_MAX_STEPS) can the head move along
         that bearing before hitting an obstacle or foreign copper (Channels
@@ -191,6 +219,19 @@ class PCBEncoder(nn.Module):
         per-net history not recoverable from a single observation frame).
         This can differ from the env's true action bearing by a few
         degrees, which does not matter at 45-degree bucket resolution.
+
+        Returns (raycast, dist_safe):
+        - raycast: (B, 8) continuous freespace in [0,1], per direction only
+          (the original signal -- coarse, for the general concatenated
+          latent and the softer per-direction logit bias).
+        - dist_safe: (B, 8, len(DIST_STEPS)) -- for each direction AND each
+          of the environment's actual discrete step distances, whether a
+          hop of exactly that length lands before the first blocked cell.
+          A direction can read "mostly open" in `raycast` while still being
+          blocked at the specific distance an action would actually try --
+          this is the granularity `raycast` alone cannot express, and
+          exactly the gap that produced repeated same-spot REJECTED-
+          collision retries in practice (see DIST_SAFETY_SUPPRESSION).
         """
         with torch.no_grad():
             B, _, H, W = x.shape
@@ -237,7 +278,14 @@ class PCBEncoder(nn.Module):
                 torch.full_like(first_hit_step0, RAYCAST_MAX_STEPS + 1, dtype=torch.float32),
             )
             raycast = (first_blocked_step - 1).clamp(0, RAYCAST_MAX_STEPS) / float(RAYCAST_MAX_STEPS)
-            return raycast  # (B, 8)
+
+            # dist_safe[:, d, k] = True iff a hop of DIST_STEPS[k] cells
+            # along direction d lands strictly before the first blocked
+            # cell (first_blocked_step counts 1..RAYCAST_MAX_STEPS+1, where
+            # +1 means "nothing blocked in any sampled cell").
+            dist_steps_t = torch.tensor(DIST_STEPS, device=device, dtype=torch.float32)  # (num_dists,)
+            dist_safe = (first_blocked_step.unsqueeze(-1) > dist_steps_t.view(1, 1, -1)).float()
+            return raycast, dist_safe  # (B, 8), (B, 8, len(DIST_STEPS))
 
     def _local_crop(self, x: torch.Tensor, head_x: torch.Tensor, head_y: torch.Tensor) -> torch.Tensor:
         """Fixed-size native-resolution crop centered on the head, all 10
@@ -284,15 +332,20 @@ class PCBEncoder(nn.Module):
         local_latent, _ = self.local_attn(local_query, local_tokens, local_tokens)
         return local_latent.squeeze(1)  # (B, d_model)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass.
         Args:
             x: (B, 10, 256, 256) spatial observation tensor
         Returns:
-            combined_latent: (B, 2*d_model + 8 + 128) global + local + raycast + crop
+            combined_latent: (B, combined_latent_dim(d_model)) global + local
+                + raycast + dist_safe + crop
             patch_tokens: (B, 256, d_model) spatial token sequence
             raycast_vector: (B, 8) non-learned per-direction freespace, [0,1]
+            dist_safe: (B, 8, len(DIST_STEPS)) non-learned per-(direction,
+                distance) collision-free mask, see _raycast_sensor
         """
         head_x, head_y = self._head_position(x)
 
@@ -312,12 +365,19 @@ class PCBEncoder(nn.Module):
         mean_pooled = encoded_tokens.mean(dim=1)
 
         local_attn_latent = self._local_attention_pool(encoded_tokens, head_x, head_y)
-        raycast_vector = self._raycast_sensor(x, head_x, head_y)
+        raycast_vector, dist_safe = self._raycast_sensor(x, head_x, head_y)
         local_crop = self._local_crop(x, head_x, head_y)
         local_crop_latent = self.local_crop_cnn(local_crop).mean(dim=(2, 3))  # (B, 128)
 
         combined_latent = torch.cat(
-            [mean_pooled, local_attn_latent, raycast_vector, local_crop_latent], dim=-1
+            [
+                mean_pooled,
+                local_attn_latent,
+                raycast_vector,
+                dist_safe.reshape(B, -1),
+                local_crop_latent,
+            ],
+            dim=-1,
         )
 
-        return combined_latent, encoded_tokens, raycast_vector
+        return combined_latent, encoded_tokens, raycast_vector, dist_safe

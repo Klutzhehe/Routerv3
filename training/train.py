@@ -349,6 +349,21 @@ def train_single_net_policy(
         # Update curves plot & save checkpoint
         if efficiency_reached or global_step % plot_interval == 0 or global_step >= total_timesteps:
             plot_learning_curves(history, plot_path)
+            if in_colab:
+                # Actually show the dashboard inline -- previously this
+                # block only wrote plot_path to disk; clear_output/display/
+                # Image were imported (see in_colab above) but never
+                # called, so the module docstring's "real-time live
+                # updating dashboard in Colab" was not actually happening,
+                # only a file quietly accumulating on Drive. Deliberately
+                # NOT calling clear_output() here: this project's standing
+                # discipline (see memory project_pcb_router_workflow) is to
+                # report the printed log back verbatim, and clearing the
+                # cell would throw away every earlier status_line, trading
+                # a slightly noisier notebook for losing the run's history.
+                # A fresh image appended each update is still a live,
+                # watchable dashboard, just an append-only one.
+                display(Image(filename=str(plot_path)))
             torch.save(
                 {
                     "step": global_step,

@@ -6,9 +6,11 @@ Combines:
    models/pcb_encoder.py and docs/WORLD_MODEL_SPATIAL_DESIGN.md -> combined
    latent)
 2. NetSelectorHead (Optional Net Attention)
-3. 96-Action Router Policy Head (Categorical Action Distribution), plus a
-   direct raycast -> logit-bias path so a blocked direction is discouraged
-   by construction, not only by hoping the rest of the network learns it
+3. 96-Action Router Policy Head (Categorical Action Distribution), plus two
+   direct non-learned-geometry -> logit-bias paths: a per-direction one and
+   a finer per-(direction, distance) one, so a blocked direction/distance
+   is discouraged by construction, not only by hoping the rest of the
+   network learns it
 4. Value Critic Head (Scalar Board Return Estimate)
 """
 
@@ -20,7 +22,13 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
-from models.pcb_encoder import PCBEncoder, RAYCAST_NUM_DIRS, combined_latent_dim
+from models.pcb_encoder import (
+    PCBEncoder,
+    RAYCAST_NUM_DIRS,
+    DIST_SAFETY_DIM,
+    DIST_SAFETY_SUPPRESSION,
+    combined_latent_dim,
+)
 from models.net_selector import NetSelectorHead
 
 
@@ -49,10 +57,10 @@ class PCBRouterNet(nn.Module):
         self.net_selector = NetSelectorHead(d_model=d_model)
 
         # PCBEncoder now returns a wider latent (whole-board mean-pool +
-        # local-attention pool + raycast + local-crop CNN, see
-        # models/pcb_encoder.py) -- size the heads from that combined width
-        # instead of d_model directly, since it's derived, not d_model
-        # itself.
+        # local-attention pool + raycast + per-(dir,dist) safety mask +
+        # local-crop CNN, see models/pcb_encoder.py) -- size the heads from
+        # that combined width instead of d_model directly, since it's
+        # derived, not d_model itself.
         head_input_dim = combined_latent_dim(d_model)
 
         # 3. Router Action Policy Head (96 Discrete Growth Actions)
@@ -102,6 +110,22 @@ class PCBRouterNet(nn.Module):
             self.raycast_to_logit_bias.weight.mul_(2.0)
             nn.init.constant_(self.raycast_to_logit_bias.bias, -1.0)
 
+        # 6. Direct per-(direction, distance) collision-suppression path --
+        # a finer-grained sibling of raycast_to_logit_bias above. That path
+        # only discriminates by DIRECTION, so it cannot express "dist=2 is
+        # fine here but dist=8 collides" -- exactly the gap that showed up
+        # as repeated same-spot REJECTED-collision retries in practice
+        # (checkpoints_stage2_v8_spatial, seed 9764 trace). dist_safe is an
+        # exact (non-learned) boolean per (dir_idx, dist_idx) pair, so this
+        # is a FIXED additive bias, not a learned Linear like the one above
+        # -- see DIST_SAFETY_SUPPRESSION's docstring in pcb_encoder.py for
+        # why this one specifically should not be trainable away.
+        assert action_dim % DIST_SAFETY_DIM == 0, (
+            f"action_dim={action_dim} must be a multiple of {DIST_SAFETY_DIM} "
+            "(one block of actions per (dir_idx, dist_idx) pair)"
+        )
+        self.actions_per_distpair = action_dim // DIST_SAFETY_DIM
+
         # Initialize policy head near zero to prevent violent initial divergence.
         # gain=0.01 (not smaller) matters here in a way it wouldn't without
         # the bias below: measured directly, gain=0.01 made the weight-driven
@@ -147,12 +171,17 @@ class PCBRouterNet(nn.Module):
             dist: Categorical distribution over 96 discrete actions
             value: (B, 1) state value estimate
         """
-        pcb_latent, _patch_tokens, raycast_vector = self.encoder(obs)
+        pcb_latent, _patch_tokens, raycast_vector, dist_safe = self.encoder(obs)
 
         # Compute Action Logits & Distribution
         action_logits = self.policy_head(pcb_latent)
         dir_bias = self.raycast_to_logit_bias(raycast_vector)  # (B, 8)
         action_logits = action_logits + dir_bias.repeat_interleave(self.actions_per_dir, dim=-1)
+
+        B = dist_safe.shape[0]
+        distpair_bias = (dist_safe.reshape(B, -1) - 1.0) * DIST_SAFETY_SUPPRESSION  # (B, 24): 0 if safe, -SUPPRESSION if not
+        action_logits = action_logits + distpair_bias.repeat_interleave(self.actions_per_distpair, dim=-1)
+
         dist = Categorical(logits=action_logits)
 
         # Compute State Value
