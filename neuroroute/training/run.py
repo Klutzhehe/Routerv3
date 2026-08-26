@@ -101,6 +101,32 @@ def evaluate(env: NeuroRouteEnv, policy: NeuroRoutePolicy, seeds: list[int]) -> 
 
     Same seeds for all of them: a completion number is meaningless without the
     boards being identical, and board-to-board variance here is large.
+
+    The policy is scored **twice, on those same boards**: once with
+    ``deterministic=True`` (argmax) and once **sampled**, which is the
+    distribution training actually rolls out under. Reporting only the argmax
+    number made a real effect unattributable: stage 0 logged ~100% completion
+    on every training update while every held-out eval read 73-90%, and there
+    was no way to tell whether the eval boards were harder or the mode was
+    simply worse than the mean.
+
+    Measured locally on an **untrained** policy, 16 held-out boards, so that a
+    trained gap can be read against something rather than against zero:
+
+        stage              argmax   sampled    argmax vias   sampled vias
+        0 (1 net,   2L)    75.00%    93.75%           0.00           2.88
+        1 (20 nets, 2L)    26.56%    37.19%           0.00          42.88
+
+    **+10.6 to +18.8 points of the gap is present before any learning**, and
+    stage 0's argmax number is exactly the 75.0% plateau run A sat at for three
+    consecutive evals. The mechanism is visible in the same measurement: at
+    init the argmax policy takes direction 0 -- straight down the geodesic
+    gradient -- on **100%** of steps, never proposes a via, and cycles (stage
+    1: 23,455 head-steps over 5,146 distinct cells, a 78.1% revisit rate,
+    against 48.0% sampled). Nothing in the observation tells a head it has been
+    in this cell before: the dead-zone channel keys off *rejection*, and argmax
+    is rejected 0.05% of the time. Sampling is what places the vias and what
+    breaks the cycles.
     """
     results: dict[str, float] = {}
 
@@ -120,10 +146,21 @@ def evaluate(env: NeuroRouteEnv, policy: NeuroRoutePolicy, seeds: list[int]) -> 
             {k: float(v.mean()) for k, v in metrics.items()},
         )
 
+    # `policy/*` stays the deterministic arm: it is what the stage gate, the
+    # checkpoint's `best_completion` and every logged history row already mean,
+    # and silently changing which number those refer to would make this run
+    # incomparable with the two stage-0 runs and the stage-1 run already on
+    # record.
     comp, rej, metrics = run(lambda o: policy.act(o, deterministic=True).actions)
     results["policy/completion"] = comp
     results["policy/rejected_action_rate"] = rej
     results.update({f"policy/{k}": v for k, v in metrics.items()})
+
+    comp_s, rej_s, metrics_s = run(lambda o: policy.act(o).actions)
+    results["policy_sampled/completion"] = comp_s
+    results["policy_sampled/rejected_action_rate"] = rej_s
+    results.update({f"policy_sampled/{k}": v for k, v in metrics_s.items()})
+    results["policy/sample_minus_argmax"] = comp_s - comp
 
     for name, fn in (
         ("greedy", greedy_safe_action),
@@ -354,12 +391,18 @@ def train(args) -> int:
                     tel.print(f"  EVAL @ update {update}  ({args.eval_boards} held-out "
                               f"boards, seeds {seeds[0]}..{seeds[-1]}, never trained on)")
                     tel.print(f"    policy     {ev['policy/completion']:6.1%}   "
-                              f"rejected {ev['policy/rejected_action_rate']:6.2%}")
+                              f"rejected {ev['policy/rejected_action_rate']:6.2%}   "
+                              f"vias {ev.get('policy/vias', 0):5.1f}   (argmax)")
+                    tel.print(f"    policy     {ev['policy_sampled/completion']:6.1%}   "
+                              f"rejected {ev['policy_sampled/rejected_action_rate']:6.2%}   "
+                              f"vias {ev.get('policy_sampled/vias', 0):5.1f}   (sampled -- "
+                              f"the distribution training rolls out under)")
+                    tel.print(f"    sampled - argmax {ev['policy/sample_minus_argmax']:+6.1%}"
+                              "   (untrained stage-1 reference: +10.6%)")
                     for nm in ("greedy", "detour", "layer_hop"):
                         beat = "  <-- policy ahead" if ev["policy/completion"] > ev[f"{nm}/completion"] else ""
                         tel.print(f"    {nm:<10} {ev[f'{nm}/completion']:6.1%}{beat}")
-                    tel.print(f"    vias {ev.get('policy/vias', 0):.1f}   "
-                              f"detour {ev.get('policy/detour', 0):.3f}   "
+                    tel.print(f"    detour {ev.get('policy/detour', 0):.3f}   "
                               f"pair-gap-err {ev.get('policy/pair_gap_error', 0):.3f}   "
                               f"split {ev.get('policy/split_fraction', 0):.2f}   "
                               f"len-in-tol {ev.get('policy/length_within_tol', 0):.1%}")

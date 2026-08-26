@@ -1,7 +1,10 @@
 # NeuroRoute — session handover
 
-Written 2026-08-26, at the end of the session that built `neuroroute/` and ran
-stage 0 twice on Colab. Everything here is committed and pushed to `main`.
+Written 2026-08-26, updated 2026-08-27 after stage 1's full 1500-update run
+(60.8% best held-out completion, gate not met) and after making `evaluate()`
+score both argmax and sampled on the same held-out boards to attack the
+mode/mean question directly. Everything here is committed and pushed to
+`main`.
 
 **Read order for a fresh session:** this file → `neuroroute/DESIGN.md` (the
 architecture and why alternatives were rejected) → `neuroroute/README.md`
@@ -70,38 +73,65 @@ Not directly comparable: run B's eval set is harder (`layer_hop` 95.3% vs
 
 ---
 
-## THE KEY UNRESOLVED FINDING — read this first
+## THE KEY UNRESOLVED FINDING — confirmed at init, not yet measured trained
 
 **During training the policy completes ~100% of nets. At eval it completes
-73–90%.** From `train_log.jsonl`, run B: `completion` is 0.9375–1.0 on almost
-every one of 300 updates, while every eval is 73.4–90.6%.
+73–90% (stage 0) / capped at 60.8% (stage 1).** Training rolls out with
+**sampling**; eval used only **`deterministic=True`** (argmax). Same board
+distribution, same policy — so the gap is either the argmax mode being worse
+than the sampled mean, or the eval boards being harder. Those were
+unattributable with one number.
 
-Training rolls out with **sampling**; eval uses **`deterministic=True`
-(argmax)**. Same boards distribution, same policy.
+**`evaluate()` in `neuroroute/training/run.py` now scores both arms on the
+same held-out seeds** (`policy/completion` = argmax, `policy_sampled/completion`
+= sampled, `policy/sample_minus_argmax` = the gap). Not yet run on the trained
+stage-1 checkpoint — that needs a GPU pass, queued for Antigravity via
+`ANTIGRAVITY_PROMPT.md`. What ran locally (CPU, this session) was a **decisive
+measurement on the untrained policy**, to have a reference the trained gap can
+be read against rather than against zero:
 
-**So the policy's mode is worse than its average.** The most likely mechanism,
-and it is consistent with everything else observed:
+| stage | boards | argmax completion | sampled completion | argmax vias | sampled vias |
+|---|---|---|---|---|---|
+| 0 (1 net, 2L) | 16 | **75.00%** | **93.75%** | 0.00 | 2.88 |
+| 1 (20 nets, 2L) | 16 | **26.56%** | **37.19%** | 0.00 | 42.88 |
 
-- 4/16 (25%) of stage-0 boards have their two pads on **different layers** and
-  are unroutable without a via. A via-less policy caps at exactly 75.0% —
-  which is precisely where run A's eval sat for three consecutive evals.
-- Sampled rollouts place vias (training log shows **0.125–2.875 vias/board**)
-  and therefore finish those nets.
-- Argmax rarely does (eval shows **0.0–0.2 vias/board**).
+**Confirmed: the mode/mean gap is real and partly present before any
+training.** Stage 0's untrained argmax number (75.00%) is exactly the plateau
+run A's *trained* eval sat at for three consecutive evals — so at minimum,
+part of that plateau could have been the untrained baseline showing through
+rather than something training did. The mechanism, measured directly on stage
+1 (`measure_failure_mode.py`, not committed — reproduce with the method
+below): at init, argmax takes **direction 0 on 100% of steps** (straight down
+the geodesic gradient), places **zero vias**, and cycles — 23,455 head-steps
+over only 5,146 distinct cells, a **78.1% revisit rate** (sampled: 48.0%).
+Nothing in the observation flags "I have been here before" — the dead-zone
+channel keys off *rejection*, and argmax is rejected only 0.05% of the time,
+so there is no rejection signal to trigger it. Sampling is the only thing that
+breaks the loop and the only thing that proposes a via.
 
-**The policy has learned that vias sometimes help, but not confidently enough
-for the argmax to pick one.** It relies on stochasticity to stumble into the
-via.
+Ruled out as the cause of that cycling: a **stale geodesic field**. Heads'
+distance-to-target field is computed once per net assignment and never
+refreshed by default (`--geodesic-refresh 0`), so copper laid by other heads
+afterward is invisible to it — a plausible culprit. Measured with
+`--geodesic-refresh` at 0, 1, and 8: **byte-identical** completion, revisit
+rate and head-step counts across all three. Expected in hindsight: near-zero
+actor weights (`gain=0.01`) plus a dominant direction-0 bias means an
+*untrained* argmax barely reads the field at all regardless of its staleness.
+Whether refresh matters once the weights carry real signal (after training) is
+still open — queued as a flag-only sweep in `ANTIGRAVITY_PROMPT.md`.
 
-This was NOT diagnosed before the session ended. It is the single highest-value
-thing to resolve.
+### What is still open
 
-### The immediately decisive experiment
-
-Evaluate **both** deterministic and sampled on the same held-out boards and
-report both. If sampled ≈ 100% and argmax ≈ 75%, the above is confirmed and
-the problem is a mode/mean gap, not a capability gap. `evaluate()` in
-`neuroroute/training/run.py` currently only runs `deterministic=True`.
+1. **Run the two-arm eval on the actual stage-1 checkpoint** (1500 updates,
+   60.8% best argmax). If trained sampled ≈ trained argmax + ~11pt (the
+   untrained reference), the gap never closed during training — same
+   mechanism, untouched by learning. If it's much larger, training made the
+   mode worse than the mean, which is a different, worse finding (relying on
+   exploration noise to reach the goal). If trained argmax alone is
+   materially above 26.6% with vias > 0, training *did* fix it and stage-1's
+   remaining shortfall (60.8% vs the 75% gate) is a separate problem.
+2. **The `--geodesic-refresh` sweep, on the trained checkpoint**, now that the
+   untrained no-op is explained rather than just observed.
 
 ---
 
@@ -169,21 +199,33 @@ which is real but modest. Both runs used `--batch 16`; the notebook recommends
 
 ---
 
+## Stage 1 has now run: 1500 updates, gate not met
+
+Reported back from Colab, this session: **best held-out (argmax) completion
+60.8% at update 1350**, against greedy 26.1%, detour 26.1%, layer_hop 39.2% —
+decisively ahead of every baseline, but short of the 75% stage gate. Forecast
+gate `BEATS baseline` on 29/29 evals (100%). This is the trained number the
+two-arm eval above needs to be re-run against — it was still argmax-only when
+this run happened.
+
 ## Ranked next actions
 
-1. **Run the deterministic-vs-sampled eval.** One change to `evaluate()`,
-   decisive for the central open question. Do this before anything else.
+1. **Re-run eval on the stage-1 checkpoint with the new two-arm `evaluate()`**
+   (code done, this session — see the finding above). One extra update on
+   `--resume` triggers it; queued in `ANTIGRAVITY_PROMPT.md`. This is what
+   decides whether stage 1's 60.8% ceiling is a mode/mean gap (fixable by
+   changing how eval samples) or a real capability ceiling (needs more
+   training or a different fix).
 2. **Fix the forecast gate to score on correlation**, and compute it on
    held-out boards. Justified purely by data already collected.
 3. **Fix `rejected_action_rate`'s denominator** so the alarm stops firing on
    an artifact.
 4. **Address convergence**: lower LR (clip fraction says updates are too big),
-   and either run 600–900 updates or shape the entropy schedule to actually
-   decay late.
-5. **Then** move to stage 1 (20 nets, 2 layers) — the first stage where
-   congestion, the scheduler and the forecaster are genuinely tested. Stage 0
-   is a plumbing check and has largely served its purpose.
-6. Diagnose the detour ratio.
+   and either run more updates past 1500 or shape the entropy schedule to
+   decay later — stage 1's rejected-action rate spiked repeatedly through
+   training (0.04% → 4.39% at u550 → back down, never fully settling),
+   consistent with clip fraction still being high late in the run.
+5. Diagnose the detour ratio.
 
 Things designed but **not built**: a rip-up action head (the engine's
 `world.ripup()` works and is tested, but the policy never emits one), and a

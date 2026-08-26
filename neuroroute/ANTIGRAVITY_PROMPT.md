@@ -129,10 +129,11 @@ command.
 
 Two lines matter, and **neither is the reward**:
 
-1. **`completion` vs the baselines in the `EVAL` block.** This repo has a
+1. **The TWO `policy` lines in the `EVAL` block** -- argmax and sampled, on
+   identical held-out seeds -- and both against the baselines. This repo has a
    measured case of a policy scoring *worse* reward while routing *more* nets,
    so a reward curve alone can move the wrong way and look like progress.
-   Eval now uses **64 held-out boards** (was 16, where one board was worth
+   Eval uses **64 held-out boards** (was 16, where one board was worth
    6.25% and progress was indistinguishable from noise).
 2. **`FORECAST GATE`.** Reports whether the learned occupancy forecast beats a
    straight-line demand baseline. It is expected to say `does NOT beat
@@ -179,30 +180,94 @@ so explicitly and report the last lines of `console.log` plus how long it had
 been running. That signature means something different (OOM or preemption) and
 is diagnosed differently.
 
-## What changed since the first run, and what to look for
+## What changed since the last run, and what to look for
 
-The first stage-0 run pinned held-out completion at **exactly 75.0%** for three
-consecutive evals while `layer_hop` — a non-learned baseline — got 100%.
+### The eval now scores the policy TWICE on the same held-out boards
 
-Diagnosed and measured: **4 of 16 stage-0 boards have their two pads on
-different layers**, so they cannot be routed without a via, and a via-less
-policy is capped at exactly 75.0%. The policy was placing 0.0 vias. The reward
-was *not* the problem — a correct via already scores +0.190 against +0.021 for
-a lateral move. The cause was the layer head's init bias, set to 4.0 earlier to
-fix a different problem (impossible through-vias) and over-corrected: it put
-P(stay) at ~0.97 on a 2-layer board, and under argmax — which eval uses — that
-means "never place a via".
+Every `EVAL` block now prints two policy lines instead of one:
 
-Fixed: the bias is now derived from the layer count (`log(3L)`), giving
-P(stay) = 0.75 regardless of `L`. Measured effect on an untrained policy:
-P(proposing a via) went **0.035 -> 0.123**, with the rejected-action rate
-unchanged at ~1%. The entropy floor also went 0.001 -> 0.003, because entropy
-had collapsed from 2.1 to 0.29 less than halfway through the run.
+```
+    policy      60.8%   rejected  1.71%   vias   0.0   (argmax)
+    policy      ??.?%   rejected ??.??%   vias  ??.?   (sampled -- the distribution training rolls out under)
+    sampled - argmax  +??.?%   (untrained stage-1 reference: +10.6%)
+```
 
-**So the specific thing to watch on the next stage-0 run is the `vias` figure
-in the EVAL block.** If it stays at 0.0 and completion sticks at 75%, the fix
-did not work and that is the finding to report. If vias rise above ~0.2 and
-completion moves past 75%, it did.
+**This is the single number this run exists to produce.** Report both policy
+lines from every eval, verbatim.
+
+Why: training rolls out by **sampling** and reported ~100% completion on stage
+0 and up to 75.6% on stage 1, while held-out eval — which used **argmax** —
+read 73–90% and 60.8%. Two things differed at once (the boards *and* the
+action-selection rule), so the gap was unattributable. Now both arms run on
+identical seeds and only the rule differs.
+
+Reference numbers, measured locally on an **untrained** policy so the trained
+gap can be read against something:
+
+| stage | boards | argmax | sampled | argmax vias | sampled vias |
+|---|---|---|---|---|---|
+| 0 (1 net, 2L)   | 16 | **75.00%** | **93.75%** | 0.00 | 2.88 |
+| 1 (20 nets, 2L) | 16 | **26.56%** | **37.19%** | 0.00 | 42.9 |
+
+So roughly +10 to +19 points of that gap is present **before any training**,
+and the mechanism is visible: at init, argmax takes direction 0 (straight down
+the geodesic gradient) on **100%** of steps and places **zero** vias, and its
+heads cycle — 23,455 head-steps over 5,146 distinct cells on stage 1, a 78%
+revisit rate. Sampling is what places vias and what breaks the cycles.
+
+**What that means for what you report.** A trained gap of roughly +10–19
+points is the *floor*, not a finding. What matters is:
+
+* a trained gap **much larger** than the untrained reference → training has
+  made the mode worse relative to the mean, and confidence/entropy is the
+  problem;
+* a trained gap **at or below** the untrained reference → the mode is fine and
+  argmax-at-eval is simply the wrong readout for this environment;
+* `vias` on the **argmax** line. If it is still 0.0 after 1500 updates, the
+  layer head's argmax never fires and every cross-layer net is unroutable at
+  eval regardless of what the policy learned.
+
+### Immediate task: re-eval the stage-1 checkpoint
+
+Stage 1 has already run 1500 updates (best held-out argmax completion 60.8% at
+update 1350, against greedy 26.1% and layer_hop 39.2%). Do **not** retrain it.
+`git pull`, then run one more update so that a single eval fires with the new
+two-arm code:
+
+```bash
+python -m neuroroute.training.run --stage 1 --device cuda \
+  --batch 32 --heads 8 --width 48 --rollout 32 --ppo-chunk 8 --updates 1501 \
+  --eval-every 50 --eval-boards 64 --render-every 0 --drc-every 0 \
+  --checkpoint-dir $CKPT/stage1 --resume
+```
+
+That resumes at update 1500, does one update, and evals. Report the whole
+`EVAL` block. It is a few minutes of GPU time and it answers the top open
+question in `neuroroute/HANDOVER.md`.
+
+### Then, if you have GPU time: one config sweep, no code changes
+
+The heads' geodesic distance field is computed once when a net is assigned and
+never refreshed (`--geodesic-refresh 0`), so copper laid afterwards by the
+other K-1 heads is invisible to it. That is a candidate cause of the cycling
+above -- **candidate, not confirmed**: tested locally on the *untrained*
+policy (refresh 0 vs 1 vs 8), and completion, revisit rate and head-steps came
+back byte-identical across all three. That is not a null result for the
+trained checkpoint -- with near-zero actor weights (`gain=0.01`) and a
+dominant direction-0 bias, an untrained argmax barely reads the field at all,
+so staleness has nothing to bite on yet. Whether it matters *after* 1500
+updates, once the weights carry real signal, is exactly what this sweep
+tests. It is a **flag**, not a source change:
+
+```bash
+python -m neuroroute.training.run --stage 1 --device cuda \
+  --batch 32 --heads 8 --width 48 --rollout 32 --ppo-chunk 8 --updates 1501 \
+  --eval-every 50 --eval-boards 64 --render-every 0 --drc-every 0 \
+  --geodesic-refresh 8 --checkpoint-dir $CKPT/stage1_geo8 --resume
+```
+
+Report the eval block and how much slower an update got. If argmax completion
+rises materially with a refreshed field, that is the finding.
 
 ## Ground truth reminder
 
