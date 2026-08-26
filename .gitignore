@@ -13,3 +13,5 @@ outputs/
 checkpoints/
 wandb/
 .env
+preflight_out/
+drc_out/
