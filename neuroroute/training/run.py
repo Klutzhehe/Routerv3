@@ -268,7 +268,37 @@ def train(args) -> int:
         entropy_final=args.entropy_final, chunk=args.ppo_chunk, amp=args.amp,
         board_value_coef=args.board_value_coef,
     )
-    opt = torch.optim.Adam(policy.parameters(), lr=ppo.lr, eps=1e-5)
+    # Two learning rates, not one, when resuming a checkpoint that predates
+    # the scheduler/ripup/board-value fix: `policy.nets` (NetEncoder),
+    # `h_schedule`, `h_ripup`, `h_ripup_none` and `h_board_value` have never
+    # received a real gradient on any run in this project's history (the
+    # scheduler's log-prob was silently discarded until this session -- see
+    # HANDOVER.md), so on a --resume they are freshly initialised sharing an
+    # encoder that ~2000+ prior updates have already specialised around.
+    # That is a materially more fragile situation than training everything
+    # from one shared random init together (which is what any from-scratch
+    # local smoke test necessarily does, and part of why one looking clean
+    # there did not transfer to a --resume run): a noisy new gradient source
+    # pushing an ALREADY-CONVERGED representation is a classic way to
+    # destabilise it, and the standard fix is a lower rate for the new
+    # component, not a uniformly lower rate for a backbone that was already
+    # stable at the higher one. `--new-head-lr` defaults to 1/10th of `--lr`.
+    new_head_lr = args.new_head_lr if args.new_head_lr is not None else ppo.lr / 10.0
+    new_heads = [policy.nets, policy.h_schedule, policy.h_ripup, policy.h_board_value]
+    new_head_params = {id(p) for m in new_heads for p in m.parameters()}
+    new_head_params.add(id(policy.h_ripup_none))
+    new_params = [p for p in policy.parameters() if id(p) in new_head_params]
+    rest_params = [p for p in policy.parameters() if id(p) not in new_head_params]
+    opt = torch.optim.Adam(
+        [
+            {"params": rest_params, "lr": ppo.lr},
+            {"params": new_params, "lr": new_head_lr},
+        ],
+        eps=1e-5,
+    )
+    tel.print(f"  optimiser: {len(rest_params)} established params @ lr={ppo.lr}, "
+              f"{len(new_params)} new-head params (nets/schedule/ripup/board_value) "
+              f"@ lr={new_head_lr}")
     # fp16 GradScaler, only meaningful with --amp on CUDA.
     scaler = torch.amp.GradScaler("cuda", enabled=bool(args.amp and dev.type == "cuda"))
     buf = RolloutBuffer(ppo, dev)
@@ -299,7 +329,23 @@ def train(args) -> int:
                 f"cold and re-warms over the next several updates."
             )
         else:
-            opt.load_state_dict(state["optimiser"])
+            # Model keys all matched, but the optimiser's own structure can
+            # still be incompatible -- e.g. this run just changed from one
+            # Adam parameter group to two (established vs new-head LR), and
+            # the checkpoint on disk predates that. That is a shape mismatch
+            # load_state_dict itself raises on, not something the missing/
+            # unexpected-keys check above (which only inspects the MODEL)
+            # can see coming. Same fallback as the branch above: skip loading
+            # optimiser state and start it cold rather than crash the resume.
+            try:
+                opt.load_state_dict(state["optimiser"])
+            except (ValueError, RuntimeError) as exc:
+                tel.print(
+                    f"    [WARN] optimiser state on disk is structurally "
+                    f"incompatible ({exc}) -- likely a parameter-group change "
+                    f"since this checkpoint was saved. Model weights loaded "
+                    f"fine; optimiser restarts cold."
+                )
         start_update = int(state.get("update", 0))
         tel.history = state.get("history", [])
         tel.print(f"resumed from update {start_update}")
@@ -580,6 +626,13 @@ def main() -> None:
     p.add_argument("--rollout", type=int, default=32)
     p.add_argument("--updates", type=int, default=500)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--new-head-lr", type=float, default=None,
+                   help="separate, lower LR for parameters that have never "
+                        "received a gradient before this session (NetEncoder, "
+                        "schedule, ripup, board_value) -- protects an "
+                        "already-converged, --resume'd encoder from a noisy "
+                        "new gradient source destabilising it. Defaults to "
+                        "1/10th of --lr if not set.")
     p.add_argument("--entropy", type=float, default=0.01)
     p.add_argument("--entropy-final", type=float, default=0.003,
                    help="entropy coefficient floor. 0.001 let the policy go "
