@@ -179,6 +179,14 @@ def check_metrics_health(row: dict[str, Any]) -> HealthReport:
     vloss = row.get("value_loss")
     if isinstance(vloss, float) and vloss > 1e4:
         rep.warn(f"value loss {vloss:.1f} is exploding")
+    # `board_value_loss` was added alongside the scheduler/ripup fix and this
+    # check was not -- it explored 30 -> 490,703 in 6 updates on the first
+    # real run and nothing here would have said so; the generic NaN/inf loop
+    # above only catches it once it goes non-finite, well after "exploding"
+    # would have been the more useful, earlier word for it.
+    bvloss = row.get("board_value_loss")
+    if isinstance(bvloss, float) and bvloss > 1e4:
+        rep.warn(f"board value loss {bvloss:.1f} is exploding")
     clip = row.get("clip_frac")
     if isinstance(clip, float) and clip > 0.5:
         rep.warn(f"clip fraction {clip:.2f} -- updates are too large for the PPO trust region")

@@ -81,6 +81,18 @@ class PPOConfig:
     entropy_final: float = 0.001
     value_coef: float = 0.5
     forecast_coef: float = 0.5
+    #: Separate from `value_coef` on purpose. `board_value` regresses
+    #: against board-level returns -- a SUM over up to K=8 heads' rewards,
+    #: not one head's -- so its natural squared-error scale is much larger
+    #: than the per-head value loss's, even after normalising its input
+    #: (see h_board_value's LayerNorm fix). Sharing `value_coef` measured
+    #: at 97.7% of the ENTIRE total loss from one real logged update
+    #: (bv=718 vs vl=16, pl effectively 0%) -- the routing policy was
+    #: getting essentially no gradient at all while this dominated. This
+    #: default (0.01) is a first-pass calibration from that one data point,
+    #: not a derived constant -- watch `bv` on the next run and retune if
+    #: it is still lopsided.
+    board_value_coef: float = 0.01
     max_grad_norm: float = 0.5
     lr: float = 3e-4
     #: Where rollout observations live. "cpu" trades PCIe bandwidth for VRAM
@@ -407,7 +419,7 @@ def ppo_update(
                          - board_ret) ** 2
                 board_vl = 0.5 * torch.maximum(bv_unc, bv_cl).mean()
 
-                total = total + sched_loss + ripup_loss + cfg.value_coef * board_vl
+                total = total + sched_loss + ripup_loss + cfg.board_value_coef * board_vl
 
                 # The forecaster is supervised, not reinforced, and its labels
                 # are the terminal state of the episode this rollout came from

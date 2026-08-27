@@ -266,6 +266,7 @@ def train(args) -> int:
         rollout_steps=args.rollout, epochs=args.ppo_epochs, lr=args.lr,
         store_device=args.store_device, entropy_coef=args.entropy,
         entropy_final=args.entropy_final, chunk=args.ppo_chunk, amp=args.amp,
+        board_value_coef=args.board_value_coef,
     )
     opt = torch.optim.Adam(policy.parameters(), lr=ppo.lr, eps=1e-5)
     # fp16 GradScaler, only meaningful with --amp on CUDA.
@@ -594,6 +595,14 @@ def main() -> None:
                         "is already at or above --rollout (no more tiny-pass "
                         "overhead left to remove by raising chunk further). "
                         "Lowering it trades sample efficiency for wall-clock.")
+    p.add_argument("--board-value-coef", type=float, default=0.01,
+                   help="weight on the board-level (schedule+ripup) critic's "
+                        "loss, separate from --value-coef because board "
+                        "returns sum up to K heads' rewards and have a much "
+                        "larger natural scale. Measured dominating 97.7%% of "
+                        "the total loss at the default before this flag "
+                        "existed (routing policy loss was ~0%%) -- lower "
+                        "this further if bv is still lopsided vs v.")
     p.add_argument("--amp", action="store_true",
                    help="fp16 autocast on CUDA. UNVERIFIED -- no GPU was "
                         "available to test it; watch for [FATAL] non-finite")
