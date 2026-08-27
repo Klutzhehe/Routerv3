@@ -112,6 +112,17 @@ def check_model_health(model: torch.nn.Module, amp_skip_ok: bool = False) -> Hea
     happens anyway, something got past the safety GradScaler is supposed to
     provide, and that is a strictly worse signal than the one this flag
     exists to tolerate.
+
+    It also reattributes "gradient norm is exactly zero" on the same update,
+    rather than leaving it to print as an unrelated-looking second alarm.
+    `clip_grad_norm_` computes ONE norm across every parameter combined, so a
+    single inf anywhere makes that combined norm inf too, and the resulting
+    clip coefficient (`max_norm / inf`) is exactly 0 -- which then multiplies
+    *every other parameter's gradient* by zero in the same step,
+    deterministically, not by chance. So whenever `amp_skip_ok` is true, a
+    zero gradient norm is a guaranteed downstream mechanical consequence of
+    the one inf gradient GradScaler already caught, not a second, independent
+    "nothing is learning" event.
     """
     rep = HealthReport()
     total_sq = 0.0
@@ -135,7 +146,13 @@ def check_model_health(model: torch.nn.Module, amp_skip_ok: bool = False) -> Hea
     else:
         gnorm = total_sq ** 0.5
         if gnorm == 0.0:
-            rep.warn("gradient norm is exactly zero -- nothing is learning")
+            if amp_skip_ok:
+                rep.warn("gradient norm is exactly zero -- the same skipped "
+                         "GradScaler step above, not a separate stall (its "
+                         "inf zeroed every other parameter's gradient via "
+                         "clip_grad_norm_'s combined norm)")
+            else:
+                rep.warn("gradient norm is exactly zero -- nothing is learning")
         elif gnorm > 1e4:
             rep.warn(f"gradient norm {gnorm:.1f} is very large")
     return rep
