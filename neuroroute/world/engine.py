@@ -159,6 +159,10 @@ class BatchedRouterWorld:
         self.net_len = torch.zeros(B, N, 2, dtype=torch.float32, device=dev)
         self.net_target_len = torch.full((B, N), -1.0, dtype=torch.float32, device=dev)
         self.net_vias = z(B, N)
+        # Board-level, not per-net: a ripped-up net returns to pending and
+        # its identity as "the one that got ripped" is not what matters --
+        # how often the board saw a rip-up this episode is.
+        self.ripup_count = z(B)
         self.net_split = torch.zeros(B, N, dtype=torch.float32, device=dev)
         self.net_coupled_steps = torch.zeros(B, N, dtype=torch.float32, device=dev)
 
@@ -209,6 +213,7 @@ class BatchedRouterWorld:
         self.net_len.zero_()
         self.net_target_len.fill_(-1.0)
         self.net_vias.zero_()
+        self.ripup_count.zero_()
         self.net_split.zero_()
         self.net_coupled_steps.zero_()
         self.net_group.fill_(-1)
@@ -432,6 +437,7 @@ class BatchedRouterWorld:
         self.net_split[b_i, n_i] = 0.0
         self.net_coupled_steps[b_i, n_i] = 0.0
         self.route_n[b_i, n_i] = 0
+        self.ripup_count[b_i] += 1
         return ok
 
     # -- the step -----------------------------------------------------------
@@ -814,6 +820,7 @@ class BatchedRouterWorld:
             "failed": (valid & (self.net_status == STATUS_FAILED)).sum(dim=1),
             "pending": (valid & (self.net_status == STATUS_PENDING)).sum(dim=1),
             "vias": self.net_vias.sum(dim=1),
+            "ripups": self.ripup_count.clone(),
             "wirelength": (self.net_len.sum(dim=-1) * done.float()).sum(dim=1),
             "split_fraction": (
                 (self.net_split * pair.float()).sum(dim=1)

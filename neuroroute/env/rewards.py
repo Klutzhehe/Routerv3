@@ -126,6 +126,7 @@ def terminal_reward(world: BatchedRouterWorld, cfg: RewardConfig) -> tuple[torch
     metrics = {
         "completion": stats["completion"],
         "vias": stats["vias"].float(),
+        "ripups": stats["ripups"].float(),
         "wirelength": stats["wirelength"],
         "detour": detour,
         "pair_gap_error": (gap * is_pair).sum(dim=1) / n_pair,

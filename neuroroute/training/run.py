@@ -454,10 +454,12 @@ def train(args) -> int:
                               f"boards, seeds {seeds[0]}..{seeds[-1]}, never trained on)")
                     tel.print(f"    policy     {ev['policy/completion']:6.1%}   "
                               f"rejected {ev['policy/rejected_action_rate']:6.2%}   "
-                              f"vias {ev.get('policy/vias', 0):5.1f}   (argmax)")
+                              f"vias {ev.get('policy/vias', 0):5.1f}   "
+                              f"ripups {ev.get('policy/ripups', 0):4.1f}   (argmax)")
                     tel.print(f"    policy     {ev['policy_sampled/completion']:6.1%}   "
                               f"rejected {ev['policy_sampled/rejected_action_rate']:6.2%}   "
-                              f"vias {ev.get('policy_sampled/vias', 0):5.1f}   (sampled -- "
+                              f"vias {ev.get('policy_sampled/vias', 0):5.1f}   "
+                              f"ripups {ev.get('policy_sampled/ripups', 0):4.1f}   (sampled -- "
                               f"the distribution training rolls out under)")
                     tel.print(f"    sampled - argmax {ev['policy/sample_minus_argmax']:+6.1%}"
                               "   (untrained stage-1 reference: +10.6%)")
