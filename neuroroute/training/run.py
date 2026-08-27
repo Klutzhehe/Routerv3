@@ -263,7 +263,7 @@ def train(args) -> int:
     )
 
     ppo = PPOConfig(
-        rollout_steps=args.rollout, lr=args.lr,
+        rollout_steps=args.rollout, epochs=args.ppo_epochs, lr=args.lr,
         store_device=args.store_device, entropy_coef=args.entropy,
         entropy_final=args.entropy_final, chunk=args.ppo_chunk, amp=args.amp,
     )
@@ -271,6 +271,12 @@ def train(args) -> int:
     # fp16 GradScaler, only meaningful with --amp on CUDA.
     scaler = torch.amp.GradScaler("cuda", enabled=bool(args.amp and dev.type == "cuda"))
     buf = RolloutBuffer(ppo, dev)
+    # Cumulative, CUDA-accurate breakdown of the "update" phase itself --
+    # `tel.timings` only says "update is N% of wall time"; this says what
+    # update's own time is going to (data prep / forward / loss / backward /
+    # optimiser step), so a slow run says which part is slow instead of
+    # requiring a guess.
+    phase_timer: dict[str, float] = {}
 
     start_update = 0
     if args.resume and (out / "latest.pt").exists():
@@ -328,7 +334,7 @@ def train(args) -> int:
             with tel.section("update"):
                 targets = episode_targets(env.world, latent_shape(env))
                 stats = ppo_update(policy, opt, buf, adv, ret, ppo, entropy_coef,
-                                   targets, scaler=scaler)
+                                   targets, scaler=scaler, phase_timer=phase_timer)
 
             health = check_model_health(policy)
             for w in health.warnings:
@@ -365,17 +371,29 @@ def train(args) -> int:
             if update % args.log_every == 0:
                 done_n = ppo.rollout_steps * args.batch * args.heads * (update - start_update + 1)
                 sps = done_n / max(tel.timings.get("rollout", 1e-6), 1e-6)
+                # ms/update, not just share-of-update: a percentage alone
+                # cannot show whether a change (e.g. --amp) made the run
+                # faster, only how time is split *within* whatever the total
+                # happens to be -- if every phase sped up by the same factor,
+                # the percentages would look identical before and after.
+                n_upd = max(1, update - start_update + 1)
+                phase_total = sum(phase_timer.values()) or 1.0
+                phase_summary = "  ".join(
+                    f"{k} {1000 * v / n_upd:.0f}ms({v / phase_total:.0%})"
+                    for k, v in sorted(phase_timer.items())
+                )
                 tel.print(
                     f"[{update:5d}/{args.updates}] "
                     f"completion {row['completion']:6.1%}  reward {row['reward']:8.2f}  "
                     f"rej {row['rejected_action_rate']:5.1%}  "
                     f"pi {stats['policy_loss']:+.3f}  v {stats['value_loss']:7.3f}  "
                     f"H {stats['entropy']:.3f}  fcast {stats['forecast']:.3f}  "
-                    f"{sps:,.0f} dec/s  {tel.gpu_memory()}  [{tel.timing_summary()}]"
+                    f"{sps:,.0f} dec/s  {tel.gpu_memory()}  [{tel.timing_summary()}]  "
+                    f"upd:[{phase_summary}]"
                 )
 
             # -- eval -----------------------------------------------------
-            if update > 0 and update % args.eval_every == 0:
+            if update > 0 and args.eval_every and update % args.eval_every == 0:
                 with tel.section("eval"):
                     seeds = list(range(args.eval_seed_base,
                                        args.eval_seed_base + args.eval_boards))
@@ -454,7 +472,7 @@ def train(args) -> int:
                 obs = env.reset()
 
             # -- checkpoint ------------------------------------------------
-            if update > 0 and update % args.checkpoint_every == 0:
+            if update > 0 and args.checkpoint_every and update % args.checkpoint_every == 0:
                 save(out, policy, opt, update, args, tel, best_completion)
                 tel.print(f"    checkpoint @ update {update} -> {out/'latest.pt'}")
 
@@ -523,6 +541,13 @@ def main() -> None:
     p.add_argument("--ppo-chunk", type=int, default=8,
                    help="rollout timesteps folded into one forward/backward. "
                         "The GPU utilisation knob; lower it first on OOM")
+    p.add_argument("--ppo-epochs", type=int, default=4,
+                   help="passes over the same rollout per update. Each pass is "
+                        "a full forward+backward through the encoder, so this "
+                        "is the other update-phase-cost knob once --ppo-chunk "
+                        "is already at or above --rollout (no more tiny-pass "
+                        "overhead left to remove by raising chunk further). "
+                        "Lowering it trades sample efficiency for wall-clock.")
     p.add_argument("--amp", action="store_true",
                    help="fp16 autocast on CUDA. UNVERIFIED -- no GPU was "
                         "available to test it; watch for [FATAL] non-finite")

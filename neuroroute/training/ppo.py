@@ -20,7 +20,9 @@ with `K=8` that is an 8x variance penalty for no benefit.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field as dc_field
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field as dc_field, replace
 
 import torch
 import torch.nn as nn
@@ -28,6 +30,30 @@ import torch.nn.functional as F
 
 from neuroroute.env.observation import Observation
 from neuroroute.models.forecaster import forecast_losses
+
+
+@contextmanager
+def _timed(bucket: dict[str, float] | None, name: str, device: torch.device):
+    """Accumulate wall time for one sub-phase into `bucket[name]`, CUDA-accurate.
+
+    Mirrors `Telemetry.section`'s synchronize-before-and-after pattern -- CUDA
+    ops are launched async, so an unsynchronised `perf_counter()` around them
+    times how fast Python could *submit* work, not how long the GPU took to do
+    it. `bucket=None` skips both the sync and the dict write, so callers that
+    do not want per-phase detail pay nothing extra.
+    """
+    if bucket is None:
+        yield
+        return
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t = time.perf_counter()
+    try:
+        yield
+    finally:
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        bucket[name] = bucket.get(name, 0.0) + (time.perf_counter() - t)
 
 
 @dataclass
@@ -199,6 +225,7 @@ def ppo_update(
     entropy_coef: float,
     forecast_targets: dict[str, torch.Tensor] | None = None,
     scaler: "torch.amp.GradScaler | None" = None,
+    phase_timer: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """One PPO phase over a collected rollout. Returns scalar diagnostics.
 
@@ -211,6 +238,12 @@ def ppo_update(
     The maths is unchanged: losses are still masked per head and averaged over
     live heads, so a chunk produces the same gradient as the mean of its
     timesteps did.
+
+    `phase_timer`, if given, accumulates CUDA-accurate wall time per sub-phase
+    (`prep`/`forward`/`loss`/`backward`/`step`) across every call the caller
+    makes it -- pass the same dict in every update to build a cumulative,
+    run-long breakdown of what "update" (already known to dominate wall time)
+    is actually spending its time on, instead of guessing.
     """
     d = buffer.device
     T = len(buffer)
@@ -238,61 +271,87 @@ def ppo_update(
                 continue
             n = len(idx)
 
-            obs = stack_observations([buffer.observation_at(t) for t in idx], d)
-            act = {
-                k: torch.cat([buffer.actions[t][k].to(d) for t in idx], dim=0)
-                for k in buffer.actions[idx[0]]
-            }
-            rows = lambda src: torch.cat([src[t] for t in idx], dim=0)  # noqa: E731
-            m = rows(masks)
-            denom = m.sum().clamp_min(1.0)
+            with _timed(phase_timer, "prep", d):
+                obs = stack_observations([buffer.observation_at(t) for t in idx], d)
+                act = {
+                    k: torch.cat([buffer.actions[t][k].to(d) for t in idx], dim=0)
+                    for k in buffer.actions[idx[0]]
+                }
+                rows = lambda src: torch.cat([src[t] for t in idx], dim=0)  # noqa: E731
+                m = rows(masks)
+                denom = m.sum().clamp_min(1.0)
 
             want_f = forecast_targets is not None
-            with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
-                out = policy.evaluate(obs, act, return_forecast=want_f)
-            logp, entropy, value = out[0], out[1], out[2]
-            forecast = out[3] if want_f else None
+            with _timed(phase_timer, "forward", d):
+                with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+                    out = policy.evaluate(obs, act, return_forecast=want_f)
+                logp, entropy, value = out[0], out[1], out[2]
+                forecast = out[3] if want_f else None
+                if want_f:
+                    # Same reasoning as the logp/entropy/value cast below, and
+                    # this one was missed the first time AMP was actually run:
+                    # `forecast_losses` calls BCE-with-logits and an exp() on
+                    # raw conv output that autocast leaves in fp16, and it is
+                    # called *outside* the autocast context, so nothing else
+                    # casts it back. Confirmed as the cause of the first real
+                    # AMP crash -- `h_value.weight`'s gradient going
+                    # non-finite despite the value head having nothing to do
+                    # with the forecaster; a NaN forecast loss poisons the
+                    # whole shared backward graph, not just its own branch.
+                    forecast = replace(
+                        forecast,
+                        final_occupancy=forecast.final_occupancy.float(),
+                        contention=forecast.contention.float(),
+                        jam_risk=forecast.jam_risk.float(),
+                    )
 
-            # Loss in fp32 regardless of autocast: a PPO ratio is an exponential
-            # of a difference of log-probs, and fp16 there is a good way to get
-            # a silent inf.
-            logp, entropy, value = logp.float(), entropy.float(), value.float()
+            with _timed(phase_timer, "loss", d):
+                # Loss in fp32 regardless of autocast: a PPO ratio is an
+                # exponential of a difference of log-probs, and fp16 there is
+                # a good way to get a silent inf.
+                logp, entropy, value = logp.float(), entropy.float(), value.float()
 
-            ratio = torch.exp((logp - rows(old_logp)) * m)
-            a = rows(advantages)
-            unclipped = -a * ratio
-            clipped = -a * ratio.clamp(1.0 - cfg.clip, 1.0 + cfg.clip)
-            pl = (torch.maximum(unclipped, clipped) * m).sum() / denom
+                ratio = torch.exp((logp - rows(old_logp)) * m)
+                a = rows(advantages)
+                unclipped = -a * ratio
+                clipped = -a * ratio.clamp(1.0 - cfg.clip, 1.0 + cfg.clip)
+                pl = (torch.maximum(unclipped, clipped) * m).sum() / denom
 
-            ret = rows(returns)
-            ov = rows(old_value)
-            v_unc = (value - ret) ** 2
-            v_cl = (ov + (value - ov).clamp(-cfg.value_clip, cfg.value_clip) - ret) ** 2
-            vl = 0.5 * (torch.maximum(v_unc, v_cl) * m).sum() / denom
+                ret = rows(returns)
+                ov = rows(old_value)
+                v_unc = (value - ret) ** 2
+                v_cl = (ov + (value - ov).clamp(-cfg.value_clip, cfg.value_clip) - ret) ** 2
+                vl = 0.5 * (torch.maximum(v_unc, v_cl) * m).sum() / denom
 
-            ent = (entropy * m).sum() / denom
-            total = pl + cfg.value_coef * vl - entropy_coef * ent
+                ent = (entropy * m).sum() / denom
+                total = pl + cfg.value_coef * vl - entropy_coef * ent
 
-            # The forecaster is supervised, not reinforced, and its labels are
-            # the terminal state of the episode this rollout came from -- one
-            # label set per board, so they repeat across the chunk's timesteps.
-            f_loss = torch.zeros((), device=d)
-            if want_f:
-                tgt = {k: v.repeat(n, *([1] * (v.dim() - 1))) for k, v in forecast_targets.items()}
-                f_loss = sum(forecast_losses(forecast, tgt).values())
-                total = total + cfg.forecast_coef * f_loss
+                # The forecaster is supervised, not reinforced, and its labels
+                # are the terminal state of the episode this rollout came from
+                # -- one label set per board, so they repeat across the
+                # chunk's timesteps.
+                f_loss = torch.zeros((), device=d)
+                if want_f:
+                    tgt = {k: v.repeat(n, *([1] * (v.dim() - 1))) for k, v in forecast_targets.items()}
+                    f_loss = sum(forecast_losses(forecast, tgt).values())
+                    total = total + cfg.forecast_coef * f_loss
 
-            optimiser.zero_grad(set_to_none=True)
-            if scaler is not None and amp:
-                scaler.scale(total).backward()
-                scaler.unscale_(optimiser)
-                nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-                scaler.step(optimiser)
-                scaler.update()
-            else:
-                total.backward()
-                nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-                optimiser.step()
+            with _timed(phase_timer, "backward", d):
+                optimiser.zero_grad(set_to_none=True)
+                if scaler is not None and amp:
+                    scaler.scale(total).backward()
+                else:
+                    total.backward()
+
+            with _timed(phase_timer, "step", d):
+                if scaler is not None and amp:
+                    scaler.unscale_(optimiser)
+                    nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                    scaler.step(optimiser)
+                    scaler.update()
+                else:
+                    nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                    optimiser.step()
 
             stats["policy_loss"] += float(pl.detach())
             stats["value_loss"] += float(vl.detach())
