@@ -442,10 +442,32 @@ class NeuroRoutePolicy(nn.Module):
             if given is None:
                 choice = safe.argmax(-1) if deterministic else dist.sample()
             else:
+                # `given[:, k] == -1` means "no pick happened here" for a
+                # reason that has nothing to do with net index 0 specifically
+                # (the slot wasn't idle, or nothing was pending at all) --
+                # `clamp_min(0)` just needs SOME in-range index to re-score,
+                # and can land on net 0 even when `safe[..., 0]` is `-inf`
+                # (net 0 exists but is not pending for this board). Unlike
+                # `_ripup`, there is no dedicated always-finite "none" index
+                # here to route to instead, so the mask below has to be
+                # applied via `where`, not multiplication -- see the comment
+                # on `logp` just below for why that distinction is load-bearing.
                 choice = given[:, k].clamp_min(0)
             take = idle[:, k] & ~none_pending
             picks.append(torch.where(take, choice, torch.full_like(choice, -1)))
-            logp = logp + dist.log_prob(choice) * take.float()
+            # NOT `dist.log_prob(choice) * take.float()`. When `choice` lands
+            # on a masked (-inf-scored) index -- which only the `given`
+            # branch above can cause -- `log_prob` is itself `-inf`, and
+            # `-inf * 0.0 = NaN` in IEEE 754 regardless of `take` being
+            # False. `torch.where` selects between two already-computed
+            # finite-or-not values without multiplying either by the other,
+            # so it cannot produce that NaN. Found live on the very first
+            # GPU update once `given` re-scoring started actually running --
+            # not exercised by any local CPU smoke test at toy scale, which
+            # is the honest reason it wasn't caught before real training hit
+            # a wide enough batch to make the coincidence likely.
+            step_logp = dist.log_prob(choice)
+            logp = logp + torch.where(take, step_logp, torch.zeros_like(step_logp))
         return torch.stack(picks, dim=1), logp
 
     # -- rip-up ---------------------------------------------------------------
