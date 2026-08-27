@@ -113,10 +113,11 @@ class FieldEncoder(nn.Module):
     model consumes a full-resolution feature map.
     """
 
-    def __init__(self, in_channels: int, width: int = 64, attn_heads: int = 4):
+    def __init__(self, in_channels: int, width: int = 64, attn_heads: int = 4, levels: int = 2):
         super().__init__()
         d = width
         self.width = d
+        self.levels = levels    # 0-1 = stem + one block, no down/mid/up pyramid
 
         # Straight to 1/4 resolution. See the module docstring for why.
         self.stem = nn.Sequential(
@@ -125,32 +126,41 @@ class FieldEncoder(nn.Module):
             nn.SiLU(),
         )
         self.enc0 = FactorisedBlock(d, d)
-        self.down1 = FactorisedBlock(d, 2 * d, stride=2)
-        self.down2 = FactorisedBlock(2 * d, 4 * d, stride=2)
 
-        self.mid_layer_attn = LayerAxialAttention(4 * d, attn_heads)
-        self.mid_spatial_attn = SpatialAttention(4 * d, attn_heads)
-        self.mid_block = FactorisedBlock(4 * d, 4 * d)
-
-        self.up1 = FactorisedBlock(4 * d + 2 * d, 2 * d)
-        self.up2 = FactorisedBlock(2 * d + d, d)
-        self.out_layer_attn = LayerAxialAttention(d, attn_heads)
-
-        self.global_proj = nn.Sequential(nn.Linear(4 * d, 2 * d), nn.SiLU(), nn.Linear(2 * d, 2 * d))
+        if levels >= 2:
+            # Full U-Net: two more downsample steps, mid attention, symmetric
+            # upsample. Earns its keep at 8 layers / 128 px / hundreds of nets.
+            self.down1 = FactorisedBlock(d, 2 * d, stride=2)
+            self.down2 = FactorisedBlock(2 * d, 4 * d, stride=2)
+            self.mid_layer_attn = LayerAxialAttention(4 * d, attn_heads)
+            self.mid_spatial_attn = SpatialAttention(4 * d, attn_heads)
+            self.mid_block = FactorisedBlock(4 * d, 4 * d)
+            self.up1 = FactorisedBlock(4 * d + 2 * d, 2 * d)
+            self.up2 = FactorisedBlock(2 * d + d, d)
+            self.out_layer_attn = LayerAxialAttention(d, attn_heads)
+            self.global_proj = nn.Sequential(nn.Linear(4 * d, 2 * d), nn.SiLU(), nn.Linear(2 * d, 2 * d))
+        else:
+            # Lite: stem + two blocks + pool. ~6x cheaper in fwd+bwd, and the
+            # right size for stages 0-1 (2 layers, ~48 px, 1-3 nets).
+            self.lite_block = FactorisedBlock(d, d)
+            self.global_proj = nn.Sequential(nn.Linear(d, 2 * d), nn.SiLU(), nn.Linear(2 * d, 2 * d))
         self.global_dim = 2 * d
 
     def forward(self, field: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x0 = self.enc0(self.stem(field))          # (B, d,   L, H/4,  W/4)
+        x0 = self.enc0(self.stem(field))          # (B, d, L, H/4, W/4)
+
+        if self.levels < 2:
+            z = self.lite_block(x0)
+            g = self.global_proj(z.mean(dim=(2, 3, 4)))
+            return z, g
+
         x1 = self.down1(x0)                       # (B, 2d,  L, H/8,  W/8)
         x2 = self.down2(x1)                       # (B, 4d,  L, H/16, W/16)
-
         m = self.mid_block(self.mid_spatial_attn(self.mid_layer_attn(x2)))
-
         u1 = F.interpolate(m, size=x1.shape[2:], mode="nearest")
         u1 = self.up1(torch.cat([u1, x1], dim=1))
         u2 = F.interpolate(u1, size=x0.shape[2:], mode="nearest")
         z = self.out_layer_attn(self.up2(torch.cat([u2, x0], dim=1)))
-
         g = self.global_proj(m.mean(dim=(2, 3, 4)))
         return z, g
 

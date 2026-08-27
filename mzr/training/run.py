@@ -60,22 +60,33 @@ def make_env(stage, batch: int, device: str, seed: int) -> RouteEnv:
     )
 
 
-@torch.no_grad()
-def evaluate(policy, stage, device: str, eval_seeds: list[int]) -> dict:
-    """Argmax and sampled completion on the fixed held-out seeds.
+_EVAL_ENV: RouteEnv | None = None
 
-    Also returns `argmax_fail_seeds` -- the seeds that did not reach 100% under
-    argmax. On a stage with an absolute-1.0 gate those are exactly the boards
-    worth looking at, and a short list of them is more useful than a mean.
+
+@torch.no_grad()
+def evaluate(policy, stage, device: str, eval_seeds: list[int], with_sampled: bool = True) -> dict:
+    """Held-out completion on the fixed seeds.
+
+    Reuses one persistent env across calls -- rebuilding it (and regenerating
+    every board, and recomputing every geodesic field) each eval was ~half the
+    eval cost. `with_sampled` gates the second full episode: the gate is argmax,
+    so the sampled arm is a diagnostic and does not need to run every time.
+
+    Returns `argmax_fail_seeds` -- the seeds not at 100% under argmax. On an
+    absolute-1.0 gate those are the whole story; a mean hides them.
     """
+    global _EVAL_ENV
     policy.eval()
+    if _EVAL_ENV is None or _EVAL_ENV.cfg.world.batch_size != len(eval_seeds):
+        _EVAL_ENV = make_env(stage, batch=len(eval_seeds), device=device, seed=0)
+    env = _EVAL_ENV
+
     out: dict = {}
-    for arm, det in (("argmax", True), ("sampled", False)):
-        env = make_env(stage, batch=len(eval_seeds), device=device, seed=0)
+    arms = [("argmax", True)] + ([("sampled", False)] if with_sampled else [])
+    for arm, det in arms:
         obs = env.reset(seeds=eval_seeds)
         while True:
-            act = policy.act(obs, deterministic=det)
-            step = env.step(act["action"])
+            step = env.step(policy.act(obs, deterministic=det)["action"])
             obs = step.obs
             if step.done:
                 break
@@ -84,8 +95,11 @@ def evaluate(policy, stage, device: str, eval_seeds: list[int]) -> dict:
         out[f"{arm}_perfect"] = float((c >= 0.999).float().mean())
         if arm == "argmax":
             out["argmax_fail_seeds"] = [
-                int(s) for s, done in zip(eval_seeds, (c >= 0.999).tolist()) if not done
+                int(sd) for sd, ok in zip(eval_seeds, (c >= 0.999).tolist()) if not ok
             ][:12]
+    if not with_sampled:
+        out["sampled_completion"] = out["argmax_completion"]
+        out["sampled_perfect"] = out["argmax_perfect"]
     policy.train()
     return out
 
@@ -127,12 +141,23 @@ def main() -> int:
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--rollout", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--epochs", type=int, default=2, help="PPO epochs per update (was 4)")
+    p.add_argument("--minibatches", type=int, default=2)
+    p.add_argument("--entropy-coef", type=float, default=0.004)
+    p.add_argument("--progress-coef", type=float, default=None,
+                   help="override RewardConfig.progress for this run")
     p.add_argument("--bc-coef", type=float, default=None,
                    help="override the stage's BC weight (default: 0 -- pure RL)")
-    p.add_argument("--field-width", type=int, default=48)
-    p.add_argument("--token-width", type=int, default=128)
-    p.add_argument("--eval-every", type=int, default=25)
-    p.add_argument("--eval-boards", type=int, default=64)
+    p.add_argument("--field-width", type=int, default=40)
+    p.add_argument("--token-width", type=int, default=96)
+    p.add_argument("--encoder-levels", type=int, default=2,
+                   help="0 = lite encoder (no U-Net pyramid); right size for stages 0-1")
+    p.add_argument("--token-depth", type=int, default=2,
+                   help="0 = per-frontier MLP only, no cross-frontier attention")
+    p.add_argument("--eval-every", type=int, default=50)
+    p.add_argument("--eval-boards", type=int, default=32)
+    p.add_argument("--sampled-every", type=int, default=3,
+                   help="run the (diagnostic) sampled eval arm every Nth eval")
     p.add_argument("--checkpoint-dir", default="mzr_ckpt")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--seed", type=int, default=0)
@@ -151,10 +176,17 @@ def main() -> int:
         num_layers=stage.layers,
         field_width=args.field_width,
         token_width=args.token_width,
+        encoder_levels=args.encoder_levels,
+        token_depth=args.token_depth,
     ).to(dev)
     opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
+    if args.progress_coef is not None:
+        stage.reward.progress = args.progress_coef
     bc = stage.bc_coef0 if args.bc_coef is None else args.bc_coef
-    ppo_cfg = PPOConfig(lr=args.lr, bc_coef=bc)
+    ppo_cfg = PPOConfig(
+        lr=args.lr, bc_coef=bc, epochs=args.epochs,
+        minibatches=args.minibatches, entropy_coef=args.entropy_coef,
+    )
 
     start, best = 0, -1.0
     latest = ckpt_dir / f"stage{args.stage}_latest.pt"
@@ -181,16 +213,28 @@ def main() -> int:
         t0 = time.time()
         buf = RolloutBuffer()
         obs = collect(env, policy, buf, args.rollout, obs)
+        t_collect = time.time() - t0
         with torch.no_grad():
             last_v = policy.act(obs, deterministic=False)["value"]
+        t1 = time.time()
         m = ppo_update(policy, opt, buf, last_v, ppo_cfg)
+        t_ppo = time.time() - t1
         dt = time.time() - t0
 
-        line = {"update": u, "sec": round(dt, 2), "bc_coef": bc,
+        line = {"update": u, "sec": round(dt, 2), "collect_s": round(t_collect, 2),
+                "ppo_s": round(t_ppo, 2), "bc_coef": bc,
                 **{k: round(v, 4) for k, v in m.items()}}
+        # A heartbeat every update -- so "is it stuck or just slow" is answerable
+        # without waiting for the next eval.
+        if u < start + 3 or u % max(1, args.eval_every // 5) == 0:
+            print(f"  u{u:4d} {dt:.1f}s (collect {t_collect:.1f} / ppo {t_ppo:.1f}) "
+                  f"kl {m['approx_kl']:.3f} clip {m['clip_frac']:.2f} vloss {m['value_loss']:.1f}",
+                  flush=True)
 
         if (u + 1) % args.eval_every == 0 or u == args.updates - 1:
-            ev = evaluate(policy, stage, dev, eval_seeds)
+            n_eval = (u + 1) // args.eval_every
+            ev = evaluate(policy, stage, dev, eval_seeds,
+                          with_sampled=(n_eval % args.sampled_every == 0))
             line.update(
                 {k: (round(v, 4) if isinstance(v, float) else v) for k, v in ev.items()}
             )

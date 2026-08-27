@@ -22,6 +22,8 @@ from dataclasses import dataclass
 
 import torch
 
+from mzr.env.observation import stack_observations
+
 
 @dataclass
 class PPOConfig:
@@ -31,6 +33,10 @@ class PPOConfig:
     epochs: int = 4
     minibatches: int = 4
     value_coef: float = 0.5
+    #: Clip the value update to +/- this around the old prediction, like the
+    #: policy ratio is clipped. Standard PPO; stops one bad-scale rollout batch
+    #: from yanking the critic (and, through the shared encoder, the policy).
+    value_clip: float = 10.0
     entropy_coef: float = 0.01
     max_grad_norm: float = 1.0
     lr: float = 3e-4
@@ -117,59 +123,65 @@ def ppo_update(
             if not steps:
                 continue
 
-            pol_loss = val_loss = ent_term = bc_term = kl_term = clip_term = 0.0
-            for t in steps:
-                obs = buf.obs[t]
-                act = buf.actions[t]
-                mask = buf.masks[t].float()            # (B, F)
-                n_live = mask.sum().clamp_min(1.0)
-
-                ev = policy.evaluate(obs, act)
-                new_logp = ev["logp"]                  # (B, F)
-                old_logp = buf.logp[t]
-
-                ratio = torch.exp((new_logp - old_logp).clamp(-20, 20))
-                a_t = adv[t].view(B, 1)                # board advantage, broadcast
-                unclipped = ratio * a_t
-                clipped = torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * a_t
-                pol_loss = pol_loss + -(torch.minimum(unclipped, clipped) * mask).sum() / n_live
-
-                v = ev["value"]                        # (B,)
-                val_loss = val_loss + (v - returns[t]).pow(2).mean()
-                ent_term = ent_term + ev["entropy"]
-
-                with torch.no_grad():
-                    kl_term = kl_term + ((old_logp - new_logp) * mask).sum() / n_live
-                    clip_term = clip_term + (
-                        ((ratio - 1.0).abs() > cfg.clip).float() * mask
-                    ).sum() / n_live
-
-                if cfg.bc_coef > 0.0 and buf.bc_actions[t] is not None:
-                    bc = buf.bc_actions[t]
-                    evb = policy.evaluate(obs, bc["action"])
-                    # Cross-entropy to the expert action, on frontiers the
-                    # expert actually moved.
-                    w = bc["mask"].float()
-                    bc_term = bc_term + -(evb["logp"] * w).sum() / w.sum().clamp_min(1.0)
-
             k = len(steps)
+            # One batched evaluate for the whole minibatch: stack k timesteps
+            # into a (k*B, ...) observation and action, run the model once.
+            mb_obs = stack_observations([buf.obs[t] for t in steps])
+            mb_act = {
+                key: torch.cat([buf.actions[t][key] for t in steps], dim=0)
+                for key in buf.actions[steps[0]]
+            }
+            mb_mask = torch.cat([buf.masks[t] for t in steps], dim=0).float()   # (k*B, F)
+            mb_oldlp = torch.cat([buf.logp[t] for t in steps], dim=0)           # (k*B, F)
+            mb_adv = adv[steps].reshape(k * B, 1)
+            mb_ret = returns[steps].reshape(k * B)
+
+            mb_oldval = torch.cat([buf.values[tt] for tt in steps], dim=0)     # (k*B,)
+
+            ev = policy.evaluate(mb_obs, mb_act)
+            new_logp = ev["logp"]                                              # (k*B, F)
+            n_live = mb_mask.sum().clamp_min(1.0)
+
+            ratio = torch.exp((new_logp - mb_oldlp).clamp(-20, 20))
+            unclipped = ratio * mb_adv
+            clipped = torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * mb_adv
+            pol_loss = -(torch.minimum(unclipped, clipped) * mb_mask).sum() / n_live
+            v = ev["value"]
+            v_clipped = mb_oldval + (v - mb_oldval).clamp(-cfg.value_clip, cfg.value_clip)
+            val_loss = torch.maximum((v - mb_ret).pow(2), (v_clipped - mb_ret).pow(2)).mean()
+            ent_term = ev["entropy"]
+
+            with torch.no_grad():
+                kl_term = ((mb_oldlp - new_logp) * mb_mask).sum() / n_live
+                clip_term = (((ratio - 1.0).abs() > cfg.clip).float() * mb_mask).sum() / n_live
+
+            bc_term = torch.zeros((), device=dev)
+            if cfg.bc_coef > 0.0 and buf.bc_actions[steps[0]] is not None:
+                mb_bc = {
+                    key: torch.cat([buf.bc_actions[t]["action"][key] for t in steps], dim=0)
+                    for key in buf.bc_actions[steps[0]]["action"]
+                }
+                w = torch.cat([buf.bc_actions[t]["mask"] for t in steps], dim=0).float()
+                evb = policy.evaluate(mb_obs, mb_bc)
+                bc_term = -(evb["logp"] * w).sum() / w.sum().clamp_min(1.0)
+
             loss = (
-                pol_loss / k
-                + cfg.value_coef * val_loss / k
-                - cfg.entropy_coef * ent_term / k
-                + cfg.bc_coef * bc_term / k
+                pol_loss
+                + cfg.value_coef * val_loss
+                - cfg.entropy_coef * ent_term
+                + cfg.bc_coef * bc_term
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
             optimizer.step()
 
-            metrics["policy_loss"] += float((pol_loss / k).detach())
-            metrics["value_loss"] += float((val_loss / k).detach())
-            metrics["entropy"] += float((ent_term / k).detach())
-            metrics["clip_frac"] += float(clip_term / k)
-            metrics["bc_loss"] += float((bc_term / k).detach()) if cfg.bc_coef > 0 and not isinstance(bc_term, float) else 0.0
-            metrics["approx_kl"] += float(kl_term / k)
+            metrics["policy_loss"] += float(pol_loss.detach())
+            metrics["value_loss"] += float(val_loss.detach())
+            metrics["entropy"] += float(ent_term.detach())
+            metrics["clip_frac"] += float(clip_term)
+            metrics["bc_loss"] += float(bc_term.detach()) if cfg.bc_coef > 0 else 0.0
+            metrics["approx_kl"] += float(kl_term)
             metrics["grad_norm"] = float(gn)
             n_updates += 1
 

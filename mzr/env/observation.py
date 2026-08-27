@@ -125,6 +125,33 @@ class Observation:
     is_pair: torch.Tensor
 
 
+def stack_observations(obs_list: list[Observation]) -> Observation:
+    """Concatenate a list of same-shape observations along the batch axis.
+
+    The PPO update needs `policy.evaluate()` on many stored timesteps. Calling
+    it once per timestep runs the (heavy) field encoder that many times; on the
+    stage-0 profile that was ~30 s of the ~40 s update. Stacking K timesteps
+    into one (K*B, ...) observation and evaluating once collapses that to a
+    single encoder pass -- same FLOPs, an order of magnitude less launch
+    overhead, and it actually parallelises on the GPU.
+
+    Every field is a plain tensor with a leading batch dim, so this is one
+    `torch.cat` per field. The caller is responsible for reshaping the
+    (K*B, ...) outputs back to (K, B, ...).
+    """
+    return Observation(
+        field=torch.cat([o.field for o in obs_list], dim=0),
+        frontiers=torch.cat([o.frontiers for o in obs_list], dim=0),
+        frontier_pos=torch.cat([o.frontier_pos for o in obs_list], dim=0),
+        frontier_mask=torch.cat([o.frontier_mask for o in obs_list], dim=0),
+        safety=torch.cat([o.safety for o in obs_list], dim=0),
+        via_safe=torch.cat([o.via_safe for o in obs_list], dim=0),
+        geo_layer=torch.cat([o.geo_layer for o in obs_list], dim=0),
+        bearing=torch.cat([o.bearing for o in obs_list], dim=0),
+        is_pair=torch.cat([o.is_pair for o in obs_list], dim=0),
+    )
+
+
 def build_field(world) -> torch.Tensor:
     """(B, C, L, H, W) board tensor."""
     occ = world.occ

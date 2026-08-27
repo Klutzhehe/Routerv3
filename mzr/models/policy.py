@@ -92,7 +92,7 @@ class FrontierEncoder(nn.Module):
             width, heads, dim_feedforward=3 * width, batch_first=True, dropout=0.0,
             activation="gelu", norm_first=True,
         )
-        self.blocks = nn.TransformerEncoder(block, depth)
+        self.blocks = nn.TransformerEncoder(block, depth) if depth > 0 else None
         self.width = width
 
     def forward(
@@ -105,9 +105,15 @@ class FrontierEncoder(nn.Module):
     ) -> torch.Tensor:
         t = self.embed(torch.cat([feat, crop, z_gather], dim=-1))
         t = t + self.ctx(g).unsqueeze(1)
+        # depth=0: per-frontier features only, no cross-frontier attention.
+        # The right size for stages 0-1 (1-3 nets) -- there is almost nothing
+        # for frontiers to coordinate about, and the transformer is a real
+        # fwd+bwd cost.
+        if self.blocks is None:
+            return torch.nan_to_num(t) * mask.unsqueeze(-1).float()
         # A batch row with zero live frontiers makes the padding mask all-True,
-        # which NaNs softmax. Guard by leaving at least the first slot attention-visible;
-        # its output is masked to zero below anyway.
+        # which NaNs softmax. Guard by leaving at least the first slot
+        # attention-visible; its output is masked to zero below anyway.
         safe_mask = mask.clone()
         safe_mask[~mask.any(dim=1), 0] = True
         out = self.blocks(t, src_key_padding_mask=~safe_mask)
@@ -121,11 +127,13 @@ class PriorPolicy(nn.Module):
         field_width: int = 64,
         token_width: int = 192,
         crop: int = 16,
+        encoder_levels: int = 2,
+        token_depth: int = 2,
     ):
         super().__init__()
         self.num_layers = num_layers
         self.sizes = _head_sizes(num_layers)
-        self.field = FieldEncoder(FIELD_CHANNELS, width=field_width)
+        self.field = FieldEncoder(FIELD_CHANNELS, width=field_width, levels=encoder_levels)
         self.cropper = FrontierCropEncoder(FIELD_CHANNELS, num_layers, crop=crop)
 
         feat_dim = frontier_feature_dim(num_layers)
@@ -135,6 +143,7 @@ class PriorPolicy(nn.Module):
             z_dim=field_width,
             global_dim=self.field.global_dim,
             width=token_width,
+            depth=token_depth,
         )
 
         total = sum(self.sizes.values())

@@ -39,8 +39,13 @@ from mzr.world.engine import StepResult
 @dataclass
 class RewardConfig:
     gamma: float = 0.99
-    #: Potential-based geodesic shaping.
-    progress: float = 1.0
+    #: Potential-based geodesic shaping. Raised from 1.0: at the old weight a
+    #: step toward the target was worth ~0.02 (a 1-cell geodesic drop / a
+    #: LENGTH_SCALE of 32), which the normalised advantage's value-function
+    #: noise drowned -- on stage 0 the `direction`-toward-target bias eroded
+    #: and argmax stopped pointing at the pad. At 4.0 a good step is ~0.12,
+    #: clearly the best local move.
+    progress: float = 4.0
     #: Flat per-step cost, so finishing sooner is strictly better.
     step_cost: float = 0.01
     #: This frontier's move was illegal. See calibration note 2.
@@ -56,12 +61,16 @@ class RewardConfig:
     #: Weight on the per-step change in board-wide present congestion, split
     #: across live frontiers. Negative delta (congestion fell) is a reward.
     congestion_delta: float = 0.30
-    #: A leg connected this step -- credited to both its frontiers.
-    arrival: float = 5.0
+    #: A leg connected this step -- credited to both its frontiers. Lowered
+    #: from 5.0: at 5.0 (x2 frontiers = +10) plus a completion bonus of 20,
+    #: the return was dominated by a few large spikes at irregular episode
+    #: positions, and the near-zero-init value head could not track it --
+    #: vloss swung 7 -> 128 between rollout batches and fed the policy thrash.
+    arrival: float = 2.0
     #: A net ran out of budget with a leg still open.
     failure: float = 4.0
-    #: Terminal, per board.
-    completion: float = 20.0
+    #: Terminal, per board. Lowered from 20.0 with `arrival` -- see above.
+    completion: float = 10.0
     wirelength: float = 0.5  # weight on excess routed length over straight-line
     #: Differential pairs (stage 6). Dormant until pairs appear in the netlist.
     pair_gap: float = 4.0
