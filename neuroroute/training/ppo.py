@@ -262,6 +262,16 @@ def ppo_update(
     stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_frac": 0.0, "forecast": 0.0}
     n_updates = 0
     chunk = max(1, min(cfg.chunk, T))
+    # Did GradScaler itself decline to apply an update this call? Distinct
+    # from a genuinely corrupted model: GradScaler already refuses to step
+    # the optimiser when its unscaled gradients contain inf (routine,
+    # expected while its scale factor is still calibrating, especially in
+    # the first updates after --amp is turned on), but it does not clear
+    # `.grad` afterward -- so the stale inf sits there for whoever inspects
+    # gradients next. The caller uses this to tell "GradScaler already
+    # caught and discarded this" apart from "a real non-finite gradient
+    # that WOULD have corrupted the model."
+    amp_step_skipped = False
 
     for _ in range(cfg.epochs):
         order = torch.randperm(T).tolist()
@@ -347,8 +357,17 @@ def ppo_update(
                 if scaler is not None and amp:
                     scaler.unscale_(optimiser)
                     nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                    scale_before = scaler.get_scale()
                     scaler.step(optimiser)
                     scaler.update()
+                    # A shrinking scale after `update()` is GradScaler's own
+                    # signal that it saw inf and skipped the step just now --
+                    # there is no other public way to ask "did the last step
+                    # actually apply". `<` not `!=`: growth_interval can also
+                    # *raise* the scale on a healthy step, which must not be
+                    # read as a skip.
+                    if scaler.get_scale() < scale_before:
+                        amp_step_skipped = True
                 else:
                     nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
                     optimiser.step()
@@ -362,4 +381,9 @@ def ppo_update(
             stats["forecast"] += float(f_loss.detach())
             n_updates += 1
 
-    return {k: v / max(1, n_updates) for k, v in stats.items()}
+    out = {k: v / max(1, n_updates) for k, v in stats.items()}
+    # Not averaged like the metrics above -- a flag, not a per-iteration
+    # quantity. `check_model_health`'s caller uses it to tell a routine
+    # GradScaler skip apart from a genuinely corrupted model.
+    out["amp_step_skipped"] = 1.0 if amp_step_skipped else 0.0
+    return out

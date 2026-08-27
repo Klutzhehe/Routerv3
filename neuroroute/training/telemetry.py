@@ -95,11 +95,23 @@ class HealthReport:
         self.fatal = True
 
 
-def check_model_health(model: torch.nn.Module) -> HealthReport:
+def check_model_health(model: torch.nn.Module, amp_skip_ok: bool = False) -> HealthReport:
     """Look for NaN/inf parameters and dead or exploding gradients.
 
     Run *after* the optimiser step, so it catches a corrupted update before the
     next rollout is collected against a broken policy.
+
+    `amp_skip_ok`: GradScaler itself already declined to apply this update
+    (it saw inf in the unscaled gradients and skipped the optimiser step --
+    routine while its scale factor is still calibrating, especially right
+    after --amp is turned on), but it never clears `.grad` afterward. Without
+    this flag every one of those routine skips looks identical to a real
+    corruption and kills the run. It only softens the **gradient** check to a
+    warning -- a non-finite **parameter** stays fully fatal regardless, since
+    that is exactly the failure GradScaler's skip exists to prevent; if it
+    happens anyway, something got past the safety GradScaler is supposed to
+    provide, and that is a strictly worse signal than the one this flag
+    exists to tolerate.
     """
     rep = HealthReport()
     total_sq = 0.0
@@ -111,7 +123,11 @@ def check_model_health(model: torch.nn.Module) -> HealthReport:
         if p.grad is not None:
             n_with_grad += 1
             if not torch.isfinite(p.grad).all():
-                rep.fail(f"gradient of '{name}' is non-finite")
+                if amp_skip_ok:
+                    rep.warn(f"gradient of '{name}' is non-finite "
+                             f"(GradScaler already skipped this step)")
+                else:
+                    rep.fail(f"gradient of '{name}' is non-finite")
             else:
                 total_sq += float(p.grad.detach().pow(2).sum())
     if n_with_grad == 0:

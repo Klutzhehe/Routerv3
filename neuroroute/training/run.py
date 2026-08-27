@@ -336,7 +336,7 @@ def train(args) -> int:
                 stats = ppo_update(policy, opt, buf, adv, ret, ppo, entropy_coef,
                                    targets, scaler=scaler, phase_timer=phase_timer)
 
-            health = check_model_health(policy)
+            health = check_model_health(policy, amp_skip_ok=bool(stats.get("amp_step_skipped")))
             for w in health.warnings:
                 tel.print(f"    [WARN] {w}")
             for e in health.errors:
