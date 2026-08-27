@@ -70,6 +70,13 @@ Report the table and the `routing decisions/sec` figure. Local CPU reference
 
 ## Step 3 — Train, in order. Do not skip stages.
 
+**Stage 1 is not a fresh start any more** — a checkpoint already exists with
+real progress. Use the resume command in "What changed since the last run"
+below, not the from-scratch one here. The stage-1 command below is kept for
+reference (what a genuinely fresh stage-1 run looks like) but is stale on
+tuning: no `--lr 1.5e-4`, no `--amp`, no `--store-device cuda`, none of which
+existed when it was written.
+
 ```bash
 # Stage 0 — plumbing. Should climb well past the 87.5% non-learned baseline.
 python -m neuroroute.training.run --stage 0 --device cuda \
@@ -144,7 +151,11 @@ Two lines matter, and **neither is the reward**:
 collapse, exploding value loss, clip fraction, rejected-action rate). Report
 every one of them with the update number. A `[FATAL]` stops the run
 deliberately, before corruption reaches a checkpoint — that is working as
-intended, and the output is the finding.
+intended, and the output is the finding. With `--amp` on, a `[WARN] gradient
+... is non-finite (GradScaler already skipped this step)` is expected and
+routine (GradScaler's own safety mechanism, not a corruption) — only a
+`[FATAL]` needs reporting as urgent; that WARN is fine to just include in the
+normal report.
 
 ## What to report back
 
@@ -182,92 +193,79 @@ is diagnosed differently.
 
 ## What changed since the last run, and what to look for
 
-### The eval now scores the policy TWICE on the same held-out boards
+The two-arm eval question from earlier sessions is **answered** (both a
+mode/mean gap and a real learning-rate instability were confirmed and fixed
+along the way -- full story in `HANDOVER.md`). The current state: stage 1
+peaked at **64.8% argmax completion at update 1550**, and has not exceeded
+that through roughly update 2199 since. `--amp` is on and confirmed working
+(~1.9x real speedup once past a one-time per-process warm-up cost) after
+fixing one real bug in it (a forecaster loss running in unsafe fp16). None of
+that needs re-running.
 
-Every `EVAL` block now prints two policy lines instead of one:
+### The big one: the scheduler had never trained, on any run, ever
 
-```
-    policy      60.8%   rejected  1.71%   vias   0.0   (argmax)
-    policy      ??.?%   rejected ??.??%   vias  ??.?   (sampled -- the distribution training rolls out under)
-    sampled - argmax  +??.?%   (untrained stage-1 reference: +10.6%)
-```
+Traced it down while building something else: `policy.act()` computed a
+log-prob for the net-scheduling decision every step, but nothing downstream
+ever used it -- `h_schedule` received **zero gradient** on every stage-0 and
+stage-1 run in this project's history, for a stage whose whole point is
+*"congestion and ordering."* Fixed, along with wiring in a rip-up action
+(`world.ripup()` already existed and was already verified; the policy simply
+never emitted it) through the same fix, since both are the same kind of
+missing piece. Full detail in `HANDOVER.md`.
 
-**This is the single number this run exists to produce.** Report both policy
-lines from every eval, verbatim.
+**This has never been trained on. That is the main thing to find out now.**
 
-Why: training rolls out by **sampling** and reported ~100% completion on stage
-0 and up to 75.6% on stage 1, while held-out eval — which used **argmax** —
-read 73–90% and 60.8%. Two things differed at once (the boards *and* the
-action-selection rule), so the gap was unattributable. Now both arms run on
-identical seeds and only the rule differs.
-
-Reference numbers, measured locally on an **untrained** policy so the trained
-gap can be read against something:
-
-| stage | boards | argmax | sampled | argmax vias | sampled vias |
-|---|---|---|---|---|---|
-| 0 (1 net, 2L)   | 16 | **75.00%** | **93.75%** | 0.00 | 2.88 |
-| 1 (20 nets, 2L) | 16 | **26.56%** | **37.19%** | 0.00 | 42.9 |
-
-So roughly +10 to +19 points of that gap is present **before any training**,
-and the mechanism is visible: at init, argmax takes direction 0 (straight down
-the geodesic gradient) on **100%** of steps and places **zero** vias, and its
-heads cycle — 23,455 head-steps over 5,146 distinct cells on stage 1, a 78%
-revisit rate. Sampling is what places vias and what breaks the cycles.
-
-**What that means for what you report.** A trained gap of roughly +10–19
-points is the *floor*, not a finding. What matters is:
-
-* a trained gap **much larger** than the untrained reference → training has
-  made the mode worse relative to the mean, and confidence/entropy is the
-  problem;
-* a trained gap **at or below** the untrained reference → the mode is fine and
-  argmax-at-eval is simply the wrong readout for this environment;
-* `vias` on the **argmax** line. If it is still 0.0 after 1500 updates, the
-  layer head's argmax never fires and every cross-layer net is unroutable at
-  eval regardless of what the policy learned.
-
-### Immediate task: re-eval the stage-1 checkpoint
-
-Stage 1 has already run 1500 updates (best held-out argmax completion 60.8% at
-update 1350, against greedy 26.1% and layer_hop 39.2%). Do **not** retrain it.
-`git pull`, then run one more update so that a single eval fires with the new
-two-arm code:
+### Step A -- resume stage 1 with the new code, on the SAME checkpoint
 
 ```bash
+git pull origin main   # must be at commit 1b82baf or later
 python -m neuroroute.training.run --stage 1 --device cuda \
-  --batch 32 --heads 8 --width 48 --rollout 32 --ppo-chunk 8 --updates 1501 \
-  --eval-every 50 --eval-boards 64 --render-every 0 --drc-every 0 \
+  --batch 32 --heads 8 --width 48 --rollout 32 --ppo-chunk 32 \
+  --store-device cuda --lr 1.5e-4 --amp \
+  --updates 3000 --eval-every 50 --eval-boards 64 --render-every 100 --drc-every 0 \
   --checkpoint-dir $CKPT/stage1 --resume
 ```
 
-That resumes at update 1500, does one update, and evals. Report the whole
-`EVAL` block. It is a few minutes of GPU time and it answers the top open
-question in `neuroroute/HANDOVER.md`.
+(`--render-every 100` is intentionally back on this time -- see Step B.)
 
-### Then, if you have GPU time: one config sweep, no code changes
+**Expect one `[WARN]` on resume, and it is not a problem:**
 
-The heads' geodesic distance field is computed once when a net is assigned and
-never refreshed (`--geodesic-refresh 0`), so copper laid afterwards by the
-other K-1 heads is invisible to it. That is a candidate cause of the cycling
-above -- **candidate, not confirmed**: tested locally on the *untrained*
-policy (refresh 0 vs 1 vs 8), and completion, revisit rate and head-steps came
-back byte-identical across all three. That is not a null result for the
-trained checkpoint -- with near-zero actor weights (`gain=0.01`) and a
-dominant direction-0 bias, an untrained argmax barely reads the field at all,
-so staleness has nothing to bite on yet. Whether it matters *after* 1500
-updates, once the weights carry real signal, is exactly what this sweep
-tests. It is a **flag**, not a source change:
-
-```bash
-python -m neuroroute.training.run --stage 1 --device cuda \
-  --batch 32 --heads 8 --width 48 --rollout 32 --ppo-chunk 8 --updates 1501 \
-  --eval-every 50 --eval-boards 64 --render-every 0 --drc-every 0 \
-  --geodesic-refresh 8 --checkpoint-dir $CKPT/stage1_geo8 --resume
+```
+[WARN] checkpoint predates the current architecture -- missing [...], unexpected []...
 ```
 
-Report the eval block and how much slower an update got. If argmax completion
-rises materially with a refreshed field, that is the finding.
+This is the checkpoint's old weights loading correctly; the three new
+parameters (the ripup head, its "do nothing" bias, and the new board-level
+value function) start at their own fresh init, exactly as intended. Report
+it once, then move on -- it is expected, not a fault to fix.
+
+**What to watch that is new:**
+* Every progress line now has `sched`, `ripup`, and `bv` fields. `bv` (the new
+  board-level critic's loss) should move around like a real value function
+  is learning -- if it sits pinned near one number for hundreds of updates,
+  that is worth reporting, not just the headline completion number.
+* Every `EVAL` block now has a `ripups` count next to `vias`, for both argmax
+  and sampled. Report it every time -- it is the only way to see whether the
+  policy is actually using the new capability, since the trained checkpoint
+  has literally never had this option before.
+* **The number that answers the open question**: does argmax completion move
+  past 64.8% now? Report every `EVAL` block in full, verbatim, same as always.
+
+### Step B -- once a handful of evals have landed: look at the renders
+
+`--render-every 100` above already turns this on. After the run has been
+going a while, pull the images:
+
+```bash
+ls -la $CKPT/stage1/renders/
+```
+
+Send back the **latest** `*_worst.png` and `*_sheet.png`. Nobody has looked
+at an actual failed board this whole project -- every finding so far has come
+from numbers. Dashed red lines in the render are nets that did not route,
+drawn pad-to-pad over whatever is in their way; this is expected to be far
+more informative than any more delta-of-numbers, and it's needed regardless
+of how Step A comes out.
 
 ## Ground truth reminder
 

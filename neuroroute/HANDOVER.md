@@ -199,38 +199,91 @@ which is real but modest. Both runs used `--batch 16`; the notebook recommends
 
 ---
 
-## Stage 1 has now run: 1500 updates, gate not met
+## Stage 1, across several Colab sessions: peaked at 64.8%, gate still not met
 
-Reported back from Colab, this session: **best held-out (argmax) completion
-60.8% at update 1350**, against greedy 26.1%, detour 26.1%, layer_hop 39.2% —
-decisively ahead of every baseline, but short of the 75% stage gate. Forecast
-gate `BEATS baseline` on 29/29 evals (100%). This is the trained number the
-two-arm eval above needs to be re-run against — it was still argmax-only when
-this run happened.
+Full trajectory, in order: first full run hit **60.8% at update 1350**, then
+**decayed to 56% by update 1500** (rejected-action rate climbing at the same
+time — a real instability, not noise). Lowering `--lr` to 1.5e-4 fixed that:
+rejected rate collapsed back down and completion recovered past the old peak
+to **64.8% at update 1550**. `--amp` was turned on partway through (confirmed,
+after accounting for cudnn's one-time algorithm-search cost on a fresh
+process, to be a real **~1.9x wall-clock speedup** — ~5.2s/update vs ~10s
+before) and hit one real bug (below). The run has since continued to roughly
+update 2199 without exceeding 64.8% again — best argmax has stayed in the
+low-to-mid 60s, gate (75%) still not met.
+
+**A real AMP bug, found and fixed, not a flake:** `forecast_losses()` runs
+BCE-with-logits and an `exp()` on the forecaster's raw fp16 output, called
+*outside* the autocast block — unlike `logp`/`entropy`/`value`, which already
+had an explicit fp32 cast with a comment explaining exactly this risk, the
+forecast tensors were missed. A NaN forecast loss poisons the whole shared
+backward graph (not just the forecaster's own parameters), which is why the
+symptom was `h_value.weight`'s gradient going non-finite despite the value
+head having nothing to do with it. Fixed with the same cast. Separately,
+`GradScaler` declining a step (routine, expected while its scale is
+calibrating) was being treated as fatal because it never clears `.grad` after
+a decline — `check_model_health` now takes `amp_skip_ok` and downgrades a
+non-finite **gradient** to a warning (a non-finite **parameter** stays fully
+fatal regardless — that is the actual corruption GradScaler's decline exists
+to prevent).
+
+## THE major finding this session: the scheduler has never trained, ever
+
+`policy.act()` computes `schedule_log_prob` every step; nothing downstream
+ever used it. `RolloutBuffer.add()` explicitly dropped `"schedule"` from
+stored actions (`if k != "schedule"`), and `policy.evaluate()` never called
+`_schedule()` at all. `h_schedule` and the `NetEncoder` behind it received
+**zero gradient, on every run in this project's history** — for a stage whose
+own description is *"congestion and ordering."* Confirmed by grepping every
+use of `schedule_log_prob`: computed once, read never.
+
+**Fixed, along with building the rip-up head at the same time** — they are
+the same architectural gap (both are board-level "pointer over net tokens"
+decisions), so fixing one without the other would have just added a second
+untrained-looking head. Both now train through a proper board-level PPO path:
+a new critic (`h_board_value`, from the global context — the per-head value
+is masked to active heads and meaningless on a board between nets, exactly
+when scheduling matters most), `given=` re-scoring on `_schedule`/`_ripup`
+(mirrors what `_score` already did for the per-head actions), and a real
+GAE-based board-level advantage in `ppo_update`. Ripup itself
+(`world.ripup()`, `NeuroRouteEnv.step`'s `"ripup"` handling) already existed
+and was already verified — the policy simply never emitted the action.
+Measured on the untrained policy, not assumed: **0.00%** ripup rate under
+argmax over 3,163 eligible board-steps (matches "untrained policy == greedy
+baseline"), **5.16%** under sampled (real exploration signal to learn from).
+A `policy/ripups` count now appears in every eval block, same path `vias`
+already takes, so this is observable going forward, not just inferable from a
+loss number.
+
+**This has not been trained on yet.** The existing stage-1 checkpoint predates
+all of this — resuming it now hits a deliberate `strict=False` load (verified
+against a real stripped checkpoint): old weights load normally, the three new
+parameters start at their own fresh init, and Adam's optimiser state resets
+cold rather than silently mismatching. The real test of whether this closes
+any of the plateau is still **unrun**.
 
 ## Ranked next actions
 
-1. **Re-run eval on the stage-1 checkpoint with the new two-arm `evaluate()`**
-   (code done, this session — see the finding above). One extra update on
-   `--resume` triggers it; queued in `ANTIGRAVITY_PROMPT.md`. This is what
-   decides whether stage 1's 60.8% ceiling is a mode/mean gap (fixable by
-   changing how eval samples) or a real capability ceiling (needs more
-   training or a different fix).
-2. **Fix the forecast gate to score on correlation**, and compute it on
-   held-out boards. Justified purely by data already collected.
-3. **Fix `rejected_action_rate`'s denominator** so the alarm stops firing on
-   an artifact.
-4. **Address convergence**: lower LR (clip fraction says updates are too big),
-   and either run more updates past 1500 or shape the entropy schedule to
-   decay later — stage 1's rejected-action rate spiked repeatedly through
-   training (0.04% → 4.39% at u550 → back down, never fully settling),
-   consistent with clip fraction still being high late in the run.
-5. Diagnose the detour ratio.
+1. **Resume stage 1 with the new code and just watch it.** This is the
+   single most-anticipated result outstanding: does completion move past
+   64.8% now that ordering and rip-up can actually be learned, or does the
+   plateau hold regardless? New progress-line fields to watch: `sched`,
+   `ripup`, `bv` (board value loss — should move like a real value function,
+   not sit at zero). New eval-block field: `ripups` per board.
+2. **Look at the renders before building anything else.** `--render-every`
+   has been 0 all session — nobody has looked at an actual failed board yet,
+   only numbers. `render_board`/`contact_sheet` in `eval/render.py` draw
+   failed nets as dashed red lines over whatever is in their way; this is
+   the cheapest, highest-information next step and should come before
+   deciding what (if anything) to build next.
+3. Diagnose the detour ratio (still open, unexplained: 50–160% longer than
+   straight-line even uncontested).
+4. Fix the forecast gate to score on correlation, on held-out boards
+   (justified purely by data already collected — see README §"forecaster").
+5. Fix `rejected_action_rate`'s denominator artifact.
 
-Things designed but **not built**: a rip-up action head (the engine's
-`world.ripup()` works and is tested, but the policy never emits one), and a
-policy head for the refine phase (the drag action works and is verified, but
-nothing chooses drags).
+Still designed but **not built**: a policy head for the refine phase (the
+vertex-drag action works and is verified, but nothing chooses drags).
 
 ---
 
