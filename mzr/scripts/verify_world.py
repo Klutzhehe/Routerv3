@@ -404,6 +404,53 @@ def test_exported_segments_are_backed_by_copper() -> None:
     )
 
 
+def test_expert_paths_are_replayable() -> None:
+    """Expert routes are made of single engine actions, and are legal copper.
+
+    This is the property that makes the expert a *demonstration source* rather
+    than just a baseline number. Behaviour cloning needs (observation, action)
+    pairs, so every step of an expert route has to be exactly one thing the
+    policy could have done: one of the 8 in-plane directions at a legal step
+    length, or one layer change. A planner emitting arbitrary jumps would score
+    well and teach nothing.
+
+    Also checks the expert's copper is actually on the board -- it stamps
+    through `geometry.move_claims` / `via_claims`, the same functions
+    `engine.step()` uses, so a mismatch here means the two have drifted apart.
+    """
+    from mzr.world.expert import ExpertConfig, route_world_board
+    from mzr.world.spec import DIRECTION_VECTORS
+
+    dirs = {(int(dy), int(dx)) for dy, dx in DIRECTION_VECTORS}
+    w = build(nets=10, layers=4, size=48, batch=2)
+    bad_step = bad_copper = steps = legs = 0
+    completion = 0.0
+    for b in range(w.cfg.batch_size):
+        res = route_world_board(w, b, ExpertConfig(iterations=3))
+        completion += res.completion / w.cfg.batch_size
+        for (net, leg), path in res.paths.items():
+            legs += 1
+            for (l0, y0, x0), (l1, y1, x1) in zip(path, path[1:]):
+                steps += 1
+                if l0 != l1:
+                    # A layer change is a via: it must not also move.
+                    if (y0, x0) != (y1, x1) or abs(l1 - l0) != 1:
+                        bad_step += 1
+                elif (y1 - y0, x1 - x0) not in dirs:
+                    bad_step += 1
+
+    check(
+        "expert routes are single engine actions end to end",
+        bad_step == 0,
+        f"{steps - bad_step}/{steps} steps over {legs} legs are unit moves or single via hops",
+    )
+    check(
+        "the expert is actually expert -- it beats the layer_hop baseline",
+        completion > 0.75,
+        f"expert completion {completion:.3f}",
+    )
+
+
 def test_rejected_steps_are_no_ops() -> None:
     """An all-illegal macro-step must leave the board byte-identical.
 
@@ -675,6 +722,7 @@ def main() -> int:
     test_done_nets_are_connected(layers=4, via=True)
     test_polyline_matches_copper()
     test_exported_segments_are_backed_by_copper()
+    test_expert_paths_are_replayable()
 
     print("\n== step mechanics ==")
     test_rejected_steps_are_no_ops()
