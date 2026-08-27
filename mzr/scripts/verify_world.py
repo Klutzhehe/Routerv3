@@ -451,6 +451,92 @@ def test_expert_paths_are_replayable() -> None:
     )
 
 
+def test_observation_is_well_formed() -> None:
+    """The policy's input: right shape, finite, dead rows silent, not aliased.
+
+    `frontier_pos` being a **clone** is the one that matters most and the one
+    that would never be noticed. `world.fr_pos` is replaced in place by
+    `step()`; an aliasing observation made NeuroRoute's `policy.evaluate()`
+    silently disagree with `policy.act()`, which breaks the PPO importance
+    ratio with no error raised anywhere and no obviously wrong number to chase.
+    """
+    from mzr.env.observation import build_observation, frontier_feature_dim
+    from mzr.world.baselines import layer_hop
+
+    w = build(nets=12, layers=4, size=48, batch=3)
+    for _ in range(8):
+        if w.episode_done():
+            break
+        w.step(*layer_hop(w))
+    obs = build_observation(w)
+
+    D = frontier_feature_dim(w.num_layers)
+    check(
+        "observation shapes are as declared",
+        obs.frontiers.shape == (w.cfg.batch_size, w.F, D)
+        and obs.field.shape[0] == w.cfg.batch_size,
+        f"frontiers {tuple(obs.frontiers.shape)} (D={D}), field {tuple(obs.field.shape)}",
+    )
+    check(
+        "observation is finite everywhere",
+        bool(torch.isfinite(obs.frontiers).all()) and bool(torch.isfinite(obs.field).all()),
+        f"range [{float(obs.frontiers.min()):.2f}, {float(obs.frontiers.max()):.2f}]",
+    )
+    check(
+        "dead frontiers contribute nothing",
+        float(obs.frontiers[~obs.frontier_mask].abs().sum()) == 0.0,
+        "",
+    )
+
+    before = obs.frontier_pos.clone()
+    w.step(*layer_hop(w))
+    check(
+        "frontier_pos is a clone, not a view of live engine state",
+        bool(torch.equal(obs.frontier_pos, before)),
+        "an aliased observation breaks the PPO ratio silently",
+    )
+
+
+def test_price_reaches_the_policy() -> None:
+    """Congestion actually shows up in what the policy sees, and scales.
+
+    The price is the negotiation substrate -- if it never reaches the
+    observation, simultaneous growth is an unmanaged traffic jam and the whole
+    design premise is dead, but completion alone would never say so.
+
+    Measured by **volume**, not by the maximum. The max is uninformative here:
+    one contested cell pins it to `present_rate / max_present` regardless of
+    how much contention there is, so 8-net and 30-net boards report identical
+    maxima while differing 25x in actual contested cell-events.
+    """
+    from mzr.env.observation import CH_PRICE_HISTORY, CH_PRICE_PRESENT, build_observation
+    from mzr.world.baselines import layer_hop
+
+    vols = {}
+    for nets in (8, 30):
+        w = build(nets=nets, layers=4, size=48, batch=4, steps=48)
+        total = 0.0
+        for _ in range(24):
+            if w.episode_done():
+                break
+            w.step(*layer_hop(w))
+            obs = build_observation(w)
+            total += float(obs.field[:, CH_PRICE_PRESENT].sum())
+            total += float(obs.field[:, CH_PRICE_HISTORY].sum())
+        vols[nets] = total
+
+    check(
+        "congestion price reaches the observation",
+        vols[30] > 0.0,
+        f"price mass: {vols[8]:.1f} at 8 nets, {vols[30]:.1f} at 30 nets",
+    )
+    check(
+        "congestion price grows with board density",
+        vols[30] > 2.0 * max(vols[8], 1e-6),
+        f"{vols[30] / max(vols[8], 1e-6):.1f}x more price mass at 30 nets than at 8",
+    )
+
+
 def test_rejected_steps_are_no_ops() -> None:
     """An all-illegal macro-step must leave the board byte-identical.
 
@@ -723,6 +809,8 @@ def main() -> int:
     test_polyline_matches_copper()
     test_exported_segments_are_backed_by_copper()
     test_expert_paths_are_replayable()
+    test_observation_is_well_formed()
+    test_price_reaches_the_policy()
 
     print("\n== step mechanics ==")
     test_rejected_steps_are_no_ops()
