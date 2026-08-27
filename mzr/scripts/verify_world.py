@@ -642,6 +642,64 @@ def test_route_env_is_deterministic() -> None:
     )
 
 
+def test_prior_policy_is_greedy_at_init_and_ppo_consistent() -> None:
+    """Untrained argmax == the greedy baseline, and act() == evaluate().
+
+    Two properties the whole training setup depends on:
+
+    * **Greedy at init.** Near-zero head weights make the *bias* the entire
+      signal, and the biases are set so argmax is "one cell down the geodesic
+      gradient, stay on this layer, minimum width". If this drifts, training
+      starts *below* the baseline instead of at it -- a zero-bias width head in
+      `neuroroute/` picked 3-cell traces on 88% of actions and never recovered.
+    * **act() and evaluate() return identical log-probs for the same action.**
+      The PPO importance ratio is `exp(evaluate_logp - act_logp)`; if the two
+      forward passes disagree, the ratio is noise and the update is meaningless
+      -- with no error raised. Dropout in the transformer caused exactly this
+      and is why it is set to 0.
+    """
+    from mzr.env.route_env import EnvConfig, RouteEnv
+    from mzr.models.policy import PriorPolicy
+    from mzr.world.engine import WorldConfig
+    from mzr.world.generator import GeneratorConfig
+
+    torch.manual_seed(0)
+    cfg = EnvConfig(
+        spec=BoardSpec(height_cells=48, width_cells=48, layers=LayerStack(num_layers=4)),
+        world=WorldConfig(
+            batch_size=4, max_nets=10, max_macro_steps=40,
+            max_steps_per_frontier=40, ripup=RipupRules(interval=0),
+        ),
+        generator=GeneratorConfig(num_nets=5, num_components=3, pin_pitch_cells=4),
+        max_episode_steps=40,
+    )
+    env = RouteEnv(cfg)
+    obs = env.reset(seeds=[1, 2, 3, 4])
+    pol = PriorPolicy(num_layers=4, field_width=48, token_width=128)
+
+    det = pol.act(obs, deterministic=True)["action"]
+    live = obs.frontier_mask
+    greedy = (
+        float((det["direction"][live] == 0).float().mean()) == 1.0
+        and float((det["step"][live] == 0).float().mean()) == 1.0
+        and float((det["layer"][live] == 0).float().mean()) == 1.0
+    )
+    check("untrained argmax is exactly the greedy action", greedy)
+
+    sampled = pol.act(obs, deterministic=False)
+    ev = pol.evaluate(obs, sampled["action"])
+    check(
+        "act() and evaluate() give identical log-probs (PPO ratio is meaningful)",
+        bool(torch.allclose(ev["logp"], sampled["logp"], atol=1e-5)),
+        f"max delta {float((ev['logp'] - sampled['logp']).abs().max()):.1e}",
+    )
+
+    loss = -ev["logp"].sum() + ev["value"].pow(2).sum() - 0.01 * ev["entropy"]
+    loss.backward()
+    no_grad = [n for n, q in pol.named_parameters() if q.grad is None]
+    check("every policy parameter receives gradient", not no_grad, f"{len(no_grad)} without grad")
+
+
 def test_rejected_steps_are_no_ops() -> None:
     """An all-illegal macro-step must leave the board byte-identical.
 
@@ -918,6 +976,7 @@ def main() -> int:
     test_price_reaches_the_policy()
     test_route_env_reward_is_well_formed()
     test_route_env_is_deterministic()
+    test_prior_policy_is_greedy_at_init_and_ppo_consistent()
 
     print("\n== step mechanics ==")
     test_rejected_steps_are_no_ops()
