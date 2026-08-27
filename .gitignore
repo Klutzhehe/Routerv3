@@ -16,3 +16,4 @@ wandb/
 preflight_out/
 drc_out/
 mzr_out/
+mzr_ckpt/

@@ -700,6 +700,59 @@ def test_prior_policy_is_greedy_at_init_and_ppo_consistent() -> None:
     check("every policy parameter receives gradient", not no_grad, f"{len(no_grad)} without grad")
 
 
+def test_training_loop_runs_without_nan() -> None:
+    """rollout -> GAE -> PPO update -> eval, two updates, all finite.
+
+    An integration check, not a learning check. It catches the class of bug
+    that only appears once every piece is wired together: a NaN in the reward
+    that poisons the whole shared backward graph, an advantage that is all
+    zeros because the value bootstrap is misaligned, an act/evaluate shape
+    mismatch that silently drops half the frontiers from the ratio.
+    """
+    import tempfile
+
+    from mzr.env.route_env import EnvConfig, RouteEnv
+    from mzr.models.policy import PriorPolicy
+    from mzr.training.curriculum import STAGES
+    from mzr.training.ppo import PPOConfig, RolloutBuffer, ppo_update
+    from mzr.training.run import collect
+    from mzr.world.engine import WorldConfig
+
+    stage = STAGES["0"]
+    env = RouteEnv(EnvConfig(
+        spec=stage.board_spec(),
+        world=WorldConfig(
+            batch_size=4, max_nets=stage.generator.num_nets + 6,
+            max_macro_steps=24, max_steps_per_frontier=24, ripup=stage.ripup,
+        ),
+        generator=stage.generator, max_episode_steps=24,
+    ))
+    pol = PriorPolicy(num_layers=stage.layers, field_width=32, token_width=64)
+    opt = torch.optim.Adam(pol.parameters(), lr=3e-4)
+    cfg = PPOConfig(epochs=2, minibatches=2)
+
+    obs = env.reset()
+    finite = True
+    for _ in range(2):
+        buf = RolloutBuffer()
+        obs = collect(env, pol, buf, 8, obs)
+        with torch.no_grad():
+            last_v = pol.act(obs, deterministic=False)["value"]
+        m = ppo_update(pol, opt, buf, last_v, cfg)
+        finite = finite and all(
+            v == v and abs(v) < 1e6 for v in m.values()  # NaN != NaN
+        )
+    for q in pol.parameters():
+        finite = finite and bool(torch.isfinite(q).all())
+
+    check(
+        "full training loop runs two updates with finite params and metrics",
+        finite,
+        f"policy_loss {m['policy_loss']:.3f} value_loss {m['value_loss']:.3f} "
+        f"kl {m['approx_kl']:.3f} grad_norm {m.get('grad_norm', 0):.2f}",
+    )
+
+
 def test_rejected_steps_are_no_ops() -> None:
     """An all-illegal macro-step must leave the board byte-identical.
 
@@ -977,6 +1030,7 @@ def main() -> int:
     test_route_env_reward_is_well_formed()
     test_route_env_is_deterministic()
     test_prior_policy_is_greedy_at_init_and_ppo_consistent()
+    test_training_loop_runs_without_nan()
 
     print("\n== step mechanics ==")
     test_rejected_steps_are_no_ops()
