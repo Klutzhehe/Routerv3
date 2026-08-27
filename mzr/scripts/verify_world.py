@@ -537,6 +537,111 @@ def test_price_reaches_the_policy() -> None:
     )
 
 
+def test_route_env_reward_is_well_formed() -> None:
+    """The RL env: rewards finite, dead frontiers earn nothing, arrivals paid.
+
+    The arrival check is the one that matters. The engine reports a connection
+    only as a board-level count; the env recovers *which* frontiers closed a
+    leg by diffing `leg_done` across the step, and credits both. If that diff
+    is wrong, the dense progress signal still works and completion still rises,
+    so nothing looks broken -- but the policy never learns that *finishing* is
+    the point, only that getting closer is, which is exactly the failure this
+    project is trying to leave behind.
+    """
+    from mzr.env.route_env import EnvConfig, RouteEnv
+    from mzr.world.baselines import layer_hop_action
+    from mzr.world.engine import WorldConfig
+    from mzr.world.generator import GeneratorConfig
+
+    cfg = EnvConfig(
+        spec=BoardSpec(height_cells=48, width_cells=48, layers=LayerStack(num_layers=4)),
+        world=WorldConfig(
+            batch_size=4, max_nets=14, max_macro_steps=48,
+            max_steps_per_frontier=48, ripup=RipupRules(interval=8),
+        ),
+        generator=GeneratorConfig(num_nets=8, num_components=4, pin_pitch_cells=4),
+        max_episode_steps=48,
+    )
+    env = RouteEnv(cfg)
+    obs = env.reset(seeds=[900000 + i for i in range(4)])
+
+    # A frontier that was already masked out at the START of a step must earn
+    # nothing from it. Checking against the POST-step mask would be wrong: a
+    # frontier that connects this step is live during it, correctly earns the
+    # arrival bonus, and only then drops out of the mask.
+    prev_mask = obs.frontier_mask.clone()
+    settled_earned = 0.0
+    arrivals_paid = 0
+    finite = True
+    steps = 0
+    while True:
+        out = env.step({"layer": layer_hop_action(env.world)})
+        finite = finite and bool(torch.isfinite(out.reward).all())
+        finite = finite and bool(torch.isfinite(out.board_reward).all())
+        settled_earned += float(out.reward[~prev_mask].abs().sum())
+        arrivals_paid += int((out.reward > 3.0).sum())
+        prev_mask = out.obs.frontier_mask.clone()
+        steps += 1
+        if out.done:
+            break
+
+    final_done = int(
+        (env.world.net_valid & (env.world.net_status == STATUS_DONE)).sum()
+    )
+    check("route-env reward is finite over a whole episode", finite, f"{steps} steps")
+    check(
+        "route-env pays nothing to a frontier already settled at step start",
+        settled_earned < 1.0,
+        f"{settled_earned:.3f} stray reward on already-settled frontiers",
+    )
+    check(
+        "route-env credits arrivals, ~2 frontiers per connected leg",
+        arrivals_paid >= final_done,
+        f"{arrivals_paid} arrival payouts for {final_done} connected legs",
+    )
+
+
+def test_route_env_is_deterministic() -> None:
+    """Same seeds + same actions -> identical rewards and completion.
+
+    A replay for a PPO or MuZero update has to reproduce the trajectory that
+    generated it. The engine's determinism is already checked; this confirms
+    the env layer -- observation build, reward, arrival diff -- adds no
+    nondeterminism on top.
+    """
+    from mzr.env.route_env import EnvConfig, RouteEnv
+    from mzr.world.baselines import layer_hop_action
+    from mzr.world.engine import WorldConfig
+    from mzr.world.generator import GeneratorConfig
+
+    def run():
+        cfg = EnvConfig(
+            spec=BoardSpec(height_cells=48, width_cells=48, layers=LayerStack(num_layers=2)),
+            world=WorldConfig(
+                batch_size=3, max_nets=16, max_macro_steps=40,
+                max_steps_per_frontier=40, ripup=RipupRules(interval=0),
+            ),
+            generator=GeneratorConfig(num_nets=10, num_components=4, pin_pitch_cells=4),
+            max_episode_steps=40,
+        )
+        env = RouteEnv(cfg)
+        env.reset(seeds=[7, 8, 9])
+        r = torch.zeros(3, env.world.F)
+        while True:
+            out = env.step({"layer": layer_hop_action(env.world)})
+            r += out.reward
+            if out.done:
+                return r, out.info["completion"].clone()
+
+    r0, c0 = run()
+    r1, c1 = run()
+    check(
+        "route-env replays identically",
+        bool(torch.equal(r0, r1)) and bool(torch.equal(c0, c1)),
+        f"reward delta {float((r0 - r1).abs().max()):.2e}, completion {c0.mean():.3f} vs {c1.mean():.3f}",
+    )
+
+
 def test_rejected_steps_are_no_ops() -> None:
     """An all-illegal macro-step must leave the board byte-identical.
 
@@ -811,6 +916,8 @@ def main() -> int:
     test_expert_paths_are_replayable()
     test_observation_is_well_formed()
     test_price_reaches_the_policy()
+    test_route_env_reward_is_well_formed()
+    test_route_env_is_deterministic()
 
     print("\n== step mechanics ==")
     test_rejected_steps_are_no_ops()

@@ -1,0 +1,169 @@
+"""Reward terms for the simultaneous-frontier MDP.
+
+The dense signal is **potential-based shaping** -- ``gamma*Phi(s') - Phi(s)``
+with ``Phi = -geodesic/scale`` -- which is policy-invariant: it changes how
+fast the policy learns but cannot change what the optimal policy is. That is
+why it is safe to make it the dominant term. Carried over from `docs/RL_PLAN.md`
+where it is validated [LIVE].
+
+What is new here is the **congestion-delta** term. Simultaneous growth only
+works if a frontier is charged for *creating* contention and credited for
+*resolving* it -- otherwise every frontier greedily descends its own gradient
+into the same channel and the congestion price has nothing to push against.
+The term is the per-step change in board-wide present congestion, shared
+equally across the board's live frontiers: it is a joint outcome, so it gets a
+joint (not per-frontier) attribution.
+
+Calibration notes carried from `neuroroute/`, each of which cost real time:
+
+1. **Reward and completion are not the same objective.** On a 24-net board a
+   random policy scored -330 reward against greedy's -177 and still routed
+   *more* nets. Track completion, gate on completion, never on reward.
+2. **A large rejection/collision penalty makes a policy timid.** At 0.5/step,
+   twenty rejected steps cancel a whole completion bonus and the policy learns
+   to stand still. Kept low here, and `contended` (arbitrated away by another
+   net, no fault of this frontier) is separated from `rejected` (this
+   frontier's move was illegal) so the two are not conflated.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from mzr.env.observation import LENGTH_SCALE
+from mzr.world.engine import StepResult
+
+
+@dataclass
+class RewardConfig:
+    gamma: float = 0.99
+    #: Potential-based geodesic shaping.
+    progress: float = 1.0
+    #: Flat per-step cost, so finishing sooner is strictly better.
+    step_cost: float = 0.01
+    #: This frontier's move was illegal. See calibration note 2.
+    rejection: float = 0.10
+    #: This frontier lost a cell to another net in arbitration -- not its
+    #: fault, so a much lighter touch than `rejection`. It is still a small
+    #: negative because the policy *can* learn to route where arbitration will
+    #: not bite.
+    contended: float = 0.02
+    #: Per via. Vias cost area, yield and signal integrity; a free via action
+    #: yields a policy that drills instead of routing.
+    via: float = 0.30
+    #: Weight on the per-step change in board-wide present congestion, split
+    #: across live frontiers. Negative delta (congestion fell) is a reward.
+    congestion_delta: float = 0.30
+    #: A leg connected this step -- credited to both its frontiers.
+    arrival: float = 5.0
+    #: A net ran out of budget with a leg still open.
+    failure: float = 4.0
+    #: Terminal, per board.
+    completion: float = 20.0
+    wirelength: float = 0.5  # weight on excess routed length over straight-line
+    #: Differential pairs (stage 6). Dormant until pairs appear in the netlist.
+    pair_gap: float = 4.0
+    pair_skew: float = 2.0
+    pair_split: float = 0.5
+    #: Length-matched groups (stage 7).
+    length_error: float = 4.0
+    length_tolerance_cells: float = 2.0
+    length_bonus: float = 5.0
+
+
+def step_reward(
+    res: StepResult,
+    arrived: torch.Tensor,
+    cfg: RewardConfig,
+) -> torch.Tensor:
+    """(B, F) per-frontier reward for one macro-step.
+
+    `res.progress` is already ``Phi(s) - Phi(s')`` in cells per frontier, so it
+    needs only scaling. `arrived` (B, F) bool is supplied by the env, which
+    diffs `leg_done` across the step -- the engine's `StepResult` reports
+    connections only as a board-level count, and credit assignment wants the
+    frontier that actually closed the leg.
+
+    Dead frontiers get exactly zero -- never a step cost. A frontier that has
+    finished or been retired must not make the policy's "do nothing here" look
+    expensive.
+    """
+    live = res.live.float()
+
+    r = cfg.progress * (res.progress / LENGTH_SCALE)
+    r = r - cfg.step_cost * live
+    r = r - cfg.rejection * res.rejected.float()
+    r = r - cfg.contended * res.contended.float()
+    r = r - cfg.via * res.via_placed.float()
+    r = r + cfg.arrival * arrived.float()
+
+    # Board-wide congestion change, shared equally across this board's live
+    # frontiers. `congestion_delta` is (B,); a fall in congestion is a reward.
+    n_live = live.sum(dim=1, keepdim=True).clamp_min(1.0)
+    r = r - cfg.congestion_delta * (res.congestion_delta.unsqueeze(1) / n_live) * live
+
+    return r * live
+
+
+def failure_penalty(res: StepResult, cfg: RewardConfig) -> torch.Tensor:
+    """(B,) charge for nets abandoned this step. Board-level: a starved net is
+    an ordering/negotiation failure, not one frontier's fault."""
+    return -cfg.failure * res.nets_failed.float()
+
+
+def terminal_reward(world, cfg: RewardConfig) -> tuple[torch.Tensor, dict]:
+    """(B,) end-of-episode reward, plus the metrics behind it.
+
+    Every constraint the user cares about lands here rather than per-step,
+    because each is a property of a *finished* route: a pair's gap error is
+    only meaningful over its whole length, a group's length target is not known
+    until its longest member is routed, and wirelength is not comparable
+    mid-route.
+    """
+    stats = world.board_stats()
+    valid = world.net_valid
+    valf = valid.float()
+    n_valid = valf.sum(dim=1).clamp_min(1.0)
+
+    r = cfg.completion * stats["completion"]
+
+    # Excess wirelength over the straight-line lower bound, per completed net.
+    src = world.net_pad[:, :, 0, 0, 1:].float()
+    dst = world.net_pad[:, :, 0, 1, 1:].float()
+    ideal = torch.linalg.vector_norm(dst - src, dim=-1).clamp_min(1.0)
+    routed = world.net_len.sum(dim=-1)
+    done = ((world.net_status == 1) & valid).float()
+    detour = ((routed / ideal - 1.0).clamp_min(0.0) * done).sum(dim=1) / n_valid
+    r = r - cfg.wirelength * detour
+
+    # --- differential pairs (dormant until pairs exist) -------------------
+    is_pair = (world.net_kind == 1).float() * valf
+    n_pair = is_pair.sum(dim=1).clamp_min(1.0)
+    if bool((is_pair > 0).any()):
+        gap = world.pair_gap_error()
+        skew = world.pair_skew() / LENGTH_SCALE
+        r = r - cfg.pair_gap * (gap * is_pair).sum(dim=1) / n_pair
+        r = r - cfg.pair_skew * (skew * is_pair).sum(dim=1) / n_pair
+        r = r - cfg.pair_split * (world.net_split * is_pair).sum(dim=1) / n_pair
+
+    # --- length-matched groups (dormant until groups exist) ---------------
+    in_group = (world.net_group >= 0).float() * valf
+    n_group = in_group.sum(dim=1).clamp_min(1.0)
+    if bool((in_group > 0).any()):
+        len_err = world.group_length_error()
+        r = r - cfg.length_error * (len_err / LENGTH_SCALE * in_group).sum(dim=1) / n_group
+        within = (len_err <= cfg.length_tolerance_cells).float() * in_group
+        r = r + cfg.length_bonus * within.sum(dim=1) / n_group
+
+    metrics = {
+        "completion": stats["completion"],
+        "vias": stats["vias"],
+        "ripups": stats["ripups"],
+        "wirelength": stats["length"],
+        "detour": detour,
+        "congestion": stats["congestion"],
+        "failed": stats["failed"],
+    }
+    return r, metrics
