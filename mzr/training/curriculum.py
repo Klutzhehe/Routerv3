@@ -1,19 +1,22 @@
 """Curriculum stages -- one mechanism per rung, each with a gate.
 
-`mzr/DESIGN.md` section 7. Sized so that **stage 3 can plausibly reach ~100%**:
-stages 1-3 run at low net counts where near-perfect completion is achievable,
-and the hard scaling work -- where no router hits 100% -- lives in stages 4-8.
-"Stage 3 done" is therefore not "the router is finished"; it is "search beats
-the prior on a tractable board".
+`mzr/DESIGN.md` section 7. The stage 0-3 gate is **absolute 100% completion**
+(argmax, sustained 3 consecutive evals).
+
+**No solvability pre-filter.** Boards are generated fresh from seeds. If the
+policy stalls a few points short of 1.0, the handful of failing eval seeds get
+**reviewed by hand** -- `python -m mzr.world.pool --stage S --seeds ...` reports
+whether the expert can route each -- rather than being auto-filtered out of the
+distribution.
+
+**Pure RL first.** `bc_coef0` is 0 for every stage. If a stage plateaus, raise
+it (`--bc-coef`) to blend in expert behaviour cloning, annealed. That decision
+is made from a real plateau on this problem, not from a paper about a different
+one.
 
 Each stage changes `GeneratorConfig` / `WorldConfig` and nothing in the model.
-The `gate` is what a run must clear before advancing:
-
-* ``("absolute", x)``  -- held-out argmax completion >= x
-* ``("vs_expert", x)`` -- held-out argmax completion >= expert + x
-* ``("vs_prior", x)``  -- (stage 3 only) search completion >= prior + x
-
-`kill` is the pre-committed "the premise was wrong, stop" line.
+`gate` is ``("absolute", x)`` for every implemented stage. `kill` is the
+pre-committed "stop, the premise was wrong" line.
 """
 
 from __future__ import annotations
@@ -36,8 +39,9 @@ class Stage:
     max_macro_steps: int
     gate: tuple[str, float]
     kill: str
-    #: BC loss weight at the start of the stage, annealed to 0 as completion
-    #: rises. 0 for stage 0 (nothing to imitate -- one net, greedy is optimal).
+    #: BC loss weight at stage start, annealed to 0 as completion rises.
+    #: **0 everywhere** -- pure RL first (see module docstring). Raise via
+    #: `--bc-coef` only after a measured plateau.
     bc_coef0: float = 0.0
     reward: RewardConfig = field(default_factory=RewardConfig)
 
@@ -63,8 +67,8 @@ STAGES: dict[str, Stage] = {
         ),
         ripup=_NO_RIPUP,
         max_macro_steps=48,
-        gate=("absolute", 0.99),
-        kill="can't reach 95% in 500 updates -> geometry or reward bug, not a hard problem",
+        gate=("absolute", 1.0),
+        kill="can't reach 0.95 in 500 updates -> geometry or reward bug, not a hard problem",
     ),
     "1": Stage(
         name="1: 3 simultaneous nets, price on",
@@ -72,9 +76,8 @@ STAGES: dict[str, Stage] = {
         generator=GeneratorConfig(num_nets=3, num_components=3, pin_pitch_cells=4),
         ripup=_RIPUP,
         max_macro_steps=48,
-        gate=("vs_expert", 0.10),
-        kill="no gain over sequential+PathFinder in 2000 updates -> simultaneous premise is wrong",
-        bc_coef0=0.5,
+        gate=("absolute", 1.0),
+        kill="can't clear 0.90 in 2000 updates -> simultaneous premise is weak; try --bc-coef 0.5",
     ),
     "2": Stage(
         name="2: 5 nets, 4 layers",
@@ -82,9 +85,8 @@ STAGES: dict[str, Stage] = {
         generator=GeneratorConfig(num_nets=5, num_components=4, pin_pitch_cells=4),
         ripup=_RIPUP,
         max_macro_steps=64,
-        gate=("vs_expert", 0.05),
-        kill="none -- a model can fail an absolute fidelity test and still serve search; let stage 3 decide",
-        bc_coef0=0.5,
+        gate=("absolute", 1.0),
+        kill="can't clear 0.90 in 3000 updates -> add h/g/f, or --bc-coef 0.5",
     ),
     "3": Stage(
         name="3: 8 nets, 4 layers, search on",
@@ -92,17 +94,14 @@ STAGES: dict[str, Stage] = {
         generator=GeneratorConfig(num_nets=8, num_components=4, pin_pitch_cells=4),
         ripup=_RIPUP,
         max_macro_steps=64,
-        gate=("vs_prior", 0.05),
-        kill="search shows no gain over prior-only -> ship prior-only (still a complete router)",
-        bc_coef0=0.3,
+        gate=("absolute", 1.0),
+        kill="prior can't clear 0.85 -> search is being built on a weak prior; --bc-coef 0.3",
     ),
 }
 
 
-#: Held-out eval seeds. Fixed, and disjoint from any training seed range, so an
-#: eval number is never memorised training boards. The tail values are
-#: `neuroroute/`'s known-hard seeds -- kept in every eval set by convention so a
-#: regression on the cases that were painful last time is visible immediately.
-EVAL_SEEDS = list(range(900_000, 900_064)) + [
-    9648, 9681, 9764, 9779, 9148, 9251, 9091, 9390, 9535, 9901
-]
+#: Held-out eval seeds. Fixed, and disjoint from any training seed range (the
+#: trainer seeds boards from 1000+), so an eval number is never a memorised
+#: training board. A failing eval seed is reproducible on its own -- that is the
+#: whole point of keeping the set fixed rather than random.
+EVAL_SEEDS = list(range(900_000, 900_128))

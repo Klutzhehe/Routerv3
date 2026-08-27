@@ -45,6 +45,10 @@ class EnvConfig:
     #: every frontier has settled, which is the common case on easy boards.
     max_episode_steps: int = 64
     seed: int = 0
+    #: When set, `reset()` samples `batch_size` seeds from this list (a
+    #: solvable-board pool, see `world/pool.py`) instead of walking a counter.
+    #: This is how stages 0-3 guarantee every training board is 100%-routable.
+    board_seeds: list[int] | None = None
 
 
 @dataclass
@@ -66,6 +70,7 @@ class RouteEnv:
         self.world = SimultaneousRouterWorld(cfg.spec, cfg.world)
         self.device = self.world.device
         self._seed = cfg.seed
+        self._rng = torch.Generator().manual_seed(cfg.seed)
         self._t = 0
         self._obs: Observation | None = None
         self._leg_done_prev: torch.Tensor | None = None
@@ -76,8 +81,13 @@ class RouteEnv:
     def reset(self, seeds: Iterable[int] | None = None) -> Observation:
         B = self.cfg.world.batch_size
         if seeds is None:
-            seeds = [self._seed + i for i in range(B)]
-            self._seed += B
+            if self.cfg.board_seeds:
+                pool = self.cfg.board_seeds
+                pick = torch.randint(0, len(pool), (B,), generator=self._rng)
+                seeds = [pool[int(i)] for i in pick]
+            else:
+                seeds = [self._seed + i for i in range(B)]
+                self._seed += B
         seeds = list(seeds)
 
         self._boards = [generate_board(self.cfg.spec, self.cfg.generator, s) for s in seeds]
