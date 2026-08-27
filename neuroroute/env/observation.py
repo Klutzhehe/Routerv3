@@ -86,6 +86,7 @@ class Observation:
     head_mask: torch.Tensor   # (B, K) bool
     nets: torch.Tensor        # (B, N, F_net) float32
     net_mask: torch.Tensor    # (B, N) bool -- schedulable (valid & pending)
+    routed_mask: torch.Tensor  # (B, N) bool -- ripup-able (valid & done)
     #: (B, K, NUM_DIRECTIONS, NUM_STEPS) bool. Not a model input -- it is the
     #: fixed, non-learned action suppression mask applied to the direction and
     #: step logits. See models/heads.py.
@@ -312,6 +313,7 @@ def build_observation(
         head_mask=live,
         nets=nets,
         net_mask=world.pending_mask(),
+        routed_mask=world.routed_mask(),
         safety=safety.view(B, K, NUM_DIRECTIONS, NUM_STEPS),
         bearing=bearing.view(B, K),
         head_is_pair=(world.net_kind[bb, net] == KIND_DIFF_PAIR) & live,

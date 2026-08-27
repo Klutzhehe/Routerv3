@@ -281,8 +281,24 @@ def train(args) -> int:
     start_update = 0
     if args.resume and (out / "latest.pt").exists():
         state = torch.load(out / "latest.pt", map_location=dev, weights_only=False)
-        policy.load_state_dict(state["policy"])
-        opt.load_state_dict(state["optimiser"])
+        # strict=False: a checkpoint saved before h_ripup/h_ripup_none/
+        # h_board_value existed is missing those keys, and load_state_dict's
+        # default strict=True would refuse the whole checkpoint over three
+        # new parameters rather than recover the thousands of updates of
+        # everything else. Everything that matches loads normally; the new
+        # heads start at their own fresh, deliberately-tuned init.
+        loaded = policy.load_state_dict(state["policy"], strict=False)
+        if loaded.missing_keys or loaded.unexpected_keys:
+            tel.print(
+                f"    [WARN] checkpoint predates the current architecture -- "
+                f"missing {loaded.missing_keys}, unexpected {loaded.unexpected_keys}. "
+                f"New parameters keep their fresh init. Optimiser state is NOT "
+                f"loaded this run (Adam's per-parameter moment estimates no "
+                f"longer line up with the new parameter list) -- it restarts "
+                f"cold and re-warms over the next several updates."
+            )
+        else:
+            opt.load_state_dict(state["optimiser"])
         start_update = int(state.get("update", 0))
         tel.history = state.get("history", [])
         tel.print(f"resumed from update {start_update}")
@@ -303,8 +319,19 @@ def train(args) -> int:
                 for _ in range(ppo.rollout_steps):
                     pol_out = policy.act(obs)
                     next_obs, reward, done, info = env.step(pol_out.actions)
+                    # Board-level reward for schedule + ripup: the sum of
+                    # that board's per-head rewards this step (a board is
+                    # doing well precisely when its heads collectively are),
+                    # minus the ripup cost when it fires -- charged here, on
+                    # the stream that actually trains the decision that
+                    # caused it, not smeared into the per-head stream below.
+                    board_reward = reward.sum(dim=-1) - (
+                        env.cfg.reward.ripup * info["did_ripup"].float()
+                    ).to(reward.device)
                     buf.add(obs, pol_out.actions, pol_out.log_prob, pol_out.value, reward,
-                            done.unsqueeze(-1).expand_as(reward), obs.head_mask)
+                            done.unsqueeze(-1).expand_as(reward), obs.head_mask,
+                            pol_out.schedule_log_prob, pol_out.ripup_log_prob,
+                            pol_out.board_value, board_reward)
                     rejected += int(info["rejected"].sum())
                     acted += int(info["active"].sum())
                     if "terminal_reward" in info:
@@ -315,6 +342,10 @@ def train(args) -> int:
                             info["terminal_reward"].unsqueeze(-1).expand_as(reward)
                             / max(1, args.heads)
                         ).to(buf.reward[-1].device)
+                        # Board stream gets the same terminal reward whole,
+                        # not divided -- it is not being spread across heads.
+                        buf.board_reward[-1] = buf.board_reward[-1] + \
+                            info["terminal_reward"].to(buf.board_reward[-1].device)
                         ep_metrics = {
                             k.split("/", 1)[1]: float(v.mean())
                             for k, v in info.items() if k.startswith("final/")
@@ -324,16 +355,27 @@ def train(args) -> int:
                         obs = env.reset()
 
             with torch.no_grad():
-                last_value = policy.act(obs).value
+                last_out = policy.act(obs)
+                last_value = last_out.value
+                last_board_value = last_out.board_value
 
             rewards = torch.stack(buf.reward).to(dev)
             values = torch.stack(buf.value).to(dev)
             dones = torch.stack(buf.done).to(dev)
             adv, ret = compute_gae(rewards, values, dones, last_value, ppo.gamma, ppo.gae_lambda)
 
+            board_rewards = torch.stack(buf.board_reward).to(dev)
+            board_values = torch.stack(buf.board_value).to(dev)
+            board_dones = dones[..., 0]  # same `done`, already board-level before the K broadcast
+            board_adv, board_ret = compute_gae(
+                board_rewards, board_values, board_dones, last_board_value,
+                ppo.gamma, ppo.gae_lambda,
+            )
+
             with tel.section("update"):
                 targets = episode_targets(env.world, latent_shape(env))
                 stats = ppo_update(policy, opt, buf, adv, ret, ppo, entropy_coef,
+                                   board_adv, board_ret,
                                    targets, scaler=scaler, phase_timer=phase_timer)
 
             health = check_model_health(policy, amp_skip_ok=bool(stats.get("amp_step_skipped")))
@@ -388,6 +430,8 @@ def train(args) -> int:
                     f"rej {row['rejected_action_rate']:5.1%}  "
                     f"pi {stats['policy_loss']:+.3f}  v {stats['value_loss']:7.3f}  "
                     f"H {stats['entropy']:.3f}  fcast {stats['forecast']:.3f}  "
+                    f"sched {stats['sched_loss']:+.3f}  ripup {stats['ripup_loss']:+.3f}  "
+                    f"bv {stats['board_value_loss']:7.3f}  "
                     f"{sps:,.0f} dec/s  {tel.gpu_memory()}  [{tel.timing_summary()}]  "
                     f"upd:[{phase_summary}]"
                 )

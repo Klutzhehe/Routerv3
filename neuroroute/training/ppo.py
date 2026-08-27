@@ -114,8 +114,19 @@ class RolloutBuffer:
         self.reward: list[torch.Tensor] = []
         self.done: list[torch.Tensor] = []
         self.mask: list[torch.Tensor] = []
+        # Board-level (schedule + ripup) bookkeeping. Separate from the
+        # per-head lists above because both actions, and the critic that
+        # scores them, operate on the whole board rather than one head --
+        # see PolicyOutput.board_value and models/policy.py::_ripup.
+        self.sched_log_prob: list[torch.Tensor] = []
+        self.ripup_log_prob: list[torch.Tensor] = []
+        self.board_value: list[torch.Tensor] = []
+        self.board_reward: list[torch.Tensor] = []
 
-    def add(self, obs: Observation, actions: dict, log_prob, value, reward, done, mask) -> None:
+    def add(
+        self, obs: Observation, actions: dict, log_prob, value, reward, done, mask,
+        sched_log_prob, ripup_log_prob, board_value, board_reward,
+    ) -> None:
         s = self.store
         self.obs.append(
             {
@@ -127,17 +138,25 @@ class RolloutBuffer:
                 "via_safe": obs.via_safe.to(s),
                 "nets": obs.nets.half().to(s),
                 "net_mask": obs.net_mask.to(s),
+                "routed_mask": obs.routed_mask.to(s),
                 "safety": obs.safety.to(s),
                 "bearing": obs.bearing.to(s),
                 "geo_layer": obs.geo_layer.half().to(s),
             }
         )
-        self.actions.append({k: v.to(s) for k, v in actions.items() if k != "schedule"})
+        # Every action kept now, including "schedule" and "ripup" -- both
+        # used to be dropped here (`if k != "schedule"`), which is exactly
+        # why neither ever received a PPO gradient before this change.
+        self.actions.append({k: v.to(s) for k, v in actions.items()})
         self.log_prob.append(log_prob.detach().to(s))
         self.value.append(value.detach().to(s))
         self.reward.append(reward.detach().to(s))
         self.done.append(done.to(s))
         self.mask.append(mask.to(s))
+        self.sched_log_prob.append(sched_log_prob.detach().to(s))
+        self.ripup_log_prob.append(ripup_log_prob.detach().to(s))
+        self.board_value.append(board_value.detach().to(s))
+        self.board_reward.append(board_reward.detach().to(s))
 
     def observation_at(self, t: int) -> Observation:
         o = self.obs[t]
@@ -151,6 +170,7 @@ class RolloutBuffer:
             via_safe=o["via_safe"].to(d),
             nets=o["nets"].to(d).float(),
             net_mask=o["net_mask"].to(d),
+            routed_mask=o["routed_mask"].to(d),
             safety=o["safety"].to(d),
             bearing=o["bearing"].to(d),
             geo_layer=o["geo_layer"].to(d).float(),
@@ -165,9 +185,11 @@ def stack_observations(obs_list: list[Observation], device: torch.device) -> Obs
 
     Every field concatenates along dim 0, and every module in the policy is
     batch-agnostic (convolutions, per-row MLPs, attention over K/N), so a
-    stacked observation is just a bigger batch -- the maths is identical. Only
-    `NeuroRoutePolicy._schedule` reads `B` in a way that would care, and
-    `evaluate()` never calls it.
+    stacked observation is just a bigger batch -- the maths is identical.
+    `NeuroRoutePolicy._schedule`/`_ripup` only ever use `B` as a size (to
+    bound their per-slot loop and shape a zeros tensor), never as an
+    identity or index, so `evaluate()` calling them on a stacked, chunk*B
+    wide observation is exactly as safe as everything else here.
 
     This is what turns a rollout timestep (B boards, e.g. 16) into a forward
     pass wide enough to actually occupy a GPU.
@@ -182,6 +204,7 @@ def stack_observations(obs_list: list[Observation], device: torch.device) -> Obs
         via_safe=cat("via_safe"),
         nets=cat("nets"),
         net_mask=cat("net_mask"),
+        routed_mask=cat("routed_mask"),
         safety=cat("safety"),
         bearing=cat("bearing"),
         geo_layer=cat("geo_layer"),
@@ -223,6 +246,8 @@ def ppo_update(
     returns: torch.Tensor,
     cfg: PPOConfig,
     entropy_coef: float,
+    board_advantages: torch.Tensor,
+    board_returns: torch.Tensor,
     forecast_targets: dict[str, torch.Tensor] | None = None,
     scaler: "torch.amp.GradScaler | None" = None,
     phase_timer: dict[str, float] | None = None,
@@ -244,12 +269,20 @@ def ppo_update(
     makes it -- pass the same dict in every update to build a cumulative,
     run-long breakdown of what "update" (already known to dominate wall time)
     is actually spending its time on, instead of guessing.
+
+    `board_advantages`/`board_returns` are the GAE outputs for the
+    board-level (schedule + ripup) reward stream -- see `PolicyOutput.
+    board_value`'s docstring for why that stream, and its own value
+    function, has to be separate from the per-head one.
     """
     d = buffer.device
     T = len(buffer)
     old_logp = torch.stack(buffer.log_prob).to(d)
     old_value = torch.stack(buffer.value).to(d)
     masks = torch.stack(buffer.mask).to(d)
+    old_sched_logp = torch.stack(buffer.sched_log_prob).to(d)
+    old_ripup_logp = torch.stack(buffer.ripup_log_prob).to(d)
+    old_board_value = torch.stack(buffer.board_value).to(d)
     amp = bool(cfg.amp and d.type == "cuda")
 
     if cfg.normalise_advantage:
@@ -258,8 +291,15 @@ def ppo_update(
             mu = advantages[live].mean()
             sd = advantages[live].std().clamp_min(1e-6)
             advantages = torch.where(live, (advantages - mu) / sd, torch.zeros_like(advantages))
+        # No mask needed here: unlike a head, which can be idle, a board
+        # always has SOME state every timestep, so every entry is live.
+        board_advantages = (board_advantages - board_advantages.mean()) / \
+            board_advantages.std().clamp_min(1e-6)
 
-    stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_frac": 0.0, "forecast": 0.0}
+    stats = {
+        "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_frac": 0.0,
+        "forecast": 0.0, "sched_loss": 0.0, "ripup_loss": 0.0, "board_value_loss": 0.0,
+    }
     n_updates = 0
     chunk = max(1, min(cfg.chunk, T))
     # Did GradScaler itself decline to apply an update this call? Distinct
@@ -296,7 +336,8 @@ def ppo_update(
                 with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
                     out = policy.evaluate(obs, act, return_forecast=want_f)
                 logp, entropy, value = out[0], out[1], out[2]
-                forecast = out[3] if want_f else None
+                sched_logp, ripup_logp, board_value = out[3], out[4], out[5]
+                forecast = out[6] if want_f else None
                 if want_f:
                     # Same reasoning as the logp/entropy/value cast below, and
                     # this one was missed the first time AMP was actually run:
@@ -320,6 +361,9 @@ def ppo_update(
                 # exponential of a difference of log-probs, and fp16 there is
                 # a good way to get a silent inf.
                 logp, entropy, value = logp.float(), entropy.float(), value.float()
+                sched_logp = sched_logp.float()
+                ripup_logp = ripup_logp.float()
+                board_value = board_value.float()
 
                 ratio = torch.exp((logp - rows(old_logp)) * m)
                 a = rows(advantages)
@@ -335,6 +379,35 @@ def ppo_update(
 
                 ent = (entropy * m).sum() / denom
                 total = pl + cfg.value_coef * vl - entropy_coef * ent
+
+                # Board-level PPO terms for schedule and ripup, sharing one
+                # advantage (`board_a`): both are decisions about the SAME
+                # board state at the SAME timestep, so "did the board do
+                # well after this" is one signal, not two. No per-element
+                # mask needed -- unlike the per-head terms above, every row
+                # here is a real, always-defined board-level decision (see
+                # `_ripup`'s docstring for why its log-prob is well-defined
+                # even when there is nothing to rip up).
+                board_a = rows(board_advantages)
+
+                sched_ratio = torch.exp(sched_logp - rows(old_sched_logp))
+                sched_unclipped = -board_a * sched_ratio
+                sched_clipped = -board_a * sched_ratio.clamp(1.0 - cfg.clip, 1.0 + cfg.clip)
+                sched_loss = torch.maximum(sched_unclipped, sched_clipped).mean()
+
+                ripup_ratio = torch.exp(ripup_logp - rows(old_ripup_logp))
+                ripup_unclipped = -board_a * ripup_ratio
+                ripup_clipped = -board_a * ripup_ratio.clamp(1.0 - cfg.clip, 1.0 + cfg.clip)
+                ripup_loss = torch.maximum(ripup_unclipped, ripup_clipped).mean()
+
+                board_ret = rows(board_returns)
+                old_bv = rows(old_board_value)
+                bv_unc = (board_value - board_ret) ** 2
+                bv_cl = (old_bv + (board_value - old_bv).clamp(-cfg.value_clip, cfg.value_clip)
+                         - board_ret) ** 2
+                board_vl = 0.5 * torch.maximum(bv_unc, bv_cl).mean()
+
+                total = total + sched_loss + ripup_loss + cfg.value_coef * board_vl
 
                 # The forecaster is supervised, not reinforced, and its labels
                 # are the terminal state of the episode this rollout came from
@@ -379,6 +452,9 @@ def ppo_update(
                 (((ratio - 1.0).abs() > cfg.clip).float() * m).sum().detach() / denom
             )
             stats["forecast"] += float(f_loss.detach())
+            stats["sched_loss"] += float(sched_loss.detach())
+            stats["ripup_loss"] += float(ripup_loss.detach())
+            stats["board_value_loss"] += float(board_vl.detach())
             n_updates += 1
 
     out = {k: v / max(1, n_updates) for k, v in stats.items()}

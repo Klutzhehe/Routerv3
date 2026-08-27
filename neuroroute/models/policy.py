@@ -62,6 +62,10 @@ class PolicyOutput:
     entropy: torch.Tensor       # (B, K)
     value: torch.Tensor         # (B, K)
     schedule_log_prob: torch.Tensor  # (B,)
+    ripup_log_prob: torch.Tensor     # (B,)
+    board_value: torch.Tensor        # (B,) -- schedule's and ripup's shared
+                                      # critic; see _ripup's docstring for why
+                                      # neither ever trained before this
     forecast: Forecast
     latent: torch.Tensor
 
@@ -127,6 +131,22 @@ class NeuroRoutePolicy(nn.Module):
             nn.SiLU(),
             nn.Linear(128, 1),
         )
+        # Same shape as h_schedule -- a per-net score over the OPPOSITE mask
+        # (routed, not pending). See _ripup for why it needs its own
+        # NetEncoder pass rather than reusing the scheduler's tokens.
+        self.h_ripup = nn.Sequential(
+            nn.Linear(self.nets.out_dim + self.field.global_dim, 128),
+            nn.SiLU(),
+            nn.Linear(128, 1),
+        )
+        # The learned logit for "rip up nothing this step" -- see _ripup.
+        self.h_ripup_none = nn.Parameter(torch.tensor(4.0))
+        # Schedule and ripup are board-level decisions; nothing about them is
+        # per-head, so they need their own critic rather than the per-head
+        # h_value (which is masked to active heads and is not meaningful on,
+        # e.g., a board that is fully idle between nets -- exactly when a
+        # scheduling decision matters most).
+        self.h_board_value = nn.Linear(self.field.global_dim, 1)
         self._init_actor()
 
     def _init_actor(self) -> None:
@@ -184,6 +204,8 @@ class NeuroRoutePolicy(nn.Module):
             self.h_step.bias[0] = 0.5       # short steps are the safe default
         nn.init.orthogonal_(self.h_value.weight, gain=1.0)
         nn.init.zeros_(self.h_value.bias)
+        nn.init.orthogonal_(self.h_board_value.weight, gain=1.0)
+        nn.init.zeros_(self.h_board_value.bias)
 
     # -- feature assembly ---------------------------------------------------
 
@@ -280,9 +302,13 @@ class NeuroRoutePolicy(nn.Module):
             d_dist, s_dist, dists, actions, obs.head_is_pair, obs.head_mask
         )
         value = self.h_value(feat).squeeze(-1) * obs.head_mask.float()
+        board_value = self.h_board_value(g).squeeze(-1)
 
         schedule, sched_logp = self._schedule(obs, g, deterministic)
         actions["schedule"] = schedule
+
+        ripup, ripup_logp = self._ripup(obs, g, deterministic)
+        actions["ripup"] = ripup
 
         return PolicyOutput(
             actions=actions,
@@ -290,6 +316,8 @@ class NeuroRoutePolicy(nn.Module):
             entropy=entropy,
             value=value,
             schedule_log_prob=sched_logp,
+            ripup_log_prob=ripup_logp,
+            board_value=board_value,
             forecast=forecast,
             latent=z,
         )
@@ -306,6 +334,10 @@ class NeuroRoutePolicy(nn.Module):
         encode. The forecaster's supervised loss needs it, and encoding twice
         would double the cost of the single most expensive part of the model
         for information already computed.
+
+        Also re-scores `schedule` and `ripup` (via each one's `given=`) so
+        both board-level heads actually receive a PPO gradient here -- see
+        `_schedule`'s and `_ripup`'s docstrings for why that was missing.
         """
         feat, g, _z, forecast = self.encode(obs)
 
@@ -323,9 +355,14 @@ class NeuroRoutePolicy(nn.Module):
             d_dist, s_dist, dists, actions, obs.head_is_pair, obs.head_mask
         )
         value = self.h_value(feat).squeeze(-1) * obs.head_mask.float()
+        board_value = self.h_board_value(g).squeeze(-1)
+
+        _, sched_logp = self._schedule(obs, g, deterministic=False, given=actions["schedule"])
+        _, ripup_logp = self._ripup(obs, g, deterministic=False, given=actions["ripup"])
+
         if return_forecast:
-            return logp, entropy, value, forecast
-        return logp, entropy, value
+            return logp, entropy, value, sched_logp, ripup_logp, board_value, forecast
+        return logp, entropy, value, sched_logp, ripup_logp, board_value
 
     def _score(self, d_dist, s_dist, dists, actions, is_pair, head_mask):
         """Sum log-probs and entropies over the dimensions that had an effect.
@@ -361,7 +398,10 @@ class NeuroRoutePolicy(nn.Module):
 
     # -- scheduler ----------------------------------------------------------
 
-    def _schedule(self, obs: Observation, g: torch.Tensor, deterministic: bool):
+    def _schedule(
+        self, obs: Observation, g: torch.Tensor, deterministic: bool,
+        given: torch.Tensor | None = None,
+    ):
         """Choose a pending net for each idle head slot.
 
         Learned rather than shortest-first. At tens of nets ordering barely
@@ -375,6 +415,15 @@ class NeuroRoutePolicy(nn.Module):
         wasted slot -- which the reward already penalises, so the policy has a
         gradient telling it not to. That is much simpler than a
         sample-without-replacement scheme and costs almost nothing.
+
+        `given`, if provided, re-scores a STORED `(B, K)` action instead of
+        sampling a new one -- this is what lets `evaluate()` compute this
+        head's log-prob under the CURRENT parameters for PPO. Before this
+        existed, nothing ever called `_schedule` with a stored action:
+        `RolloutBuffer` explicitly dropped "schedule" from what it kept
+        (`if k != "schedule"`), so `h_schedule`'s output never reached any
+        loss and the scheduler never actually trained, on any run in this
+        project's history.
         """
         B, K = obs.head_mask.shape
         tokens = self.nets(obs.nets, g, obs.net_mask)
@@ -390,8 +439,65 @@ class NeuroRoutePolicy(nn.Module):
         picks = []
         logp = torch.zeros(B, device=scores.device)
         for k in range(K):
-            choice = safe.argmax(-1) if deterministic else dist.sample()
+            if given is None:
+                choice = safe.argmax(-1) if deterministic else dist.sample()
+            else:
+                choice = given[:, k].clamp_min(0)
             take = idle[:, k] & ~none_pending
             picks.append(torch.where(take, choice, torch.full_like(choice, -1)))
             logp = logp + dist.log_prob(choice) * take.float()
         return torch.stack(picks, dim=1), logp
+
+    # -- rip-up ---------------------------------------------------------------
+
+    def _ripup(
+        self, obs: Observation, g: torch.Tensor, deterministic: bool,
+        given: torch.Tensor | None = None,
+    ):
+        """Choose at most one already-routed net per board to rip up.
+
+        Complementary to the scheduler, over the opposite mask: the scheduler
+        decides which PENDING net fills an idle slot; this decides whether an
+        earlier decision -- a net that finished routing but now sits
+        somewhere blocking others -- should be undone and returned to
+        pending. `BatchedRouterWorld.ripup()` and the environment wiring for
+        it (`NeuroRouteEnv.step`) already existed; the policy never emitted
+        the action that would use them.
+
+        A SEPARATE `NetEncoder` pass is used, not the scheduler's `tokens`:
+        `NetEncoder.forward` zeroes its OUTPUT outside `mask` (see its
+        docstring), so reusing the scheduler's pending-masked tokens would
+        hand this head an all-zero embedding for every net it is actually
+        choosing between.
+
+        `-1` ("rip up nothing") is index `N` -- one past the last real net --
+        scored by a single LEARNED bias (`h_ripup_none`) rather than folded
+        into an ordinary masked softmax. Two reasons: an ordinary masked
+        categorical would force a pick among whatever routed nets exist even
+        when none of them should be touched, and a board with zero routed
+        nets would leave every real option at `-inf` with nothing finite to
+        fall back on. Routing `none` through its own always-finite logit
+        avoids both. Initialised strongly positive (matching every other
+        head's tuned-default-bias pattern) so an untrained policy never rips
+        anything up, keeping "untrained policy == greedy baseline" true here
+        too.
+
+        `given` re-scores a stored `(B,)` action the same way `_schedule`'s
+        `given` does, for the same reason -- see `_schedule`'s docstring.
+        """
+        B, N = obs.routed_mask.shape
+        tokens = self.nets(obs.nets, g, obs.routed_mask)
+        ctx = g.unsqueeze(1).expand(B, N, g.shape[-1])
+        raw = self.h_ripup(torch.cat([tokens, ctx], dim=-1)).squeeze(-1)
+        raw = raw.masked_fill(~obs.routed_mask, float("-inf"))
+        none_score = self.h_ripup_none.expand(B, 1)
+        scores = torch.cat([raw, none_score], dim=1)
+        dist = Categorical(logits=scores)
+
+        if given is None:
+            choice = scores.argmax(-1) if deterministic else dist.sample()
+        else:
+            choice = torch.where(given < 0, torch.full_like(given, N), given)
+        logp = dist.log_prob(choice)
+        net_idx = torch.where(choice == N, torch.full_like(choice, -1), choice)
+        return net_idx, logp

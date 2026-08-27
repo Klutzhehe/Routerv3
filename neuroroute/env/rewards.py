@@ -42,6 +42,13 @@ class RewardConfig:
     #: Per via. Vias cost area, yield and signal integrity; a free via action
     #: produces a policy that drills instead of routing.
     via: float = 0.30
+    #: Per rip-up. More disruptive than a via -- it discards a whole
+    #: completed route, not just adds one -- so it needs its own cost:
+    #: nothing else stops a *trained* policy from ripping up nets for free
+    #: once the untrained-default bias (h_ripup_none) washes out through
+    #: learning. Set well below the arrival/completion bonuses so a rip-up
+    #: that genuinely unblocks a later net is still clearly worth it.
+    ripup: float = 0.50
     arrival: float = 10.0
     failure: float = 4.0
     #: Terminal, per board.

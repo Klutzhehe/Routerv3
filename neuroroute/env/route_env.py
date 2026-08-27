@@ -152,8 +152,14 @@ class NeuroRouteEnv:
         )
         reward = step_reward(res, cfg.reward)
 
+        # (B,) bool -- which boards actually ripped a net up this step. Board
+        # level, not per-head: ripup is a board-level decision (like
+        # scheduling), and its cost belongs on the board-level reward stream
+        # that trains it, not smeared into the per-head geometry reward those
+        # heads did not cause.
+        did_ripup = torch.zeros(w.head_net.shape[0], dtype=torch.bool, device=self.device)
         if "ripup" in action:
-            w.ripup(action["ripup"])
+            did_ripup = w.ripup(action["ripup"])
 
         sched = action.get("schedule")
         if sched is None:
@@ -178,6 +184,7 @@ class NeuroRouteEnv:
             "nets_done": res.nets_done,
             "nets_failed": res.nets_failed,
             "completion": w.completion(),
+            "did_ripup": did_ripup,
         }
         if bool(done.all()):
             term, metrics = terminal_reward(w, cfg.reward)

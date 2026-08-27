@@ -270,6 +270,10 @@ class BatchedRouterWorld:
         """(B, N) bool -- nets not yet routed and not currently active."""
         return self.net_valid & (self.net_status == STATUS_PENDING)
 
+    def routed_mask(self) -> torch.Tensor:
+        """(B, N) bool -- nets finished and therefore ripup-able."""
+        return self.net_valid & (self.net_status == STATUS_DONE)
+
     def assign(self, net_idx: torch.Tensor) -> torch.Tensor:
         """Bind nets to idle head slots.
 
