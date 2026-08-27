@@ -146,7 +146,24 @@ class NeuroRoutePolicy(nn.Module):
         # h_value (which is masked to active heads and is not meaningful on,
         # e.g., a board that is fully idle between nets -- exactly when a
         # scheduling decision matters most).
-        self.h_board_value = nn.Linear(self.field.global_dim, 1)
+        #
+        # LayerNorm here is load-bearing for the SAME reason the trunk's own
+        # is (see its comment) -- `g` is the encoder's raw global-context
+        # vector, with nothing anywhere forcing its scale to stay controlled
+        # across training. `h_value`'s input never has this problem because
+        # it reads `feat`, which the trunk's LayerNorm renormalises to
+        # std~1 on every forward pass regardless of how the shared encoder
+        # drifts; `g` has no equivalent protection. Missing this produced a
+        # real, measured failure: value loss exploding from ~30 to 490,703
+        # by update 6 of the very first real GPU run of this head, with
+        # completion collapsing 19% -> 1% in the same window -- a bootstrapped
+        # scalar regression (GAE) has nothing else stopping it from
+        # reinforcing its own drift the way a softmax-based head's output
+        # does.
+        self.h_board_value = nn.Sequential(
+            nn.LayerNorm(self.field.global_dim),
+            nn.Linear(self.field.global_dim, 1),
+        )
         self._init_actor()
 
     def _init_actor(self) -> None:
@@ -204,8 +221,8 @@ class NeuroRoutePolicy(nn.Module):
             self.h_step.bias[0] = 0.5       # short steps are the safe default
         nn.init.orthogonal_(self.h_value.weight, gain=1.0)
         nn.init.zeros_(self.h_value.bias)
-        nn.init.orthogonal_(self.h_board_value.weight, gain=1.0)
-        nn.init.zeros_(self.h_board_value.bias)
+        nn.init.orthogonal_(self.h_board_value[1].weight, gain=1.0)
+        nn.init.zeros_(self.h_board_value[1].bias)
 
     # -- feature assembly ---------------------------------------------------
 
