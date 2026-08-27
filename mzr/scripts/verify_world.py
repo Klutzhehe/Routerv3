@@ -27,6 +27,8 @@ from collections import deque
 import numpy as np
 import torch
 
+import mzr.world.geometry as geo
+
 from mzr.world.engine import (
     STATUS_DONE,
     STATUS_ROUTING,
@@ -41,6 +43,7 @@ from mzr.world.spec import (
     NUM_ENDS,
     BoardSpec,
     LayerStack,
+    STEP_LENGTHS,
     PriceRules,
     RipupRules,
 )
@@ -288,6 +291,117 @@ def test_polyline_matches_copper() -> None:
 # ---------------------------------------------------------------------------
 # Step-mechanics checks
 # ---------------------------------------------------------------------------
+
+
+def test_exported_segments_are_backed_by_copper() -> None:
+    """Every segment the exporter draws is backed by copper owned by that net.
+
+    A regression test for a real bug this repo's DRC gate caught on its first
+    run. Each leg's copper is two polylines -- one per frontier -- and joining
+    them unconditionally drew a phantom segment straight across the board
+    whenever a leg finished by reaching the far *pad* rather than by the two
+    frontiers meeting: the far pad connected to the far end of the other half's
+    stub, backed by nothing. KiCad 9.0.2 reported 30 `clearance`, 11
+    `shorting_items` and 5 `tracks_crossing`.
+
+    The lattice was innocent -- the exporter was describing a board that had
+    never been routed. That is the more dangerous kind of failure, because it
+    would have condemned a correct geometry model.
+
+    This check needs no KiCad, so it runs everywhere and runs fast; the DRC gate
+    is the authority, but this is what catches the same class of bug in a second
+    rather than a minute.
+
+    Checked against the segment's **centre line**, not against
+    `geometry.segment_claims`. That distinction cost a debugging round and is
+    worth stating: `segment_claims` is a deliberately *conservative* footprint
+    used to decide whether a move is legal -- it samples the line, adds the
+    diagonal corner guards, and dilates, which for a one-cell diagonal at
+    minimum width yields 27 cells including cells *behind* the start that no
+    move ever stamps. Using it as a record of "what was written" reported 67
+    false violations on copper KiCad had already passed as clean.
+    """
+    from mzr.eval.kicad_export import _leg_runs
+
+    def centreline(y0, x0, y1, x1):
+        n = max(abs(y1 - y0), abs(x1 - x0))
+        if n == 0:
+            return [(y0, x0)]
+        return [
+            (round(y0 + (y1 - y0) * k / n), round(x0 + (x1 - x0) * k / n))
+            for k in range(n + 1)
+        ]
+
+    w = build(nets=24, layers=4, size=64, batch=4, steps=64)
+    rollout(w, via=True)
+    occ = w.occ
+    bad = total = 0
+    gaps = vias = stubs = 0
+    # A via is placed in place, so a layer change must not also move; an
+    # in-plane hop cannot exceed one action's reach.
+    reach = max(max(STEP_LENGTHS), w.cfg.snap_radius)
+    for b in range(w.cfg.batch_size):
+        routes = w.route_v[b].cpu()
+        counts = w.route_n[b].cpu()
+        for n in range(w.cfg.max_nets):
+            if not bool(w.net_valid[b, n]) or int(w.net_status[b, n]) != STATUS_DONE:
+                continue
+            legs = 2 if int(w.net_kind[b, n]) == KIND_DIFF_PAIR else 1
+            wclass = int(w.net_width[b, n])
+            for leg in range(legs):
+                if not bool(w.leg_done[b, n, leg]):
+                    continue
+                f_src = (n * 2 + leg) * NUM_ENDS + END_SRC
+                f_dst = (n * 2 + leg) * NUM_ENDS + END_DST
+                runs = _leg_runs(routes, counts, f_src, f_dst)
+                if len(runs) > 1:
+                    stubs += 1
+                for pts in runs:
+                    for i in range(len(pts) - 1):
+                        l0, y0, x0 = pts[i]
+                        l1, y1, x1 = pts[i + 1]
+                        # Contiguity. This is what actually catches the phantom
+                        # join, and it must come before the layer-change skip:
+                        # a stub tip and the far pad usually sit on DIFFERENT
+                        # layers -- that is precisely why the leg ended by
+                        # pad-snap instead of meeting -- so the bogus jump is
+                        # emitted as a *via*, and a check that skipped layer
+                        # changes waved it straight through.
+                        if l0 != l1:
+                            vias += 1
+                            if (y0, x0) != (y1, x1):
+                                gaps += 1
+                            continue
+                        if max(abs(y1 - y0), abs(x1 - x0)) > reach:
+                            gaps += 1
+                            continue
+                        if (y0, x0) == (y1, x1):
+                            continue
+                        total += 1
+                        cells = [
+                            int(occ[b, l0, cy, cx]) for cy, cx in centreline(y0, x0, y1, x1)
+                        ]
+                        if any(c != n + 1 for c in cells):
+                            bad += 1
+
+    # Guard against the check silently going vacuous: if the boards stop
+    # producing stub legs, the phantom-join bug would no longer be reachable
+    # and a green tick here would mean nothing.
+    check(
+        "export check actually exercises stub legs",
+        stubs > 0,
+        f"{stubs} legs exported as two runs, {vias} vias, {total} segments",
+    )
+    check(
+        "no exported run jumps -- every vertex pair is contiguous",
+        gaps == 0,
+        f"{gaps} discontinuities",
+    )
+    check(
+        "every exported segment is backed by its own net's copper",
+        bad == 0,
+        f"{total - bad}/{total} segments verified",
+    )
 
 
 def test_rejected_steps_are_no_ops() -> None:
@@ -560,6 +674,7 @@ def main() -> int:
     test_done_nets_are_connected(layers=1, via=False)
     test_done_nets_are_connected(layers=4, via=True)
     test_polyline_matches_copper()
+    test_exported_segments_are_backed_by_copper()
 
     print("\n== step mechanics ==")
     test_rejected_steps_are_no_ops()
