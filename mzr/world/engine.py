@@ -88,6 +88,10 @@ class WorldConfig:
     max_macro_steps: int = 64
     #: Macro-steps one frontier may take before its net is abandoned.
     max_steps_per_frontier: int = 64
+    #: Consecutive rejected moves before a wedged net is abandoned. Generous on
+    #: purpose: at stages 1+ a frontier may be blocked for several steps by
+    #: copper that a rip-up round is about to clear.
+    max_stuck_steps: int = 16
     #: Cells within which a frontier may snap onto its target pad, or onto its
     #: partner frontier. MUST be >= max(STEP_LENGTHS) / 2, or a long step jumps
     #: clean over the snap zone and the frontier orbits its target forever -- a
@@ -194,6 +198,13 @@ class SimultaneousRouterWorld:
         self.fr_pos = z(B, F, 3)
         self.fr_alive = torch.zeros(B, F, dtype=torch.bool, device=dev)
         self.fr_steps = z(B, F)
+        #: Consecutive macro-steps this frontier's move was rejected. A frontier
+        #: whose every direction is blocked re-picks the same illegal move each
+        #: step -- nothing is written, so the next observation is identical and
+        #: a deterministic policy is trapped until the episode ends. Measured on
+        #: stage 0: a frozen run of 48 of 48 steps. Counting consecutive
+        #: rejections lets `step()` retire the net instead of spinning.
+        self.fr_stuck = z(B, F)
         self.fr_prev = torch.zeros(B, F, dtype=torch.float32, device=dev)
         # fp16: a coarse field's values are small (a 128-cell board at ds=4 is
         # ~32 coarse cells across) so half precision is ample, and the cache is
@@ -258,6 +269,7 @@ class SimultaneousRouterWorld:
         self.leg_done.zero_()
         self.fr_alive.zero_()
         self.fr_steps.zero_()
+        self.fr_stuck.zero_()
         self.fr_prev.zero_()
         self.route_n.zero_()
         self.price.reset()
@@ -319,6 +331,7 @@ class SimultaneousRouterWorld:
         self.fr_alive = torch.where(alive, torch.ones_like(alive), self.fr_alive & ~alive)
         self.fr_pos = torch.where(alive.unsqueeze(-1), pos, self.fr_pos)
         self.fr_steps = torch.where(alive, torch.zeros_like(self.fr_steps), self.fr_steps)
+        self.fr_stuck = torch.where(alive, torch.zeros_like(self.fr_stuck), self.fr_stuck)
         self.route_n = torch.where(alive, torch.ones_like(self.route_n), self.route_n)
         self.route_v[:, :, 0] = torch.where(
             alive.unsqueeze(-1), pos.to(torch.int16), self.route_v[:, :, 0]
@@ -530,6 +543,7 @@ class SimultaneousRouterWorld:
         rejected = (plan.live & ~go).view(B, F)
 
         self.fr_steps = torch.where(live, self.fr_steps + 1, self.fr_steps)
+        self.fr_stuck = torch.where(rejected, self.fr_stuck + 1, torch.zeros_like(self.fr_stuck))
 
         # --- connection: pad snap, then partner meeting ----------------------
         self._try_snap(b_flat, n_flat, w_flat, live.reshape(M))
@@ -543,7 +557,13 @@ class SimultaneousRouterWorld:
         routing = self.net_status == STATUS_ROUTING
         net_done = routing & self.net_valid & (self.leg_done | ~self.leg_valid).all(dim=-1)
         starved = self._fr_view(self.fr_steps).amax(dim=(2, 3)) >= self.cfg.max_steps_per_frontier
-        net_failed = routing & self.net_valid & ~net_done & starved
+        # A frontier with no legal move at all cannot recover on its own. Give it
+        # a generous window first -- at stages 1+ a frontier is often blocked for
+        # several steps by copper another net will rip up -- then fail the net
+        # rather than let it burn the rest of the episode re-picking one illegal
+        # move.
+        wedged = self._fr_view(self.fr_stuck).amax(dim=(2, 3)) >= self.cfg.max_stuck_steps
+        net_failed = routing & self.net_valid & ~net_done & (starved | wedged)
 
         nets_done = self._retire(net_done, STATUS_DONE)
         nets_failed = self._retire(net_failed, STATUS_FAILED)

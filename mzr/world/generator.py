@@ -85,13 +85,25 @@ def _component_pins(
     spec: BoardSpec,
     cfg: GeneratorConfig,
     min_pins: int,
+    blocked: np.ndarray | None = None,
 ) -> list[tuple[int, int, int]]:
     """Place components and return every pin as (layer, y, x).
 
     Components are placed by rejection sampling against already-placed
-    bounding boxes, so pin fields never overlap -- overlapping footprints
-    would make some nets unroutable for a reason that has nothing to do with
-    routing skill.
+    bounding boxes **and against `blocked`** -- the (H, W) union of keepout and
+    edge-margin cells, which `generate_board` has already stamped by the time
+    this runs.
+
+    Rejecting against `blocked` is not optional. Without it a component lands
+    inside a keepout rectangle and its pads are stamped **entombed**: walled in
+    on all eight sides, zero legal moves at reset, the net unroutable forever.
+    Measured on stage 0 before this check existed: 13 of 256 frontiers boxed in
+    at reset, on 12 of 128 eval boards -- which put a hard ceiling of ~0.89 on a
+    curriculum whose gate is absolute 1.00, and made the stage-0 kill-number
+    (0.95) unreachable by construction. The coarse geodesic could not see it
+    either: at `geodesic_downsample=4` a one-cell keepout ring vanishes, so the
+    field reported a finite distance to a pad nothing could reach and the
+    shaping reward kept paying progress toward it.
 
     Placement continues past `cfg.num_components` if the netlist still needs
     pins. Without that, a run of unlucky rejections silently yields a board
@@ -121,6 +133,10 @@ def _component_pins(
             y0 = int(rng.integers(margin, H - margin - h))
             x0 = int(rng.integers(margin, W - margin - w))
             box = (y0 - 2, x0 - 2, y0 + h + 2, x0 + w + 2)
+            if blocked is not None and blocked[
+                max(0, box[0]) : box[2], max(0, box[1]) : box[3]
+            ].any():
+                continue
             if all(
                 box[2] <= q[0] or q[2] <= box[0] or box[3] <= q[1] or q[3] <= box[1]
                 for q in placed
@@ -169,7 +185,9 @@ def generate_board(
         x0 = int(rng.integers(em, max(em + 1, W - em - kw)))
         static[:, y0 : y0 + kh, x0 : x0 + kw] = -1
 
-    pins = _component_pins(rng, spec, cfg, _pins_required(cfg))
+    # Keepouts and the edge margin are already stamped; pins must avoid both.
+    blocked = (static < 0).any(axis=0)
+    pins = _component_pins(rng, spec, cfg, _pins_required(cfg), blocked)
     if len(pins) < 4:
         # Should be unreachable now that placement keeps going until the pin
         # budget is met; kept as a guard because a zero-net board silently

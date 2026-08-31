@@ -148,8 +148,23 @@ class PriorPolicy(nn.Module):
 
         total = sum(self.sizes.values())
         self.head = nn.Linear(token_width, total)
+        # The critic reads the frontier tokens too, not just `g`.
+        #
+        # `g` is `global_proj(z.mean(dim=(2,3,4)))` -- the field embedding
+        # *globally mean-pooled*. It carries no frontier position and no
+        # distance-to-target, and this repo has four recorded failures at
+        # decoding distance out of a pooled embedding (jepa x3,
+        # models/fast_lookahead.py). A critic built on it alone measured
+        # explained_variance +0.0001 with value_std 0.0008 against return_std
+        # 1.74 -- V(s) was constant, so every advantage PPO saw was noise, which
+        # is what the kl 0.29 / clip 0.64 thrash in the stage-0 log was.
+        #
+        # The masked mean over tokens carries the per-frontier geometry
+        # (including the `dist` scalar) straight to the value head, by the same
+        # principle the action features already follow: hand it the geometry,
+        # do not ask it to reconstruct it.
         self.value = nn.Sequential(
-            nn.Linear(self.field.global_dim, token_width),
+            nn.Linear(self.field.global_dim + token_width, token_width),
             nn.SiLU(),
             nn.Linear(token_width, 1),
         )
@@ -223,7 +238,9 @@ class PriorPolicy(nn.Module):
 
         tok = self.tokens(obs.frontiers, crop, z_gather, g, obs.frontier_mask)
         logits = self._suppress(self._split(self.head(tok)), obs)
-        value = self.value(g).squeeze(-1)
+        m = obs.frontier_mask.unsqueeze(-1).float()
+        pooled = (tok * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
+        value = self.value(torch.cat([g, pooled], dim=-1)).squeeze(-1)
         return PolicyOutput(logits=logits, value=value)
 
     # -- rollout / update API -------------------------------------------
