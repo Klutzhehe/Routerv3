@@ -3,7 +3,10 @@
     "colab-mcp": {
       "command": "uv",
       "args": ["run", "--directory", "C:/Users/Game Making/tools/colab-mcp", "colab-mcp"],
-      "timeout": 600000
+      "timeout": 600000,
+      "env": {
+        "COLAB_MCP_NOTEBOOK": ""
+      }
     }
   }
 }
