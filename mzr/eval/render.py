@@ -41,6 +41,37 @@ def _bitmap(plane: np.ndarray) -> str:
     return base64.b64encode(np.packbits(plane.astype(np.uint8))).decode("ascii")
 
 
+#: Octant index of each (sign(dy), sign(dx)) heading, matching the engine's
+#: direction table ordering closely enough for a bend histogram.
+def _octant(dy: int, dx: int) -> int:
+    import math
+
+    return int(round(math.atan2(dy, dx) / (math.pi / 4))) % 8
+
+
+def _bends(pts: list[list[int]]) -> dict:
+    """Histogram of direction changes along one polyline, in 45-degree octants.
+
+    Reported because the corner reward (`RewardConfig.corner`) is only worth
+    keeping if it actually moves this: fab practice replaces every 90-degree
+    corner with two 45-degree bends, so `right_angle` falling while `soft`
+    rises is the shape of success. Layer changes are skipped -- a via is not a
+    corner.
+    """
+    hist = [0] * 5
+    prev = None
+    for a, b in zip(pts, pts[1:]):
+        dy, dx = b[1] - a[1], b[2] - a[2]
+        if dy == 0 and dx == 0:
+            continue                      # a via: same cell, different layer
+        o = _octant(dy, dx)
+        if prev is not None:
+            d = abs(o - prev)
+            hist[min(d, 8 - d)] += 1
+        prev = o
+    return {"straight": hist[0], "soft": hist[1], "right_angle": sum(hist[2:])}
+
+
 @torch.no_grad()
 def export(policy, stage, device: str, seeds: list[int], deterministic: bool = True) -> dict:
     env = make_env(stage, batch=len(seeds), device=device, seed=0)
@@ -81,7 +112,8 @@ def export(policy, stage, device: str, seeds: list[int], deterministic: bool = T
             if n < 2:
                 continue
             pts = rv[b, f, :n].astype(int).tolist()
-            traces.append({"net": f // (2 * NUM_ENDS), "frontier": f, "pts": pts})
+            traces.append({"net": f // (2 * NUM_ENDS), "frontier": f,
+                           "pts": pts, "bends": _bends(pts)})
 
         nets = []
         for n in range(w.cfg.max_nets):
@@ -96,8 +128,11 @@ def export(policy, stage, device: str, seeds: list[int], deterministic: bool = T
                 "vias": int(vias[b, n]),
             })
 
+        bends = {k: sum(t["bends"][k] for t in traces) for k in ("straight", "soft", "right_angle")}
+
         boards.append({
             "seed": int(seed),
+            "bends": bends,
             "completion": float(comp[b]),
             "keepout": [_bitmap(occ0[b, l] < 0) for l in range(L)],
             "copper": [_bitmap(occ[b, l] > 0) for l in range(L)],
@@ -105,7 +140,9 @@ def export(policy, stage, device: str, seeds: list[int], deterministic: bool = T
             "traces": traces,
         })
 
+    tot = {k: sum(b["bends"][k] for b in boards) for k in ("straight", "soft", "right_angle")}
     return {
+        "bends": tot,
         "stage": stage.name,
         "height": H, "width": W, "layers": L,
         "steps": steps,
@@ -140,7 +177,14 @@ def main() -> int:
           f"-- {len(seeds)} boards, mean completion {blob['mean_completion']:.3f}")
     for bd in blob["boards"]:
         st = ",".join(f"{n['status']}/{n['vias']}v" for n in bd["nets"])
-        print(f"  seed {bd['seed']}: completion {bd['completion']:.2f}  [{st}]")
+        bn = bd["bends"]
+        print(f"  seed {bd['seed']}: completion {bd['completion']:.2f}  [{st}]  "
+              f"bends straight {bn['straight']} 45deg {bn['soft']} >=90deg {bn['right_angle']}")
+    t = blob["bends"]
+    n = t["straight"] + t["soft"] + t["right_angle"]
+    print(f"\ncorners over all boards: straight {t['straight']}, 45deg {t['soft']}, "
+          f">=90deg {t['right_angle']}"
+          + (f"  ({t['right_angle'] / n * 100:.1f}% right angles)" if n else ""))
     return 0
 
 

@@ -61,6 +61,19 @@ class RewardConfig:
     #: Weight on the per-step change in board-wide present congestion, split
     #: across live frontiers. Negative delta (congestion fell) is a reward.
     congestion_delta: float = 0.30
+    #: Per 45-degree octant of bend **beyond the first**, on an accepted move.
+    #: A 45-degree turn is free; 90 degrees costs one unit, 135 two, a reversal
+    #: three. This is a real fab rule rather than an aesthetic one: a right
+    #: angle in copper is an acid trap when the board is etched and an
+    #: impedance discontinuity when the trace is driven, which is why layout
+    #: practice replaces every 90-degree corner with two 45-degree bends.
+    #:
+    #: The action space already moves in octants, so this needs no new action
+    #: -- only a memory of the previous heading (`world.fr_dir`). Kept small:
+    #: it is a preference between equally-valid routes, and must never outweigh
+    #: `progress` or the policy will prefer a straight line into a wall over
+    #: turning to reach the pad.
+    corner: float = 0.08
     #: A leg connected this step -- credited to both its frontiers. Lowered
     #: from 5.0: at 5.0 (x2 frontiers = +10) plus a completion bonus of 20,
     #: the return was dominated by a few large spikes at irregular episode
@@ -106,6 +119,9 @@ def step_reward(
     r = r - cfg.rejection * res.rejected.float()
     r = r - cfg.contended * res.contended.float()
     r = r - cfg.via * res.via_placed.float()
+    # Straight and 45-degree bends are free; charge only the excess octants, so
+    # the term prices right angles rather than taxing every turn.
+    r = r - cfg.corner * (res.turn - 1.0).clamp_min(0.0)
     r = r + cfg.arrival * arrived.float()
 
     # Board-wide congestion change, shared equally across this board's live

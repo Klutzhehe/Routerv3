@@ -149,6 +149,13 @@ class StepResult:
     congestion_delta: torch.Tensor
     #: (B,) frontiers whose move was arbitrated away by another net this step.
     contended: torch.Tensor
+    #: (B, F) how sharply this frontier turned, in 45-degree octants: 0 straight,
+    #: 1 = 45, 2 = 90, 3 = 135, 4 = reversal. Zero for a frontier that did not
+    #: move or has no previous heading. Fab practice routes 45-degree bends and
+    #: avoids right angles -- a 90-degree corner in copper is an acid trap when
+    #: etched and an impedance discontinuity when driven -- so the reward can
+    #: price a corner without the action space needing to change.
+    turn: torch.Tensor
 
 
 class SimultaneousRouterWorld:
@@ -205,6 +212,9 @@ class SimultaneousRouterWorld:
         #: stage 0: a frozen run of 48 of 48 steps. Counting consecutive
         #: rejections lets `step()` retire the net instead of spinning.
         self.fr_stuck = z(B, F)
+        #: Last accepted absolute heading, or -1 before a frontier has moved.
+        #: A via does not change it: a layer change is not a corner.
+        self.fr_dir = torch.full((B, F), -1, dtype=torch.long, device=dev)
         self.fr_prev = torch.zeros(B, F, dtype=torch.float32, device=dev)
         # fp16: a coarse field's values are small (a 128-cell board at ds=4 is
         # ~32 coarse cells across) so half precision is ample, and the cache is
@@ -270,6 +280,7 @@ class SimultaneousRouterWorld:
         self.fr_alive.zero_()
         self.fr_steps.zero_()
         self.fr_stuck.zero_()
+        self.fr_dir.fill_(-1)
         self.fr_prev.zero_()
         self.route_n.zero_()
         self.price.reset()
@@ -332,6 +343,7 @@ class SimultaneousRouterWorld:
         self.fr_pos = torch.where(alive.unsqueeze(-1), pos, self.fr_pos)
         self.fr_steps = torch.where(alive, torch.zeros_like(self.fr_steps), self.fr_steps)
         self.fr_stuck = torch.where(alive, torch.zeros_like(self.fr_stuck), self.fr_stuck)
+        self.fr_dir = torch.where(alive, torch.full_like(self.fr_dir, -1), self.fr_dir)
         self.route_n = torch.where(alive, torch.ones_like(self.route_n), self.route_n)
         self.route_v[:, :, 0] = torch.where(
             alive.unsqueeze(-1), pos.to(torch.int16), self.route_v[:, :, 0]
@@ -542,6 +554,16 @@ class SimultaneousRouterWorld:
         progress, moved, via_placed = self._commit(plan, go, b_flat, n_flat, w_flat)
         rejected = (plan.live & ~go).view(B, F)
 
+        # Turn magnitude, measured only on moves that were actually committed.
+        # Directions are octants, so the circular distance between headings is
+        # the bend in units of 45 degrees.
+        moved_f = moved.view(B, F)
+        new_dir = abs_dir.view(B, F)
+        raw = (new_dir - self.fr_dir).abs()
+        oct_dist = torch.minimum(raw, NUM_DIRECTIONS - raw)
+        turn = torch.where(moved_f & (self.fr_dir >= 0), oct_dist, torch.zeros_like(oct_dist))
+        self.fr_dir = torch.where(moved_f, new_dir, self.fr_dir)
+
         self.fr_steps = torch.where(live, self.fr_steps + 1, self.fr_steps)
         self.fr_stuck = torch.where(rejected, self.fr_stuck + 1, torch.zeros_like(self.fr_stuck))
 
@@ -584,6 +606,7 @@ class SimultaneousRouterWorld:
             congestion=congestion,
             congestion_delta=congestion_delta,
             contended=contended,
+            turn=turn.float(),
         )
 
     # -- plan / commit ------------------------------------------------------
