@@ -146,6 +146,11 @@ def main() -> int:
     p.add_argument("--entropy-coef", type=float, default=0.004)
     p.add_argument("--progress-coef", type=float, default=None,
                    help="override RewardConfig.progress for this run")
+    p.add_argument("--wirelength", type=float, default=None,
+                   help="terminal weight on excess routed length over the straight "
+                        "line, charged per completed net across BOTH frontiers")
+    p.add_argument("--corner", type=float, default=None,
+                   help="per 45-degree octant of bend beyond the first")
     p.add_argument("--leg-progress", type=float, default=None,
                    help="shape on the leg's closing gap instead of per-frontier "
                         "distance, so a leg is paid once for ground covered")
@@ -187,6 +192,10 @@ def main() -> int:
         stage.reward.progress = args.progress_coef
     if args.leg_progress is not None:
         stage.reward.leg_progress = args.leg_progress
+    if args.wirelength is not None:
+        stage.reward.wirelength = args.wirelength
+    if args.corner is not None:
+        stage.reward.corner = args.corner
     bc = stage.bc_coef0 if args.bc_coef is None else args.bc_coef
     ppo_cfg = PPOConfig(
         lr=args.lr, bc_coef=bc, epochs=args.epochs,
