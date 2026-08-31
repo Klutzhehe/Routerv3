@@ -146,6 +146,9 @@ def main() -> int:
     p.add_argument("--entropy-coef", type=float, default=0.004)
     p.add_argument("--progress-coef", type=float, default=None,
                    help="override RewardConfig.progress for this run")
+    p.add_argument("--leg-progress", type=float, default=None,
+                   help="shape on the leg's closing gap instead of per-frontier "
+                        "distance, so a leg is paid once for ground covered")
     p.add_argument("--bc-coef", type=float, default=None,
                    help="override the stage's BC weight (default: 0 -- pure RL)")
     p.add_argument("--field-width", type=int, default=40)
@@ -182,6 +185,8 @@ def main() -> int:
     opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
     if args.progress_coef is not None:
         stage.reward.progress = args.progress_coef
+    if args.leg_progress is not None:
+        stage.reward.leg_progress = args.leg_progress
     bc = stage.bc_coef0 if args.bc_coef is None else args.bc_coef
     ppo_cfg = PPOConfig(
         lr=args.lr, bc_coef=bc, epochs=args.epochs,

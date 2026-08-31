@@ -46,6 +46,22 @@ class RewardConfig:
     #: and argmax stopped pointing at the pad. At 4.0 a good step is ~0.12,
     #: clearly the best local move.
     progress: float = 4.0
+    #: When > 0, shape on the **leg's** closing gap instead of each frontier's
+    #: distance to its own far pad, and `progress` is ignored.
+    #:
+    #: Per-frontier shaping pays a leg twice for one corridor: both frontiers
+    #: are rewarded for nearing the opposite pad, so the optimal behaviour is
+    #: for each to route the whole net. Measured on the gate-clearing stage-0
+    #: policy: 6 of 9 boards laid ~2.2x the necessary copper as a closed loop,
+    #: two mirror paths between the same pads, while `completion` read 1.000
+    #: because the net was connected -- twice. One board had a frontier that
+    #: never moved at all.
+    #:
+    #: The leg gap is `d_src + d_dst - D`: it starts at D and hits zero exactly
+    #: when the pair has covered the route between them, so it pays for ground
+    #: covered once and pays nothing for a frontier that keeps going after the
+    #: work is done.
+    leg_progress: float = 0.0
     #: Flat per-step cost, so finishing sooner is strictly better.
     step_cost: float = 0.01
     #: This frontier's move was illegal. See calibration note 2.
@@ -114,7 +130,10 @@ def step_reward(
     """
     live = res.live.float()
 
-    r = cfg.progress * (res.progress / LENGTH_SCALE)
+    if cfg.leg_progress > 0.0:
+        r = cfg.leg_progress * (res.leg_progress / LENGTH_SCALE)
+    else:
+        r = cfg.progress * (res.progress / LENGTH_SCALE)
     r = r - cfg.step_cost * live
     r = r - cfg.rejection * res.rejected.float()
     r = r - cfg.contended * res.contended.float()

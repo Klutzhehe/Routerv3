@@ -156,6 +156,16 @@ class StepResult:
     #: etched and an impedance discontinuity when driven -- so the reward can
     #: price a corner without the action space needing to change.
     turn: torch.Tensor
+    #: (B, F) reduction this step in the leg's *remaining gap* -- the distance
+    #: still separating its two frontiers -- split between them, so the leg is
+    #: paid once for ground covered instead of once per frontier.
+    #:
+    #: `progress` above pays every frontier for nearing its own far pad, which
+    #: pays a leg TWICE for the same corridor. Measured consequence: on 6 of 9
+    #: stage-0 boards both frontiers routed the whole net along mirror paths and
+    #: laid ~2.2x the necessary copper in a closed loop, while `completion` read
+    #: 1.000 because the net was connected -- twice.
+    leg_progress: torch.Tensor
 
 
 class SimultaneousRouterWorld:
@@ -215,6 +225,11 @@ class SimultaneousRouterWorld:
         #: Last accepted absolute heading, or -1 before a frontier has moved.
         #: A via does not change it: a layer change is not a corner.
         self.fr_dir = torch.full((B, F), -1, dtype=torch.long, device=dev)
+        #: Pad-to-pad geodesic per leg, and the gap still to close between its
+        #: two frontiers. gap = d_src_end + d_dst_end - D, which starts at D and
+        #: reaches 0 exactly when the pair has collectively covered the route.
+        self.leg_D = torch.zeros(B, cfg.max_nets, 2, dtype=torch.float32, device=dev)
+        self.leg_gap = torch.zeros(B, cfg.max_nets, 2, dtype=torch.float32, device=dev)
         self.fr_prev = torch.zeros(B, F, dtype=torch.float32, device=dev)
         # fp16: a coarse field's values are small (a 128-cell board at ds=4 is
         # ~32 coarse cells across) so half precision is ample, and the cache is
@@ -281,6 +296,8 @@ class SimultaneousRouterWorld:
         self.fr_steps.zero_()
         self.fr_stuck.zero_()
         self.fr_dir.fill_(-1)
+        self.leg_D.zero_()
+        self.leg_gap.zero_()
         self.fr_prev.zero_()
         self.route_n.zero_()
         self.price.reset()
@@ -326,6 +343,7 @@ class SimultaneousRouterWorld:
 
         self._seed_frontiers(self.net_valid)
         self._refresh_geodesic(self.fr_alive)
+        self._seed_leg_gap()
 
     def _seed_frontiers(self, net_mask: torch.Tensor) -> None:
         """Place every live net's frontiers on their pads and start polylines.
@@ -344,6 +362,9 @@ class SimultaneousRouterWorld:
         self.fr_steps = torch.where(alive, torch.zeros_like(self.fr_steps), self.fr_steps)
         self.fr_stuck = torch.where(alive, torch.zeros_like(self.fr_stuck), self.fr_stuck)
         self.fr_dir = torch.where(alive, torch.full_like(self.fr_dir, -1), self.fr_dir)
+        ripped = self._fr_view(alive).any(dim=3)
+        tot = self._fr_view(self.fr_prev).sum(dim=3)
+        self.leg_gap = torch.where(ripped, (tot - self.leg_D).clamp_min(0.0), self.leg_gap)
         self.route_n = torch.where(alive, torch.ones_like(self.route_n), self.route_n)
         self.route_v[:, :, 0] = torch.where(
             alive.unsqueeze(-1), pos.to(torch.int16), self.route_v[:, :, 0]
@@ -393,6 +414,13 @@ class SimultaneousRouterWorld:
         )
         self.fr_geo[b_i, f_i] = fld.to(self.fr_geo.dtype)
         self.fr_prev[b_i, f_i] = self._geo_at(fld, self.fr_pos[b_i, f_i])
+
+    def _seed_leg_gap(self) -> None:
+        """Both frontiers of a leg start at distance D from the opposite pad, so
+        their sum is 2D and the pad-to-pad distance is half of it."""
+        tot = self._fr_view(self.fr_prev).sum(dim=3)
+        self.leg_D = torch.nan_to_num(tot * 0.5, posinf=0.0, nan=0.0)
+        self.leg_gap = (tot - self.leg_D).clamp_min(0.0)
 
     def _geo_at(self, coarse: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         """Sample a coarse geodesic field at fine-lattice positions, in fine
@@ -564,6 +592,15 @@ class SimultaneousRouterWorld:
         turn = torch.where(moved_f & (self.fr_dir >= 0), oct_dist, torch.zeros_like(oct_dist))
         self.fr_dir = torch.where(moved_f, new_dir, self.fr_dir)
 
+        tot = self._fr_view(self.fr_prev).sum(dim=3)
+        gap = torch.nan_to_num((tot - self.leg_D).clamp_min(0.0), posinf=0.0, nan=0.0)
+        leg_delta = self.leg_gap - gap
+        self.leg_gap = gap
+        # Split across the leg's frontiers so the pair collects it once.
+        leg_progress = (
+            (leg_delta * 0.5).unsqueeze(-1).expand(B, self.cfg.max_nets, 2, NUM_ENDS).reshape(B, F)
+        )
+
         self.fr_steps = torch.where(live, self.fr_steps + 1, self.fr_steps)
         self.fr_stuck = torch.where(rejected, self.fr_stuck + 1, torch.zeros_like(self.fr_stuck))
 
@@ -607,6 +644,7 @@ class SimultaneousRouterWorld:
             congestion_delta=congestion_delta,
             contended=contended,
             turn=turn.float(),
+            leg_progress=leg_progress * live.float(),
         )
 
     # -- plan / commit ------------------------------------------------------
