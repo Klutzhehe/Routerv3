@@ -716,13 +716,19 @@ def test_prior_policy_is_greedy_at_init_and_ppo_consistent() -> None:
     try:
         env3 = RouteEnv(cfg)
         obs3 = env3.reset(seeds=[21, 22, 23, 24])
-        d0_sum = float(env3.world.fr_prev.sum())
+        # Live frontiers only: a retired one carries a sentinel distance, and
+        # summing it produced a reported "fr_prev 1144.8 -> 120000672.0" that
+        # meant nothing. A passing check with a meaningless number in it is
+        # how a real regression gets waved through later.
+        live0 = env3.world.fr_alive.clone()
+        d0_sum = float(env3.world.fr_prev[live0].sum())
         for _ in range(cfg.max_episode_steps):
             s3 = env3.step(pol.act(obs3, deterministic=True)["action"])
             obs3 = s3.obs
             if s3.done:
                 break
-        dend_sum = float(env3.world.fr_prev.sum())
+        still = env3.world.fr_alive
+        dend_sum = float(env3.world.fr_prev[still].sum()) if bool(still.any()) else 0.0
     finally:
         _E.SimultaneousRouterWorld.step = _orig_step
 
@@ -733,7 +739,8 @@ def test_prior_policy_is_greedy_at_init_and_ppo_consistent() -> None:
     check(
         "progress shaping telescopes (potential is stationary across refreshes)",
         prog_sum > -1.0,
-        f"sum(progress) {prog_sum:+.2f} cells, fr_prev {d0_sum:.1f} -> {dend_sum:.1f}",
+        f"sum(progress) {prog_sum:+.2f} cells; live fr_prev {d0_sum:.1f} -> "
+        f"{dend_sum:.1f} ({int(live0.sum())} -> {int(still.sum())} live)",
     )
 
     # -- the quality instrumentation itself ------------------------------
