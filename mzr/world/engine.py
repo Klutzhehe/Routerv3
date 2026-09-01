@@ -101,6 +101,20 @@ class WorldConfig:
     #: FRONTIER -- is the dominant memory term in the whole system, so raising
     #: this is a real memory decision, not a free generalisation.
     max_legs: int = 2
+    #: Fraction of the leg's pad-to-pad geodesic that ONE frontier may route
+    #: before it is retired. 0 disables the budget.
+    #:
+    #: Two frontiers must together cover D, so neither legitimately needs more
+    #: than D/2; 0.6 leaves 20% slack for routing around an obstacle
+    #: asymmetrically. A full double-traverse needs 1.0*D EACH, so this makes
+    #: the pathology impossible rather than merely unrewarded -- which is the
+    #: point, because two attempts to price it out of existence (leg-gap
+    #: shaping, wirelength x12) were both ignored by the policy.
+    #:
+    #: Pairs with `RewardConfig.tip_progress`: the budget is the hard
+    #: constraint, tip-distance is the dense gradient that teaches the policy
+    #: how to satisfy it. A constraint with no gradient only produces failures.
+    leg_budget_frac: float = 0.0
     #: Cells within which a frontier may snap onto its target pad, or onto its
     #: partner frontier. MUST be >= max(STEP_LENGTHS) / 2, or a long step jumps
     #: clean over the snap zone and the frontier orbits its target forever -- a
@@ -252,6 +266,8 @@ class SimultaneousRouterWorld:
         self.leg_gap = torch.zeros(B, cfg.max_nets, cfg.max_legs, dtype=torch.float32, device=dev)
         #: Distance from each frontier to its partner, in cells.
         self.fr_tip = torch.zeros(B, F, dtype=torch.float32, device=dev)
+        #: Copper this frontier has laid, in cells -- charged against the budget.
+        self.fr_len = torch.zeros(B, F, dtype=torch.float32, device=dev)
         self.fr_prev = torch.zeros(B, F, dtype=torch.float32, device=dev)
         # fp16: a coarse field's values are small (a 128-cell board at ds=4 is
         # ~32 coarse cells across) so half precision is ample, and the cache is
@@ -321,6 +337,7 @@ class SimultaneousRouterWorld:
         self.leg_D.zero_()
         self.leg_gap.zero_()
         self.fr_tip.zero_()
+        self.fr_len.zero_()
         self.fr_prev.zero_()
         self.route_n.zero_()
         self.price.reset()
@@ -398,6 +415,7 @@ class SimultaneousRouterWorld:
         tot = self._fr_view(self.fr_prev).sum(dim=3)
         self.leg_gap = torch.where(ripped, (tot - self.leg_D).clamp_min(0.0), self.leg_gap)
         self.fr_tip = torch.where(alive, self._tip_dist(), self.fr_tip)
+        self.fr_len = torch.where(alive, torch.zeros_like(self.fr_len), self.fr_len)
         self.route_n = torch.where(alive, torch.ones_like(self.route_n), self.route_n)
         self.route_v[:, :, 0] = torch.where(
             alive.unsqueeze(-1), pos.to(torch.int16), self.route_v[:, :, 0]
@@ -673,6 +691,17 @@ class SimultaneousRouterWorld:
 
         # A leg is done when it is connected; a net is done when every valid
         # leg is. Frontiers of a done leg stop.
+        # Spent its share of the leg: retire it. A double-traverse needs the
+        # whole of D from ONE frontier, so this forecloses it outright.
+        if self.cfg.leg_budget_frac > 0.0:
+            budget = (
+                self.leg_D.unsqueeze(-1)
+                .expand(B, self.cfg.max_nets, self.cfg.max_legs, NUM_ENDS)
+                .reshape(B, F)
+                * self.cfg.leg_budget_frac
+            )
+            self.fr_alive &= ~((self.fr_len >= budget) & (budget > 0))
+
         leg_live = self.leg_valid & ~self.leg_done
         self.fr_alive &= leg_live.unsqueeze(-1).expand(B, self.cfg.max_nets, self.cfg.max_legs, NUM_ENDS).reshape(B, F)
 
@@ -821,6 +850,9 @@ class SimultaneousRouterWorld:
             ((b_i * self.cfg.max_nets + n_i) * 2 + leg)[go],
             plan.seg_len[go],
         )
+        self.fr_len = self.fr_len + torch.where(
+            go, plan.seg_len, torch.zeros_like(plan.seg_len)
+        ).view(B, F)
         self.fr_pos = pos.view(B, F, 3)
         self._append_vertex(pos, go)
 

@@ -40,7 +40,8 @@ from mzr.training.ppo import PPOConfig, RolloutBuffer, ppo_update
 from mzr.world.engine import WorldConfig
 
 
-def make_env(stage, batch: int, device: str, seed: int) -> RouteEnv:
+def make_env(stage, batch: int, device: str, seed: int,
+             leg_budget: float = 0.0) -> RouteEnv:
     return RouteEnv(
         EnvConfig(
             spec=stage.board_spec(),
@@ -50,6 +51,7 @@ def make_env(stage, batch: int, device: str, seed: int) -> RouteEnv:
                 # A k-pin net needs k-1 legs; a diff pair needs 2. This
                 # multiplies F and therefore fr_geo, the dominant memory term.
                 max_legs=max(2, stage.generator.max_pins_per_net - 1),
+                leg_budget_frac=leg_budget,
                 max_macro_steps=stage.max_macro_steps,
                 max_steps_per_frontier=stage.max_macro_steps,
                 ripup=stage.ripup,
@@ -154,6 +156,10 @@ def main() -> int:
                         "line, charged per completed net across BOTH frontiers")
     p.add_argument("--corner", type=float, default=None,
                    help="per 45-degree octant of bend beyond the first")
+    p.add_argument("--leg-budget", type=float, default=0.0,
+                   help="fraction of the leg geodesic ONE frontier may route "
+                        "before retiring (0.6 = half plus slack; 0 disables). "
+                        "Makes a double-traverse impossible, not just unrewarded")
     p.add_argument("--tip-progress", type=float, default=None,
                    help="dense reward for closing on the partner frontier (the "
                         "other end of the same leg); the only term that charges "
@@ -186,7 +192,8 @@ def main() -> int:
     log_path = ckpt_dir / f"stage{args.stage}.jsonl"
     eval_seeds = EVAL_SEEDS[: args.eval_boards]
 
-    env = make_env(stage, args.batch, dev, seed=1_000 + args.seed)
+    env = make_env(stage, args.batch, dev, seed=1_000 + args.seed,
+                   leg_budget=args.leg_budget)
     policy = PriorPolicy(
         num_layers=stage.layers,
         field_width=args.field_width,
