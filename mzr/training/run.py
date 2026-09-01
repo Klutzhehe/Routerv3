@@ -155,9 +155,6 @@ def main() -> int:
     p.add_argument("--corner", type=float, default=None,
                    help="per 45-degree octant of bend beyond the first")
     p.add_argument("--tip-progress", type=float, default=None,
-                   help="dense weight on closing the distance to this frontier's "
-                        "partner (the other end of its own leg)")
-    p.add_argument("--tip-progress", type=float, default=None,
                    help="dense reward for closing on the partner frontier (the "
                         "other end of the same leg); the only term that charges "
                         "back a redundant traverse")
@@ -204,8 +201,6 @@ def main() -> int:
         stage.reward.tip_progress = args.tip_progress
     if args.leg_progress is not None:
         stage.reward.leg_progress = args.leg_progress
-    if args.tip_progress is not None:
-        stage.reward.tip_progress = args.tip_progress
     if args.wirelength is not None:
         stage.reward.wirelength = args.wirelength
     if args.corner is not None:

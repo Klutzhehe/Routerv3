@@ -14,6 +14,14 @@ it (`--bc-coef`) to blend in expert behaviour cloning, annealed. That decision
 is made from a real plateau on this problem, not from a paper about a different
 one.
 
+Stage `1m` is deliberately **not** on the 0-1-2-3 spine. It holds net count at
+stage 1's three and changes exactly one thing -- nets get up to four pins, so a
+net is a k-1 leg spanning tree rather than a single connection. That isolates
+the one behaviour multi-pin adds: a pin shared by two tree edges hosts two
+frontiers and must be routed *through*, not just reached. Comparing it against
+stage 1 at equal LEG count separates "branch points are hard" from "more legs
+are hard"; run it after stage 1 so there is something to compare against.
+
 Each stage changes `GeneratorConfig` / `WorldConfig` and nothing in the model.
 `gate` is ``("absolute", x)`` for every implemented stage. `kill` is the
 pre-committed "stop, the premise was wrong" line.
@@ -87,6 +95,19 @@ STAGES: dict[str, Stage] = {
         max_macro_steps=64,
         gate=("absolute", 1.0),
         kill="can't clear 0.90 in 3000 updates -> add h/g/f, or --bc-coef 0.5",
+    ),
+    "1m": Stage(
+        name="1m: 3 nets, up to 4 pins each -- multi-pin fan-out",
+        height=48, width=48, layers=2,
+        generator=GeneratorConfig(
+            num_nets=3, num_components=4, pin_pitch_cells=4,
+            multi_pin_frac=0.6, max_pins_per_net=4,
+        ),
+        ripup=_RIPUP,
+        max_macro_steps=48,
+        gate=("absolute", 1.0),
+        kill="can't clear 0.85 in 2000 updates -> the branch point is the problem, "
+             "not net count; compare against stage 1 at equal leg count",
     ),
     "3": Stage(
         name="3: 8 nets, 4 layers, search on",
