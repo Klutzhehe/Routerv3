@@ -20,8 +20,9 @@ corner-guard bug -- a real 0.0828 mm clearance failure, exactly
 another**. A single passing configuration proves much less than it appears to,
 which is why `--configs` sweeps four by default.
 
-Requires `kicad-cli` on PATH (ships with KiCad 7+). On Colab that is
-`apt-get install -y kicad`; the full source build the PNS bridge needs is
+Requires `kicad-cli` on PATH (ships with KiCad 7+). On Colab plain
+`apt-get install -y kicad` is NOT enough -- Ubuntu 22.04 ships KiCad 6.0.2,
+which predates kicad-cli; use `ppa:kicad/kicad-9.0-releases`; the full source build the PNS bridge needs is
 **not** required here, which is the point -- this check is cheap enough to run
 on every change to geometry or design rules.
 
@@ -200,7 +201,9 @@ def main() -> int:
 
     if shutil.which("kicad-cli") is None:
         print("kicad-cli not found on PATH.")
-        print("  Linux/Colab : apt-get install -y kicad")
+        print("  Linux/Colab : add-apt-repository --yes ppa:kicad/kicad-9.0-releases")
+        print("                apt-get update && apt-get install -y --no-install-recommends kicad")
+        print("                (Ubuntu 22.04's own repo has KiCad 6.0.2, which has NO kicad-cli)")
         print('  Windows     : export PATH="$PATH:/c/Program Files/KiCad/9.0/bin"')
         print("                (APPEND, never prepend -- its bundled python shadows the system one)")
         return 2

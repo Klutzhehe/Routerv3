@@ -19,8 +19,16 @@ You are running **MZR** stage-0 training on Google Colab. Read `AGENTS.md` in th
 %cd /content/Routerv3
 !git rev-parse HEAD && git status --porcelain
 !pip -q install torch numpy
-!apt-get -qq update && apt-get -qq install -y kicad
-!kicad-cli --version
+# kicad-cli ships with KiCad 7+. Colab is Ubuntu 22.04, whose universe repo
+# has KiCad 6.0.2 -- which predates kicad-cli entirely, so plain
+# `apt-get install kicad` installs pcbnew and friends and NO kicad-cli.
+# The official PPA is the only route. ~36s with --no-install-recommends,
+# which skips demos/footprints/symbols the DRC gate does not read.
+!apt-get -qq install -y software-properties-common
+!add-apt-repository --yes ppa:kicad/kicad-9.0-releases
+!apt-get -qq update
+!DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends kicad
+!kicad-cli --version   # must print 9.x -- if it says 6.x or 'not found', stop
 ```
 
 ```python
