@@ -119,3 +119,45 @@ If the analysis is right, copper/ideal should fall to ~1.0-1.1x **without any
 reward term aimed at it**, because a frontier physically cannot walk past copper
 it is being drawn toward. If it does not, the diagnosis in this document is
 wrong and the reward patches were treating something else.
+
+## Prior art -- this is standard routing practice, not a new idea
+
+The confidence in this proposal comes from it being the established treatment of
+multi-terminal nets in production routers, not from novelty.
+
+* **McMurchie & Ebeling, "PathFinder: A Negotiation-Based Performance-Driven
+  Router for FPGAs", FPGA'95** -- the negotiated-congestion foundation this
+  repo's price model already follows.
+  <https://www.cecs.uci.edu/~papers/compendium94-03/papers/1995/fpga95/pdffiles/6a.pdf>
+* **VPR / VTR's Adaptive Incremental Router** is the confirmation of the
+  mechanism proposed here: it routes a multi-sink net by *"only inserting
+  portions of the routing tree of such nets into the priority queue when routing
+  remaining connections"* -- that is, later sinks are searched for from the
+  net's **already-laid routing**, not from its source pin. "Distance to the
+  net's live copper" is precisely this, expressed as a field instead of a
+  priority queue.
+  <https://dl.acm.org/doi/fullHtml/10.1145/3406959>
+* **Hwang's rectilinear Steiner ratio = 3/2** -- a rectilinear minimum spanning
+  tree can be up to 1.5x the length of the rectilinear Steiner minimum tree.
+  This is a proven bound, and it is the length the MST decomposition in
+  `9f4b5ba` gives away *before routing starts*. Seeding from copper recovers it
+  without computing a Steiner tree, because a frontier stops at the nearest
+  copper -- which is generally not a pin, i.e. a Steiner point.
+  <https://en.wikipedia.org/wiki/Rectilinear_Steiner_tree>
+* **Lee-style maze routing on multi-terminal nets** expands the wavefront from
+  the whole existing net rather than a single cell, for the same reason.
+  <https://sites.math.unt.edu/~sgao/pub/paper15.pdf>
+
+**What is NOT precedented**: doing this inside a *learned* simultaneous-frontier
+policy. The RL-for-PCB literature -- XRoute (arXiv 2305.13823), the escape-routing
+DQN work, DeepPCB -- routes pin-to-pin. So the routing technique is proven and
+the RL combination is not; the risk lives in the combination and in refresh cost,
+not in whether copper-seeded search is the right formulation.
+
+## Calibration, stated before running anything
+
+* correct architecture for multi-pin -- **high** (reference implementation exists)
+* removes double-routing -- **high** (direct mechanism: A's copper is in B's
+  field the step it is laid)
+* affordable once the field stops being static -- **medium**. This is the real
+  risk and the one to measure first.
