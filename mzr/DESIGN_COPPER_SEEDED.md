@@ -161,3 +161,36 @@ not in whether copper-seeded search is the right formulation.
   field the step it is laid)
 * affordable once the field stops being static -- **medium**. This is the real
   risk and the one to measure first.
+
+## Measured: the kernel, and what the refresh actually costs
+
+`geometry.geodesic_field_multi` is built and verified (step 1 of the migration).
+Three properties, all exact:
+
+* **single-source parity** with the existing `geodesic_field`: max |diff| = 0.0,
+  identical `inf` pattern. It is a strict generalisation; nothing regresses.
+* **monotone decrease**: adding a source only ever shortens distances. This is
+  what makes an incremental refresh *valid*.
+* **incremental == full recompute**: relaxing from the previous field after
+  adding sources gives max |diff| = 0.0 against a rebuild from `inf`.
+
+Cost per episode at stage-3 scale (8 nets, 4 layers, 64x64, 48 macro-steps),
+CPU, coarse ds=4:
+
+| | fields held | per-episode field time |
+|---|---|---|
+| today (static, one build) | 256 per-frontier | 160 ms |
+| new, refresh every macro-step | 64 per-net | 1866 ms (**11.7x**) |
+| new, refresh every 4 | 64 | 498 ms (3.1x) |
+| new, refresh every 8 | 64 | 270 ms (1.7x) |
+| new, refresh every 16 | 64 | 156 ms (0.98x) |
+
+**Refreshing every step is not affordable** -- that must be said plainly, since
+the earlier draft of this document implied the incremental path made the cost
+disappear. It does not; it makes it tunable. Memory falls 4x regardless (256
+fields -> 64), and a cadence of 8-16 buys the whole architecture for roughly
+today's field budget.
+
+A stale field is a *shaping* inaccuracy, never a legality one -- the engine
+validates every move against live occupancy -- so cadence is a quality/speed
+knob, exactly as `--geodesic-refresh` was in `neuroroute`. Start at 8.

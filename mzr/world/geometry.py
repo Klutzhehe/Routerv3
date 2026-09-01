@@ -438,6 +438,118 @@ def step_safety(free_units: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def geodesic_field_multi(
+    blocked: torch.Tensor,
+    sources: torch.Tensor,
+    *,
+    prev: torch.Tensor | None = None,
+    iterations: int = 96,
+    via_cost: float = 4.0,
+    downsample: int = 4,
+    upsample: bool = True,
+) -> torch.Tensor:
+    """Cost-to-go to the **nearest of many source cells**, batched.
+
+    This is the kernel `mzr/DESIGN_COPPER_SEEDED.md` is built on. Seeding the
+    relaxation from every cell a net currently owns -- its pads *and* all copper
+    laid so far -- rather than from one static pad is the standard treatment of
+    a multi-terminal net: VPR's incremental router routes a multi-sink net by
+    inserting the net's already-laid routing tree into the priority queue when
+    routing the remaining connections. A field is the same statement without a
+    queue.
+
+    Three things follow from it, and they are the reason it is worth the cost:
+
+    * A k-pin net needs **one** field, not `2(k-1)` -- and `fr_geo` is the
+      dominant memory term in the system.
+    * A frontier heads for the nearest *copper*, which is generally not a pin,
+      so junctions land at Steiner points without computing a Steiner tree.
+      Hwang's rectilinear Steiner ratio bounds what an MST gives away at 3/2.
+    * Two frontiers of one net are drawn **to each other's copper** the step it
+      is laid, so they cannot mirror-route past each other -- the double-routing
+      bug that four separate reward patches failed to remove.
+
+    Parameters
+    ----------
+    blocked : (M, L, H, W) bool -- cells this net may not enter.
+    sources : (M, L, H, W) bool -- cells at distance zero. A coarse cell counts
+        as a source if *any* fine cell in it does, which is the opposite of the
+        rule for `blocked` (all-or-nothing) and correct for the same reason:
+        never claim a corridor is closed, never lose a source.
+    prev : optional coarse field from the previous call. Adding copper can only
+        **decrease** distance-to-copper, so a refresh may start from the old
+        field and relax down rather than recompute from `inf`. That is what
+        makes a non-static field affordable.
+
+    Returns
+    -------
+    Same convention as `geodesic_field`.
+    """
+    m, L, H, W = blocked.shape
+    ds = max(1, int(downsample))
+    h, w = max(1, H // ds), max(1, W // ds)
+
+    if ds > 1:
+        coarse = (
+            F.max_pool2d(
+                (~blocked).reshape(m * L, 1, H, W).float(), kernel_size=ds, stride=ds
+            )
+            .reshape(m, L, h, w)
+            .le(0.5)
+        )
+        src = (
+            F.max_pool2d(sources.reshape(m * L, 1, H, W).float(), kernel_size=ds, stride=ds)
+            .reshape(m, L, h, w)
+            .gt(0.5)
+        )
+    else:
+        coarse, src = blocked, sources
+
+    if prev is None:
+        dist = torch.full((m, L, h, w), float("inf"), device=blocked.device, dtype=torch.float32)
+    else:
+        dist = prev.clone().float()
+    dist = torch.where(src, torch.zeros_like(dist), dist)
+
+    neg_inf = -1e9
+    for _ in range(iterations):
+        nd = torch.where(torch.isinf(dist), torch.full_like(dist, neg_inf), -dist)
+        pooled = F.max_pool2d(nd.reshape(m * L, 1, h, w), 3, stride=1, padding=1)
+        cand = -pooled.reshape(m, L, h, w) + 1.0
+
+        if L > 1:
+            up = torch.full_like(dist, float("inf"))
+            dn = torch.full_like(dist, float("inf"))
+            up[:, :-1] = dist[:, 1:] + via_cost
+            dn[:, 1:] = dist[:, :-1] + via_cost
+            cand = torch.minimum(cand, torch.minimum(up, dn))
+
+        cand = torch.where(coarse, torch.full_like(cand, float("inf")), cand)
+        new = torch.minimum(dist, cand)
+        new = torch.where(src, torch.zeros_like(new), new)
+        if torch.equal(new, dist):
+            dist = new
+            break
+        dist = new
+
+    if not upsample:
+        return dist
+    return _upsample_field(dist, m, L, H, W, ds)
+
+
+def _upsample_field(dist, m, L, H, W, ds):
+    """Coarse (m, L, h, w) -> fine (m, L, H, W), in fine cell units."""
+    if ds <= 1:
+        return dist
+    h, w = dist.shape[-2:]
+    finite = torch.isfinite(dist)
+    filled = torch.where(finite, dist, torch.zeros_like(dist))
+    up = F.interpolate(filled.reshape(m * L, 1, h, w), size=(H, W), mode="bilinear", align_corners=False)
+    reach = F.interpolate(finite.reshape(m * L, 1, h, w).float(), size=(H, W), mode="bilinear", align_corners=False)
+    out = torch.where(reach > 0.25, up / reach.clamp_min(1e-6), torch.full_like(up, float("inf")))
+    return out.reshape(m, L, H, W) * ds
+
+
 def geodesic_field(
     blocked: torch.Tensor,
     target_layer: torch.Tensor,
