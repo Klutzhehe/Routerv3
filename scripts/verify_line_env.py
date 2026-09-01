@@ -33,7 +33,7 @@ def test_env(board_path: str, verbose: bool = True) -> bool:
         env = LineRouteEnv(
             board_path=board_path,
             track_width_nm=250_000,
-            max_steps=100,
+            max_steps_per_net=100,
             reward_weights=RewardWeights(),
         )
     except Exception as e:
