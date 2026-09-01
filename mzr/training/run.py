@@ -162,6 +162,10 @@ def main() -> int:
                         "line, charged per completed net across BOTH frontiers")
     p.add_argument("--corner", type=float, default=None,
                    help="per 45-degree octant of bend beyond the first")
+    p.add_argument("--max-macro-steps", type=int, default=None,
+                   help="override the stage's episode length. Single-ended "
+                        "(copper-seeded) growth needs roughly double, since one "
+                        "frontier covers the whole route instead of two halves")
     p.add_argument("--copper-seeded", action="store_true",
                    help="one field per NET (distance to its trunk) instead of one "
                         "per frontier targeting a static pad; implies trunk+spokes. "
@@ -198,6 +202,8 @@ def main() -> int:
 
     torch.manual_seed(args.seed)
     stage = STAGES[args.stage]
+    if args.max_macro_steps is not None:
+        stage.max_macro_steps = args.max_macro_steps
     dev = args.device
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
