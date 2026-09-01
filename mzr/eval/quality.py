@@ -105,39 +105,71 @@ def route_quality(world) -> dict:
     }
 
 
-@torch.no_grad()
-def action_profile(policy, obs) -> dict:
-    """What the policy chooses, and how collapsed each head is.
+class ProfileAccumulator:
+    """What the policy chose, accumulated ACROSS an episode.
 
-    `dir_d0_frac` is the number that matters. `d0` is defined as "one cell down
-    the geodesic gradient", so a policy at d0_frac == 1.0 is a *field
-    follower*: it has learned when to step far and when to via, and nothing
-    about steering. It can only avoid obstacles the geodesic field already
-    avoids, which means it has no mechanism for the one thing stage 1 asks for
-    -- leaving a channel because another net needs it more.
+    It has to be accumulated per step, not read at the end. Measured the hard
+    way: sampling the profile from the post-rollout observation averages over
+    zero live frontiers (they have all retired), which reports d0_frac 0%,
+    0 distinct directions and entropy 0.000 for *every* policy -- failing a
+    good one and a collapsed one identically. A metric that reads zero for
+    everybody is worse than no metric.
 
-    Measured on a gate-passing stage-0 checkpoint: 1.000. Completion was 0.99.
+    `dir_d0_frac` is the number that matters. `d0` is "one cell down the
+    geodesic gradient", so a policy at 1.0 is a FIELD FOLLOWER: it has learned
+    when to step far and when to via, and nothing about steering. It can only
+    avoid what the geodesic field already avoids -- so it has no mechanism for
+    what stage 1 is entirely about, leaving a channel because another net needs
+    it more. Measured on a stage-0 checkpoint at 0.99 completion: 317 of 317
+    actions were d0.
     """
-    out = policy.forward(obs)
-    live = obs.frontier_mask
-    n_live = live.float().sum().clamp_min(1.0)
 
-    ent = {}
-    for k, lg in out.logits.items():
-        d = torch.distributions.Categorical(logits=lg)
-        ent[f"ent_{k}"] = float((d.entropy().detach() * live.float()).sum() / n_live)
+    def __init__(self) -> None:
+        self.n = 0
+        self.d0 = 0
+        self.dirs: set[int] = set()
+        self.step_sum = 0.0
+        self.via = 0
+        self.ent_sum: dict[str, float] = {}
+        self.ent_n = 0
 
-    act = policy.act(obs, deterministic=True)["action"]
-    d = act["direction"][live]
-    n = max(1, d.numel())
-    prof = {
-        "dir_d0_frac": float((d == 0).sum()) / n,
-        "dir_distinct": int(torch.unique(d).numel()),
-        "step_mean": float(act["step"][live].float().mean()) if n else float("nan"),
-        "via_frac": float((act["layer"][live] > 0).float().mean()) if n else float("nan"),
-    }
-    prof.update(ent)
-    return prof
+    @torch.no_grad()
+    def update(self, policy, obs, action=None) -> None:
+        live = obs.frontier_mask
+        n_live = int(live.sum())
+        if n_live == 0:
+            return
+
+        out = policy.forward(obs)
+        for k, lg in out.logits.items():
+            d = torch.distributions.Categorical(logits=lg)
+            e = float((d.entropy().detach() * live.float()).sum() / max(n_live, 1))
+            self.ent_sum[k] = self.ent_sum.get(k, 0.0) + e
+        self.ent_n += 1
+
+        if action is None:
+            action = policy.act(obs, deterministic=True)["action"]
+        d = action["direction"][live]
+        self.n += int(d.numel())
+        self.d0 += int((d == 0).sum())
+        self.dirs.update(int(x) for x in torch.unique(d).tolist())
+        self.step_sum += float(action["step"][live].float().sum())
+        self.via += int((action["layer"][live] > 0).sum())
+
+    def result(self) -> dict:
+        n = max(1, self.n)
+        out = {
+            "dir_d0_frac": self.d0 / n,
+            "dir_distinct": len(self.dirs),
+            "step_mean": self.step_sum / n,
+            "via_frac": self.via / n,
+            "actions_seen": self.n,
+        }
+        m = max(1, self.ent_n)
+        for k, v in self.ent_sum.items():
+            out[f"ent_{k}"] = v / m
+        out.setdefault("ent_direction", 0.0)
+        return out
 
 
 def quality_verdict(q: dict, prof: dict, *, max_copper: float, max_right_angle: float,
@@ -155,7 +187,10 @@ def quality_verdict(q: dict, prof: dict, *, max_copper: float, max_right_angle: 
         fails.append(f"right_angle {q['right_angle_frac']:.2f} > {max_right_angle}")
     if q["doubled"]:
         fails.append(f"{q['doubled']} double-routed")
-    if not (prof["ent_direction"] >= min_dir_entropy):
+    if not prof.get("actions_seen", 0):
+        # Nothing was observed; do not manufacture a verdict from an empty set.
+        fails.append("no live actions sampled -- profile is empty, not collapsed")
+    elif not (prof["ent_direction"] >= min_dir_entropy):
         fails.append(
             f"direction head collapsed (entropy {prof['ent_direction']:.3f} < "
             f"{min_dir_entropy}, d0 {prof['dir_d0_frac']:.0%}) -- following the "

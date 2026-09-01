@@ -35,7 +35,7 @@ import torch
 
 from mzr.env.route_env import EnvConfig, RouteEnv
 from mzr.models.policy import PriorPolicy
-from mzr.eval.quality import action_profile, quality_verdict, route_quality
+from mzr.eval.quality import ProfileAccumulator, quality_verdict, route_quality
 from mzr.training.curriculum import EVAL_SEEDS, STAGES
 from mzr.training.ppo import PPOConfig, RolloutBuffer, ppo_update
 from mzr.world.engine import WorldConfig
@@ -95,11 +95,16 @@ def evaluate(policy, stage, device: str, eval_seeds: list[int], with_sampled: bo
 
     out: dict = {}
     arms = [("argmax", True)] + ([("sampled", False)] if with_sampled else [])
-    obs = None
+    prof = ProfileAccumulator()
     for arm, det in arms:
         obs = env.reset(seeds=eval_seeds)
         while True:
-            step = env.step(policy.act(obs, deterministic=det)["action"])
+            action = policy.act(obs, deterministic=det)["action"]
+            # Sampled per step while frontiers are still live -- reading this
+            # after the loop averages over an empty set. See ProfileAccumulator.
+            if arm == "argmax":
+                prof.update(policy, obs, action)
+            step = env.step(action)
             obs = step.obs
             if step.done:
                 break
@@ -115,7 +120,7 @@ def evaluate(policy, stage, device: str, eval_seeds: list[int], with_sampled: bo
             # well and whether the policy is steering or just following the
             # geodesic field. See mzr/eval/quality.py for why both are gated.
             out.update(route_quality(env.world))
-            out.update(action_profile(policy, obs))
+            out.update(prof.result())
     if not with_sampled:
         out["sampled_completion"] = out["argmax_completion"]
         out["sampled_perfect"] = out["argmax_perfect"]
