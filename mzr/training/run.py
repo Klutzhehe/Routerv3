@@ -263,8 +263,17 @@ def main() -> int:
                 print("optimizer state shape mismatch -- Adam cold")
         else:
             print(f"partial load ({len(missing)} missing, {len(unexpected)} unexpected) -- Adam cold")
+        # A torch optimizer's state_dict carries `lr` inside param_groups, so
+        # load_state_dict above silently overwrites the --lr just passed on the
+        # command line. That makes the documented remedy for a kl blow-up
+        # ("kl spiking > 0.2 -> try --lr 1.5e-4", ANTIGRAVITY_PROMPT.md) a
+        # no-op on exactly the runs that need it -- and the run then reports
+        # that a lower LR did not help, which is a wrong conclusion rather
+        # than a null one. Re-assert the requested LR after the load.
+        for g in opt.param_groups:
+            g["lr"] = args.lr
         start, best = blob.get("update", 0), blob.get("best", -1.0)
-        print(f"resumed from update {start}, best {best:.3f}")
+        print(f"resumed from update {start}, best {best:.3f}, lr {args.lr:g}")
 
     kind, thr = stage.gate
     print(f"stage {args.stage}: {stage.name}")
