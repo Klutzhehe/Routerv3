@@ -68,15 +68,29 @@ class Stage:
     #: policy that "passed".
     max_right_angle: float = 0.15
     #: Ceiling on the fraction of actions that are `d0` -- straight down the
-    #: geodesic gradient. This is THE steering check: a policy at 1.0 has
-    #: learned step size and vias and no navigation, and can only avoid what
-    #: the field already avoids.
+    #: geodesic gradient.
     #:
-    #: 0.95 is a deliberately low bar -- the field IS mostly right, so a good
-    #: policy still picks d0 often. It asks that the head deviate at all. The
-    #: measured collapsed policy sat at 1.000, using 2 of 8 directions across
-    #: an entire eval.
-    max_d0_frac: float = 0.95
+    #: **Default 1.0 (disabled), and deliberately so.** This started life as
+    #: "the steering check", on the hypothesis that a direction head collapsed
+    #: on d0 meant the policy had learned no obstacle avoidance. A stage-0 run
+    #: tested that hypothesis and refuted it, over 28 evals:
+    #:
+    #:     group                  n    completion  right-angle  copper
+    #:     d0 <= 95% (steering)   7    0.8771      51.3%        1.126x
+    #:     d0 >  95% (following)  21   0.9159      47.9%        1.098x
+    #:     correlation(d0, completion) = +0.260
+    #:
+    #: Steering correlated with WORSE results on every axis, and the best eval
+    #: of the run -- completion 1.000, copper 1.049x, right-angle 16% -- was a
+    #: pure field follower at d0 = 100%. On one net with a correct geodesic
+    #: field, following the field IS the optimal policy, and the route quality
+    #: comes from choosing step sizes well rather than from deviating. Gating
+    #: on d0 at stage 0 would fail a good policy for being right.
+    #:
+    #: It becomes meaningful from stage 1, where the field cannot see other
+    #: nets' live copper and yielding a channel REQUIRES leaving your own
+    #: gradient -- so the stages that need it set it explicitly below.
+    max_d0_frac: float = 1.0
     #: Secondary: entropy floor, to catch a head that is dead rather than
     #: merely decisive. Kept LOW and not relied on -- the collapsed policy
     #: measured 0.410 against this 0.40 and scraped through, because the
@@ -117,6 +131,10 @@ STAGES: dict[str, Stage] = {
         max_macro_steps=48,
         gate=("absolute", 1.0),
         kill="can't clear 0.90 in 2000 updates -> simultaneous premise is weak; try --bc-coef 0.5",
+        # Steering is required here: the geodesic field does not
+        # contain other nets' live copper, so yielding a channel
+        # means leaving your own gradient. See Stage.max_d0_frac.
+        max_d0_frac=0.95,
     ),
     "2": Stage(
         name="2: 5 nets, 4 layers",
@@ -126,6 +144,10 @@ STAGES: dict[str, Stage] = {
         max_macro_steps=64,
         gate=("absolute", 1.0),
         kill="can't clear 0.90 in 3000 updates -> add h/g/f, or --bc-coef 0.5",
+        # Steering is required here: the geodesic field does not
+        # contain other nets' live copper, so yielding a channel
+        # means leaving your own gradient. See Stage.max_d0_frac.
+        max_d0_frac=0.95,
     ),
     "1m": Stage(
         name="1m: 3 nets, up to 4 pins each -- multi-pin fan-out",
@@ -139,6 +161,10 @@ STAGES: dict[str, Stage] = {
         gate=("absolute", 1.0),
         kill="can't clear 0.85 in 2000 updates -> the branch point is the problem, "
              "not net count; compare against stage 1 at equal leg count",
+        # Steering is required here: the geodesic field does not
+        # contain other nets' live copper, so yielding a channel
+        # means leaving your own gradient. See Stage.max_d0_frac.
+        max_d0_frac=0.95,
     ),
     "3": Stage(
         name="3: 8 nets, 4 layers, search on",
@@ -148,6 +174,10 @@ STAGES: dict[str, Stage] = {
         max_macro_steps=64,
         gate=("absolute", 1.0),
         kill="prior can't clear 0.85 -> search is being built on a weak prior; --bc-coef 0.3",
+        # Steering is required here: the geodesic field does not
+        # contain other nets' live copper, so yielding a channel
+        # means leaving your own gradient. See Stage.max_d0_frac.
+        max_d0_frac=0.95,
     ),
 }
 
