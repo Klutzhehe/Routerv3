@@ -694,7 +694,17 @@ def test_prior_policy_is_greedy_at_init_and_ppo_consistent() -> None:
         f"max delta {float((ev['logp'] - sampled['logp']).abs().max()):.1e}",
     )
 
-    loss = -ev["logp"].sum() + ev["value"].pow(2).sum() - 0.01 * ev["entropy"]
+    # The per-frontier value head is only reached through `value_f`, so a loss
+    # built from `value` alone leaves it grad-less and this check calls a
+    # healthy head dead. It fired that way from the moment --per-frontier-adv
+    # landed: ppo.py trains value_frontier at the `if per_frontier:` branch,
+    # and the synthetic loss here was never widened to match.
+    loss = (
+        -ev["logp"].sum()
+        + ev["value"].pow(2).sum()
+        + ev["value_f"].pow(2).sum()
+        - 0.01 * ev["entropy"]
+    )
     loss.backward()
     no_grad = [n for n, q in pol.named_parameters() if q.grad is None]
     check("every policy parameter receives gradient", not no_grad, f"{len(no_grad)} without grad")
