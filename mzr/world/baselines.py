@@ -90,7 +90,8 @@ def layer_hop_action(world) -> torch.Tensor:
     M = B * F
     ds = world.cfg.geodesic_downsample
 
-    fld = world.fr_geo.reshape(M, L, *world._geo_shape).float()
+    fld = (world._frontier_field() if world.cfg.copper_seeded
+           else world.fr_geo.reshape(M, L, *world._geo_shape).float())
     pos = world.fr_pos.reshape(M, 3)
     cur = pos[:, 0]
 

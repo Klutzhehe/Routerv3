@@ -204,7 +204,8 @@ def build_observation(world) -> Observation:
     kind = world.net_kind.gather(1, net)
     is_pair = kind == KIND_DIFF_PAIR
 
-    fld = world.fr_geo.reshape(M, L, *world._geo_shape).float()
+    fld = (world._frontier_field() if world.cfg.copper_seeded
+           else world.fr_geo.reshape(M, L, *world._geo_shape).float())
     tgt = world._target_pad().reshape(M, 3)
 
     # --- exact local geometry, recomputed every step ------------------------

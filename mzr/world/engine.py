@@ -115,6 +115,18 @@ class WorldConfig:
     #: constraint, tip-distance is the dense gradient that teaches the policy
     #: how to satisfy it. A constraint with no gradient only produces failures.
     leg_budget_frac: float = 0.0
+    #: Copper-seeded fields (mzr/DESIGN_COPPER_SEEDED.md). One field per NET --
+    #: distance to that net's TRUNK, the connected component holding pin 0 --
+    #: instead of one per frontier targeting a static pad.
+    #:
+    #: Implies trunk+spokes: only the far end of each leg grows, toward copper
+    #: that already exists. Double-routing stops being possible rather than
+    #: being penalised, which is what four reward patches failed to achieve.
+    copper_seeded: bool = False
+    #: Macro-steps between field refreshes when `copper_seeded`. Measured cost
+    #: at stage-3 scale: cadence 1 is 11.7x today's static build, 8 is 1.7x,
+    #: 16 is ~1.0x. A stale field is a shaping inaccuracy, never a legality one.
+    geodesic_refresh: int = 16
     #: Cells within which a frontier may snap onto its target pad, or onto its
     #: partner frontier. MUST be >= max(STEP_LENGTHS) / 2, or a long step jumps
     #: clean over the snap zone and the frontier orbits its target forever -- a
@@ -273,6 +285,11 @@ class SimultaneousRouterWorld:
         # ~32 coarse cells across) so half precision is ample, and the cache is
         # the dominant memory term once every net is live at once -- (B, F, L,
         # h, w) grows with net count where NeuroRoute's grew with slot count.
+        self.net_geo = (
+            torch.full((B, N, L, *self._geo_shape), float("inf"),
+                       dtype=torch.float16, device=dev)
+            if cfg.copper_seeded else None
+        )
         self.fr_geo = torch.full(
             (B, F, L, h, w), float("inf"), dtype=torch.float16, device=dev
         )
@@ -391,7 +408,10 @@ class SimultaneousRouterWorld:
         )
 
         self._seed_frontiers(self.net_valid)
-        self._refresh_geodesic(self.fr_alive)
+        if self.cfg.copper_seeded:
+            self._refresh_net_geo(incremental=False)
+        else:
+            self._refresh_geodesic(self.fr_alive)
         self._seed_leg_gap()
 
     def _seed_frontiers(self, net_mask: torch.Tensor) -> None:
@@ -403,7 +423,15 @@ class SimultaneousRouterWorld:
         """
         B, N = net_mask.shape
         alive = net_mask.view(B, N, 1, 1) & self.leg_valid.view(B, N, self.cfg.max_legs, 1)
-        alive = alive.expand(B, N, self.cfg.max_legs, NUM_ENDS).reshape(B, self.F)
+        alive = alive.expand(B, N, self.cfg.max_legs, NUM_ENDS)
+        if self.cfg.copper_seeded:
+            # Trunk+spokes: pin 0 (END_SRC) IS the trunk, so it does not grow --
+            # a frontier standing on its own source has no gradient. Only the
+            # far end advances, toward copper that already exists.
+            spoke = torch.zeros_like(alive)
+            spoke[..., END_DST] = True
+            alive = alive & spoke
+        alive = alive.reshape(B, self.F)
         pos = self.net_pad.view(B, self.F, 3)
 
         self.fr_alive = torch.where(alive, torch.ones_like(alive), self.fr_alive & ~alive)
@@ -426,6 +454,62 @@ class SimultaneousRouterWorld:
         B = self.cfg.batch_size
         pad = self.net_pad  # (B, N, 2, ends, 3)
         return pad.flip(dims=[3]).reshape(B, self.F, 3)
+
+    def _net_trunk(self) -> torch.Tensor:
+        """(B, N, L, H, W) bool -- each net's trunk: the component holding pin 0.
+
+        Seeding the field from ALL of a net's copper would make a frontier's own
+        trail a source, so its distance would be ~0 and the field would carry no
+        gradient (measured: 10.0 to the trunk vs 0.0 to all copper). VPR routes
+        each sink to the net's *existing* tree for the same reason.
+        """
+        B, N = self.cfg.batch_size, self.cfg.max_nets
+        L, H, W = self.shape
+        ids = torch.arange(N, device=self.device).view(1, N, 1, 1, 1) + 1
+        owned = self.occ.unsqueeze(1) == ids                       # (B,N,L,H,W)
+        seed = torch.zeros_like(owned)
+        p0 = self.net_pad[:, :, 0, END_SRC]                        # (B,N,3)
+        bb = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
+        nn = torch.arange(N, device=self.device).view(1, N).expand(B, N)
+        seed[bb, nn, p0[..., 0], p0[..., 1], p0[..., 2]] = True
+        return geo.flood_component(owned.reshape(B * N, L, H, W),
+                                   (seed & owned).reshape(B * N, L, H, W)
+                                   ).reshape(B, N, L, H, W)
+
+    def _refresh_net_geo(self, *, incremental: bool = True) -> None:
+        """Rebuild each net's distance-to-trunk field."""
+        B, N = self.cfg.batch_size, self.cfg.max_nets
+        L, H, W = self.shape
+        trunk = self._net_trunk().reshape(B * N, L, H, W)
+        ids = torch.arange(N, device=self.device).view(1, N, 1, 1, 1) + 1
+        occ5 = self.occ.unsqueeze(1)
+        blocked = ((occ5 != OCC_FREE) & (occ5 != ids)).reshape(B * N, L, H, W)
+        prev = (
+            self.net_geo.reshape(B * N, L, *self._geo_shape).float()
+            if incremental and self.net_geo is not None else None
+        )
+        if prev is not None and not torch.isfinite(prev).any():
+            prev = None
+        fld = geo.geodesic_field_multi(
+            blocked, trunk, prev=prev,
+            iterations=self.cfg.geodesic_iterations if prev is None else 24,
+            via_cost=VIA_LENGTH_COST,
+            downsample=self.cfg.geodesic_downsample,
+            upsample=False,
+        )
+        self.net_geo = fld.reshape(B, N, L, *self._geo_shape).to(torch.float16)
+
+    def _frontier_field(self) -> torch.Tensor:
+        """(B*F, L, h, w) -- each frontier's view of its own net's field.
+
+        A transient gather. The persistent store stays (B, N, ...), which is
+        where the memory win lives: 4x fewer fields at stage-3 scale.
+        """
+        B, F = self.cfg.batch_size, self.F
+        f_idx = torch.arange(F, device=self.device)
+        n_idx = (f_idx // (self.cfg.max_legs * NUM_ENDS)).view(1, F).expand(B, F)
+        b_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, F)
+        return self.net_geo[b_idx.reshape(-1), n_idx.reshape(-1)].float()
 
     def _refresh_geodesic(self, mask: torch.Tensor) -> None:
         """Recompute cached cost-to-go for the masked frontiers.
@@ -528,7 +612,8 @@ class SimultaneousRouterWorld:
         free = geo.raycast(
             self.occ, bb, pos[:, 0], pos[:, 1], pos[:, 2], n_i, self.tables, w_i
         )
-        fld = self.fr_geo.reshape(M, L, *self._geo_shape).float()
+        fld = (self._frontier_field() if self.cfg.copper_seeded
+               else self.fr_geo.reshape(M, L, *self._geo_shape).float())
         return geo.bearing_from_field(
             fld,
             pos[:, 0],
@@ -719,6 +804,12 @@ class SimultaneousRouterWorld:
         nets_done = self._retire(net_done, STATUS_DONE)
         nets_failed = self._retire(net_failed, STATUS_FAILED)
 
+        if (
+            self.cfg.copper_seeded
+            and self.step_count % max(1, self.cfg.geodesic_refresh) == 0
+        ):
+            self._refresh_net_geo()
+
         self.step_count += 1
         r = self.cfg.ripup
         if r.interval > 0 and self.step_count % r.interval == 0:
@@ -856,7 +947,8 @@ class SimultaneousRouterWorld:
         self.fr_pos = pos.view(B, F, 3)
         self._append_vertex(pos, go)
 
-        fld = self.fr_geo.reshape(M, L, *self._geo_shape).float()
+        fld = (self._frontier_field() if self.cfg.copper_seeded
+               else self.fr_geo.reshape(M, L, *self._geo_shape).float())
         new_dist = self._geo_at(fld, pos)
         prev = self.fr_prev.reshape(M)
         prog = torch.where(plan.live, prev - new_dist, torch.zeros_like(prev))
