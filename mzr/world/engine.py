@@ -517,6 +517,7 @@ class SimultaneousRouterWorld:
             upsample=False,
         )
         self.net_geo = fld.reshape(B, N, L, *self._geo_shape).to(torch.float16)
+        self._rebaseline_fr_prev()
 
         if self.cfg.dual_ended:
             # The mirror field: everything this net owns that is NOT yet part
@@ -537,6 +538,36 @@ class SimultaneousRouterWorld:
                 upsample=False,
             )
             self.net_geo_tip = fld_t.reshape(B, N, L, *self._geo_shape).to(torch.float16)
+
+    def _rebaseline_fr_prev(self) -> None:
+        """Re-measure every frontier's distance against the NEW field.
+
+        `_commit` computes progress as ``fr_prev - new_dist``, which telescopes
+        to (initial distance - final distance) and is what makes the shaping
+        potential-based, hence policy-invariant (Ng et al.). That guarantee
+        assumes ONE fixed potential. Copper-seeding rebuilds the field every
+        `geodesic_refresh` steps, and without this the next `_commit` compares
+        a `fr_prev` measured against the OLD field to a `new_dist` measured
+        against the NEW one -- charging the field's own change to the frontier
+        as if it had moved there.
+
+        Measured before this existed, on 64 boards the policy completed 100%:
+
+            sum(progress)          =   -51.56 cells
+            positive / negative    =  +991.87 / -1043.44
+
+        A frontier that walks ~30 cells to its pad must telescope to about
+        +30. Instead ~2035 cells of distance-change churned to net -52, and the
+        main navigation signal was substantially field-refresh artefact rather
+        than movement. Re-baselining makes progress measure only what the
+        frontier did.
+        """
+        if self.net_geo is None:
+            return
+        B, F = self.cfg.batch_size, self.F
+        M = B * F
+        fld = self._frontier_field()
+        self.fr_prev = self._geo_at(fld, self.fr_pos.reshape(M, 3)).view(B, F)
 
     def _frontier_field(self) -> torch.Tensor:
         """(B*F, L, h, w) -- each frontier's view of its own net's field.

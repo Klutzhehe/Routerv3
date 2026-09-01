@@ -694,6 +694,48 @@ def test_prior_policy_is_greedy_at_init_and_ppo_consistent() -> None:
         f"max delta {float((ev['logp'] - sampled['logp']).abs().max()):.1e}",
     )
 
+    # Progress shaping must telescope. `_commit` computes fr_prev - new_dist,
+    # so over an episode it must sum to (initial distance - final distance).
+    # That identity is what makes the shaping potential-based and therefore
+    # policy-invariant, and it silently stops holding the moment the potential
+    # itself changes -- which copper-seeding does every `geodesic_refresh`
+    # steps. Measured before `_rebaseline_fr_prev` existed: 64 boards at 100%
+    # completion summed progress to -51.56 cells, with +991.87 / -1043.44 of
+    # churn, so most of the navigation signal was refresh artefact.
+    import mzr.world.engine as _E
+
+    caught = []
+    _orig_step = _E.SimultaneousRouterWorld.step
+
+    def _spy(self, *a, **k):
+        r = _orig_step(self, *a, **k)
+        caught.append(float((r.progress * r.live.float()).sum()))
+        return r
+
+    _E.SimultaneousRouterWorld.step = _spy
+    try:
+        env3 = RouteEnv(cfg)
+        obs3 = env3.reset(seeds=[21, 22, 23, 24])
+        d0_sum = float(env3.world.fr_prev.sum())
+        for _ in range(cfg.max_episode_steps):
+            s3 = env3.step(pol.act(obs3, deterministic=True)["action"])
+            obs3 = s3.obs
+            if s3.done:
+                break
+        dend_sum = float(env3.world.fr_prev.sum())
+    finally:
+        _E.SimultaneousRouterWorld.step = _orig_step
+
+    prog_sum = sum(caught)
+    # Retired frontiers stop contributing, so this is a bound rather than an
+    # equality: what must not happen is a large NEGATIVE sum, which means the
+    # potential moved under the policy.
+    check(
+        "progress shaping telescopes (potential is stationary across refreshes)",
+        prog_sum > -1.0,
+        f"sum(progress) {prog_sum:+.2f} cells, fr_prev {d0_sum:.1f} -> {dend_sum:.1f}",
+    )
+
     # -- the quality instrumentation itself ------------------------------
     #
     # These check the METRICS, not the policy. An untrained policy is
