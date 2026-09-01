@@ -356,13 +356,26 @@ class PriorPolicy(nn.Module):
         m = obs.frontier_mask.float()
         logp = torch.zeros_like(m)
         ent = torch.zeros_like(m)
+        # Score only the heads the caller supplied. PPO passes a full action
+        # and is unaffected; behaviour cloning passes `direction` and `step`
+        # alone, because the expert is a sequential Dijkstra router whose via
+        # policy is not the one being learned -- so its layer/via choices must
+        # not be cloned. Iterating every head regardless raised KeyError on
+        # the first BC update.
         for k, dist in dists.items():
+            if k not in action:
+                continue
             lp = dist.log_prob(action[k])
             e = dist.entropy()
             if k == "couple":
                 lp = lp * obs.is_pair.float()
                 e = e * obs.is_pair.float()
             elif k == "via":
+                # `via` is only meaningful when a layer change was requested;
+                # with no `layer` supplied there is nothing to gate on, so the
+                # head is simply not scored.
+                if "layer" not in action:
+                    continue
                 gate = (action["layer"] > 0).float()
                 lp = lp * gate
                 e = e * gate
