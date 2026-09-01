@@ -52,6 +52,27 @@ class Stage:
     #: `--bc-coef` only after a measured plateau.
     bc_coef0: float = 0.0
     reward: RewardConfig = field(default_factory=RewardConfig)
+    #: Quality thresholds the gate enforces ALONGSIDE completion.
+    #:
+    #: Completion alone passed a policy that double-routed 46.5% of boards at
+    #: 2.3x copper, and later one emitting 38% right angles whose direction
+    #: head was collapsed on d0 for 317 of 317 actions -- a field follower that
+    #: had learned no steering at all. A router that arrives by wandering
+    #: should not clear a gate.
+    #:
+    #: `max_copper` is on the MEDIAN, which sits at 1.000 on a healthy policy;
+    #: the mean is dragged by a pathological tail and makes a poor threshold.
+    max_copper: float = 1.15
+    #: Fab practice replaces every 90-degree corner with two 45s, so this is a
+    #: real rule rather than an aesthetic. Measured at 0.38 on the stage-0
+    #: policy that "passed".
+    max_right_angle: float = 0.15
+    #: Direction-head entropy floor. d0 is "down the geodesic gradient", so a
+    #: collapsed head means the field is doing the routing and the policy is
+    #: choosing step size only. Max entropy over 8 directions is ln(8)=2.08;
+    #: the collapsed policy measured 0.189. This is deliberately a LOW bar --
+    #: it asks that the head be alive at all, not that it be good.
+    min_dir_entropy: float = 0.40
 
     def board_spec(self) -> BoardSpec:
         return BoardSpec(

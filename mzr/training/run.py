@@ -35,6 +35,7 @@ import torch
 
 from mzr.env.route_env import EnvConfig, RouteEnv
 from mzr.models.policy import PriorPolicy
+from mzr.eval.quality import action_profile, quality_verdict, route_quality
 from mzr.training.curriculum import EVAL_SEEDS, STAGES
 from mzr.training.ppo import PPOConfig, RolloutBuffer, ppo_update
 from mzr.world.engine import WorldConfig
@@ -94,6 +95,7 @@ def evaluate(policy, stage, device: str, eval_seeds: list[int], with_sampled: bo
 
     out: dict = {}
     arms = [("argmax", True)] + ([("sampled", False)] if with_sampled else [])
+    obs = None
     for arm, det in arms:
         obs = env.reset(seeds=eval_seeds)
         while True:
@@ -108,6 +110,12 @@ def evaluate(policy, stage, device: str, eval_seeds: list[int], with_sampled: bo
             out["argmax_fail_seeds"] = [
                 int(sd) for sd, ok in zip(eval_seeds, (c >= 0.999).tolist()) if not ok
             ][:12]
+            # Route quality and what the policy chose, on the SAME rollout --
+            # completion says a net connected, these say whether it was routed
+            # well and whether the policy is steering or just following the
+            # geodesic field. See mzr/eval/quality.py for why both are gated.
+            out.update(route_quality(env.world))
+            out.update(action_profile(policy, obs))
     if not with_sampled:
         out["sampled_completion"] = out["argmax_completion"]
         out["sampled_perfect"] = out["argmax_perfect"]
@@ -315,14 +323,33 @@ def main() -> int:
             )
 
             score = ev["argmax_completion"]
-            hits = hits + 1 if score >= thr else 0
+            # The gate is completion AND quality. A run that completes every
+            # net by wandering, double-routing, or blindly following the
+            # geodesic field has not solved the stage -- it has saturated the
+            # one metric that cannot see any of those.
+            q_ok, q_why = quality_verdict(
+                ev, ev,
+                max_copper=stage.max_copper,
+                max_right_angle=stage.max_right_angle,
+                min_dir_entropy=stage.min_dir_entropy,
+            )
+            hits = hits + 1 if (score >= thr and q_ok) else 0
             line["gate_hits"] = hits
+            line["quality_ok"] = q_ok
+            line["quality_why"] = q_why
 
             if score > best:
                 best = score
                 _save(policy, opt, ckpt_dir / f"stage{args.stage}_best.pt", u, best, args.stage)
             _save(policy, opt, latest, u, best, args.stage)
 
+            print(
+                f"       copper {ev['copper_median']:.3f}x med / {ev['copper_mean']:.3f}x mean"
+                f" | right-angle {ev['right_angle_frac']:.0%}"
+                f" | doubled {ev['doubled']}"
+                f" | dir d0 {ev['dir_d0_frac']:.0%} ent {ev['ent_direction']:.2f}"
+                + ("" if q_ok else f"  <-- QUALITY FAIL: {q_why}")
+            )
             fails = ev["argmax_fail_seeds"]
             print(
                 f"u{u:4d} | argmax {ev['argmax_completion']:.3f} "
