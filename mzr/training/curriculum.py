@@ -67,11 +67,21 @@ class Stage:
     #: real rule rather than an aesthetic. Measured at 0.38 on the stage-0
     #: policy that "passed".
     max_right_angle: float = 0.15
-    #: Direction-head entropy floor. d0 is "down the geodesic gradient", so a
-    #: collapsed head means the field is doing the routing and the policy is
-    #: choosing step size only. Max entropy over 8 directions is ln(8)=2.08;
-    #: the collapsed policy measured 0.189. This is deliberately a LOW bar --
-    #: it asks that the head be alive at all, not that it be good.
+    #: Ceiling on the fraction of actions that are `d0` -- straight down the
+    #: geodesic gradient. This is THE steering check: a policy at 1.0 has
+    #: learned step size and vias and no navigation, and can only avoid what
+    #: the field already avoids.
+    #:
+    #: 0.95 is a deliberately low bar -- the field IS mostly right, so a good
+    #: policy still picks d0 often. It asks that the head deviate at all. The
+    #: measured collapsed policy sat at 1.000, using 2 of 8 directions across
+    #: an entire eval.
+    max_d0_frac: float = 0.95
+    #: Secondary: entropy floor, to catch a head that is dead rather than
+    #: merely decisive. Kept LOW and not relied on -- the collapsed policy
+    #: measured 0.410 against this 0.40 and scraped through, because the
+    #: distribution had spread while the argmax never varied. That near-miss
+    #: is exactly why `max_d0_frac` above exists and is the primary check.
     min_dir_entropy: float = 0.40
 
     def board_spec(self) -> BoardSpec:

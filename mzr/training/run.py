@@ -337,6 +337,7 @@ def main() -> int:
                 max_copper=stage.max_copper,
                 max_right_angle=stage.max_right_angle,
                 min_dir_entropy=stage.min_dir_entropy,
+                max_d0_frac=stage.max_d0_frac,
             )
             hits = hits + 1 if (score >= thr and q_ok) else 0
             line["gate_hits"] = hits

@@ -694,6 +694,80 @@ def test_prior_policy_is_greedy_at_init_and_ppo_consistent() -> None:
         f"max delta {float((ev['logp'] - sampled['logp']).abs().max()):.1e}",
     )
 
+    # -- the quality instrumentation itself ------------------------------
+    #
+    # These check the METRICS, not the policy. An untrained policy is
+    # deliberately collapsed on d0 (see the greedy-at-init check above), so
+    # "is it steering" is meaningless here -- but the machinery that will
+    # answer that question later has already been wrong twice, and both times
+    # it was wrong in the direction of reporting something plausible:
+    #
+    #   * `route_quality` was absent entirely, so completion certified a
+    #     policy that double-routed 46.5% of boards at 2.3x copper.
+    #   * the action profile was sampled AFTER the rollout, averaging over
+    #     zero live frontiers, and reported d0_frac 0% / entropy 0.000 for
+    #     every policy -- failing a healthy one and a collapsed one alike.
+    #
+    # An instrument that reads plausibly and wrongly is worse than none, so
+    # the instrument gets a gate too.
+    from mzr.eval.quality import ProfileAccumulator, quality_verdict, route_quality
+
+    acc = ProfileAccumulator()
+    obs2 = env.reset(seeds=[11, 12, 13, 14])
+    for _ in range(12):
+        a = pol.act(obs2, deterministic=True)["action"]
+        acc.update(pol, obs2, a)
+        stp = env.step(a)
+        obs2 = stp.obs
+        if stp.done:
+            break
+    prof = acc.result()
+    check(
+        "action profile samples live frontiers (not an empty post-rollout set)",
+        prof["actions_seen"] > 0,
+        f"{prof['actions_seen']} actions seen, d0 {prof['dir_d0_frac']:.0%}, "
+        f"{prof['dir_distinct']} distinct directions",
+    )
+
+    q = route_quality(env.world)
+    check(
+        "route_quality returns finite copper ratios",
+        q["copper_median"] == q["copper_median"] and q["copper_median"] > 0,
+        f"median {q['copper_median']:.3f}x, mean {q['copper_mean']:.3f}x, "
+        f"right-angle {q['right_angle_frac']:.0%}, doubled {q['doubled']}",
+    )
+
+    # The verdict must actually reject the failure modes it exists for.
+    good_q = {"copper_median": 1.02, "right_angle_frac": 0.05, "doubled": 0}
+    good_p = {"actions_seen": 100, "dir_d0_frac": 0.70, "dir_distinct": 5,
+              "ent_direction": 1.2}
+    ok_good, _ = quality_verdict(good_q, good_p, max_copper=1.15,
+                                 max_right_angle=0.15, min_dir_entropy=0.4,
+                                 max_d0_frac=0.95)
+    collapsed_p = dict(good_p, dir_d0_frac=1.0, dir_distinct=1, ent_direction=0.41)
+    ok_bad, why_bad = quality_verdict(good_q, collapsed_p, max_copper=1.15,
+                                      max_right_angle=0.15, min_dir_entropy=0.4,
+                                      max_d0_frac=0.95)
+    empty_p = dict(good_p, actions_seen=0)
+    ok_empty, why_empty = quality_verdict(good_q, empty_p, max_copper=1.15,
+                                          max_right_angle=0.15, min_dir_entropy=0.4,
+                                          max_d0_frac=0.95)
+    check(
+        "quality gate passes a healthy profile and rejects a collapsed one",
+        ok_good and not ok_bad and not ok_empty,
+        f"healthy={ok_good} collapsed={ok_bad} ({why_bad[:48]}) empty={ok_empty}",
+    )
+    # The near-miss that motivated max_d0_frac: entropy alone would have
+    # passed d0=100% at 0.41 against a 0.40 floor.
+    _, why_ent_only = quality_verdict(good_q, collapsed_p, max_copper=1.15,
+                                      max_right_angle=0.15, min_dir_entropy=0.4,
+                                      max_d0_frac=1.0)
+    check(
+        "entropy alone would NOT have caught the collapse (why d0_frac is primary)",
+        "collapsed" not in why_ent_only,
+        f"entropy-only verdict: {why_ent_only or '(passed)'}",
+    )
+
     # The joint (direction, step) mask, checked as a JOINT constraint.
     #
     # `obs.safety` is (B, F, 8, 3) and agrees with the engine's own `_plan`

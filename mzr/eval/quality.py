@@ -173,7 +173,7 @@ class ProfileAccumulator:
 
 
 def quality_verdict(q: dict, prof: dict, *, max_copper: float, max_right_angle: float,
-                    min_dir_entropy: float) -> tuple[bool, str]:
+                    min_dir_entropy: float, max_d0_frac: float = 1.0) -> tuple[bool, str]:
     """Does this policy route WELL, not just completely?
 
     Returned alongside completion so a gate can require both. Kept as a pure
@@ -190,10 +190,19 @@ def quality_verdict(q: dict, prof: dict, *, max_copper: float, max_right_angle: 
     if not prof.get("actions_seen", 0):
         # Nothing was observed; do not manufacture a verdict from an empty set.
         fails.append("no live actions sampled -- profile is empty, not collapsed")
-    elif not (prof["ent_direction"] >= min_dir_entropy):
-        fails.append(
-            f"direction head collapsed (entropy {prof['ent_direction']:.3f} < "
-            f"{min_dir_entropy}, d0 {prof['dir_d0_frac']:.0%}) -- following the "
-            f"field, not steering"
-        )
+    else:
+        # Primary steering check. Entropy proved leaky: a policy choosing d0 on
+        # 100% of actions still measured 0.410 against a 0.40 floor, because
+        # spread in the DISTRIBUTION says nothing about what the argmax does.
+        if not (prof["dir_d0_frac"] <= max_d0_frac):
+            fails.append(
+                f"direction collapsed: d0 on {prof['dir_d0_frac']:.1%} of actions "
+                f"(> {max_d0_frac:.0%}), {prof['dir_distinct']} of 8 directions used "
+                f"-- following the field, not steering"
+            )
+        if not (prof["ent_direction"] >= min_dir_entropy):
+            fails.append(
+                f"direction head near-dead (entropy {prof['ent_direction']:.3f} < "
+                f"{min_dir_entropy})"
+            )
     return (not fails), "; ".join(fails)
