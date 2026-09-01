@@ -438,6 +438,50 @@ def step_safety(free_units: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def flood_component(
+    owned: torch.Tensor,
+    seed: torch.Tensor,
+    *,
+    iterations: int = 128,
+    connect_layers: bool = True,
+) -> torch.Tensor:
+    """Cells of `owned` reachable from `seed`, i.e. one connected component.
+
+    `mzr/DESIGN_COPPER_SEEDED.md` needs this to answer "which of this net's
+    copper is the TRUNK" -- the component holding pin 0. Seeding the geodesic
+    from *all* of a net's copper would be wrong: a frontier's own trail would be
+    a source, so its distance-to-copper would be ~0 and the field would carry no
+    gradient. VPR routes each sink to the net's **existing** routing tree, not
+    to the wire currently being laid, and this is how that set is identified.
+
+    Same max-pool relaxation as the distance fields, on a 0/1 indicator, so it
+    inherits their batching and needs no new kernel.
+
+    Parameters
+    ----------
+    owned : (M, L, H, W) bool -- cells belonging to this net.
+    seed  : (M, L, H, W) bool -- starting cells (must be a subset of `owned`).
+    """
+    cur = owned & seed
+    for _ in range(iterations):
+        grown = (
+            F.max_pool2d(cur.reshape(-1, 1, *cur.shape[-2:]).float(), 3, stride=1, padding=1)
+            .reshape(cur.shape)
+            .gt(0.5)
+        )
+        if connect_layers and cur.shape[1] > 1:
+            up = torch.zeros_like(grown)
+            dn = torch.zeros_like(grown)
+            up[:, :-1] = cur[:, 1:]
+            dn[:, 1:] = cur[:, :-1]
+            grown = grown | up | dn
+        nxt = grown & owned
+        if torch.equal(nxt, cur):
+            return cur
+        cur = nxt
+    return cur
+
+
 def geodesic_field_multi(
     blocked: torch.Tensor,
     sources: torch.Tensor,

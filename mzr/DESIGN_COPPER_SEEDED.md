@@ -194,3 +194,53 @@ today's field budget.
 A stale field is a *shaping* inaccuracy, never a legality one -- the engine
 validates every move against live occupancy -- so cadence is a quality/speed
 knob, exactly as `--geodesic-refresh` was in `neuroroute`. Start at 8.
+
+## Correction: sources are the TRUNK, not all of the net's copper
+
+The proposal above said "seeded from every cell the net currently owns". That is
+wrong, and the error is fatal rather than cosmetic: a frontier's **own trail**
+would be a source, so its distance-to-copper would be ~0 everywhere and the
+field would carry no gradient at all.
+
+Measured on a two-blob net -- a trunk stub and a separate frontier trail:
+
+    distance from the far frontier tip:  to TRUNK 10.0  |  to ALL copper 0.0
+
+VPR does not have this problem because it routes each sink to the net's
+**existing routing tree**, which by construction excludes the wire the current
+search is laying. The field formulation needs the same restriction.
+
+### Trunk + spokes
+
+* The net's **trunk** is the connected component containing pin 0
+  (`geometry.flood_component`, verified: 8 of 15 cells while a second blob is
+  separate, 27 of 27 once they touch).
+* Every **unjoined** pin gets ONE frontier, growing toward the trunk.
+* The field is distance to trunk copper -- one per net.
+* A frontier whose copper touches the trunk has **joined**: its pin is
+  connected, its copper becomes trunk, the frontier retires, sources grow.
+* The net is done when no unjoined pins remain.
+
+### What this costs, and why it is still right
+
+**Dual-ended growth is given up.** One growing end per connection, not two.
+Frontiers per net go `2(k-1)` -> `k-1`, shrinking to zero during an episode.
+
+That is a direct hit to the horizon-collapse argument in `DESIGN.md`, which
+credits growing "from both pads" for halving the episode. Two reasons to accept
+it:
+
+1. It is *why* double-routing becomes impossible. There is no second frontier to
+   mirror-route. The pathology is not penalised, it is unrepresentable -- and
+   four reward patches failed to achieve that.
+2. The horizon has headroom. Measured settle times are 19 / 14 / 7 macro-steps
+   for 2 / 8 / 24 nets against a 48-64 cap. Doubling lands at 38 / 28 / 14,
+   still inside.
+
+The trunk flood fill is one extra relaxation per refresh, same cost class as the
+field itself -- so budget refresh cadence 16 rather than 8 (see the table above).
+
+A later refinement, deliberately deferred: let the trunk also grow toward the
+nearest unjoined pin, recovering dual-ended growth for one connection at a time.
+It is strictly an optimisation and should not be attempted before the simple
+version is measured.
