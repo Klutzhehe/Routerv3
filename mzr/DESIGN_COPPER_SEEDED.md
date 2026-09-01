@@ -244,3 +244,41 @@ A later refinement, deliberately deferred: let the trunk also grow toward the
 nearest unjoined pin, recovering dual-ended growth for one connection at a time.
 It is strictly an optimisation and should not be attempted before the simple
 version is measured.
+
+## NEGATIVE RESULT: dual-ended copper-seeded growth does not work
+
+The refinement deferred above -- "let the trunk also grow toward the nearest
+unjoined pin, recovering dual-ended growth" -- was built (`WorldConfig.
+dual_ended`, a second per-net field seeded from `owned & ~trunk`) and is
+**worse on every axis**. layer_hop baseline, 16 stage-0 boards:
+
+| | completion | copper/ideal | double-routed |
+|---|---|---|---|
+| A baseline (pad-targeted) | 1.000 | 1.73x | 9/16 |
+| D copper-seeded, single-ended | 0.938 | **1.15x** | **0/16** |
+| E copper-seeded, dual-ended | 0.812 | 1.91x | 4/16 |
+
+**Why the reasoning was wrong.** The argument was that both ends would be drawn
+to each other's *live* copper and therefore converge, rather than to static pads
+they could sail past. But consider t=0: the trunk is the src pad and the only
+unjoined copper is the dst pad. So the trunk end heads for the dst pad and the
+spoke heads for the src pad -- **precisely the static-pad targeting that is the
+bug**. Copper-seeding only helps once there is copper to seed from, and by the
+time trails exist the two frontiers are already committed to mirror routes.
+
+**So the corrected explanation of why single-ended works**: not because the
+field is smarter, but because **there is only one frontier**. Double-routing
+needs two frontiers to traverse the same corridor; with one, it is not
+expressible. The field being copper-seeded is what lets that single frontier
+route *well* (1.15x rather than wandering), but the elimination of the loop is
+structural and blunt.
+
+Kept in the code defaulted off, documented, because "just let both ends grow"
+is the obvious next idea and will otherwise be proposed again.
+
+**The completion gap is therefore a separate problem** and needs a separate fix.
+Single-ended episodes run to the 48-step cap instead of settling at 21, and
+stage 0 has one net so there is one live frontier per board instead of two --
+half the training signal per wall-clock second. Candidates, in order: raise
+`max_macro_steps` for single-ended stages; raise `--batch` to recover
+frontier-steps per update; only then consider architectural change.

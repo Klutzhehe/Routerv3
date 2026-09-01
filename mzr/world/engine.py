@@ -123,6 +123,16 @@ class WorldConfig:
     #: that already exists. Double-routing stops being possible rather than
     #: being penalised, which is what four reward patches failed to achieve.
     copper_seeded: bool = False
+    #: With `copper_seeded`, also let the TRUNK end grow -- toward the copper
+    #: that has not joined yet. Restores dual-ended growth (halves the horizon,
+    #: doubles the frontier-steps of training signal per board) WITHOUT
+    #: restoring double-routing: both ends are drawn to each other's *live*
+    #: copper, which moves toward them, instead of to static pads they can
+    #: sail past.
+    #:
+    #: Costs a second field per net -- distance to the unjoined copper -- so
+    #: 2 relaxations per refresh instead of 1, plus the trunk flood fill.
+    dual_ended: bool = False
     #: Macro-steps between field refreshes when `copper_seeded`. Measured cost
     #: at stage-3 scale: cadence 1 is 11.7x today's static build, 8 is 1.7x,
     #: 16 is ~1.0x. A stale field is a shaping inaccuracy, never a legality one.
@@ -290,6 +300,14 @@ class SimultaneousRouterWorld:
                        dtype=torch.float16, device=dev)
             if cfg.copper_seeded else None
         )
+        #: Distance to the net's UNJOINED copper -- what the trunk end grows
+        #: toward when `dual_ended`. The trunk end sits on `net_geo`'s own
+        #: source, so it has no gradient there and needs its own field.
+        self.net_geo_tip = (
+            torch.full((B, N, L, *self._geo_shape), float("inf"),
+                       dtype=torch.float16, device=dev)
+            if cfg.copper_seeded and cfg.dual_ended else None
+        )
         self.fr_geo = torch.full(
             (B, F, L, h, w), float("inf"), dtype=torch.float16, device=dev
         )
@@ -428,9 +446,10 @@ class SimultaneousRouterWorld:
             # Trunk+spokes: pin 0 (END_SRC) IS the trunk, so it does not grow --
             # a frontier standing on its own source has no gradient. Only the
             # far end advances, toward copper that already exists.
-            spoke = torch.zeros_like(alive)
-            spoke[..., END_DST] = True
-            alive = alive & spoke
+            if not self.cfg.dual_ended:
+                spoke = torch.zeros_like(alive)
+                spoke[..., END_DST] = True
+                alive = alive & spoke
         alive = alive.reshape(B, self.F)
         pos = self.net_pad.view(B, self.F, 3)
 
@@ -499,6 +518,26 @@ class SimultaneousRouterWorld:
         )
         self.net_geo = fld.reshape(B, N, L, *self._geo_shape).to(torch.float16)
 
+        if self.cfg.dual_ended:
+            # The mirror field: everything this net owns that is NOT yet part
+            # of the trunk -- the unjoined pads and the spokes' trails.
+            owned = (self.occ.unsqueeze(1) == ids).reshape(B * N, L, H, W)
+            tip_src = owned & ~trunk
+            prev_t = (
+                self.net_geo_tip.reshape(B * N, L, *self._geo_shape).float()
+                if incremental and self.net_geo_tip is not None else None
+            )
+            # Unlike the trunk, the unjoined set SHRINKS as spokes join, so
+            # distances can rise -- an incremental relax down would be wrong.
+            fld_t = geo.geodesic_field_multi(
+                blocked, tip_src, prev=None,
+                iterations=self.cfg.geodesic_iterations,
+                via_cost=VIA_LENGTH_COST,
+                downsample=self.cfg.geodesic_downsample,
+                upsample=False,
+            )
+            self.net_geo_tip = fld_t.reshape(B, N, L, *self._geo_shape).to(torch.float16)
+
     def _frontier_field(self) -> torch.Tensor:
         """(B*F, L, h, w) -- each frontier's view of its own net's field.
 
@@ -509,7 +548,16 @@ class SimultaneousRouterWorld:
         f_idx = torch.arange(F, device=self.device)
         n_idx = (f_idx // (self.cfg.max_legs * NUM_ENDS)).view(1, F).expand(B, F)
         b_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, F)
-        return self.net_geo[b_idx.reshape(-1), n_idx.reshape(-1)].float()
+        fld = self.net_geo[b_idx.reshape(-1), n_idx.reshape(-1)].float()
+        if not self.cfg.dual_ended or self.net_geo_tip is None:
+            return fld
+        # END_SRC sits on the trunk, so it reads the mirror field instead.
+        tip = self.net_geo_tip[b_idx.reshape(-1), n_idx.reshape(-1)].float()
+        is_trunk_end = (
+            (torch.arange(F, device=self.device) % NUM_ENDS == END_SRC)
+            .view(1, F).expand(B, F).reshape(-1, 1, 1, 1)
+        )
+        return torch.where(is_trunk_end, tip, fld)
 
     def _refresh_geodesic(self, mask: torch.Tensor) -> None:
         """Recompute cached cost-to-go for the masked frontiers.
