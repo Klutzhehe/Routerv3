@@ -121,6 +121,12 @@ def collect(env: RouteEnv, policy, buf: RolloutBuffer, n_steps: int, obs):
         act = policy.act(obs, deterministic=False)
         step = env.step(act["action"])
         board_r = step.reward.sum(dim=1) + step.board_reward
+        # Per-frontier reward, with the board-level term (failure penalty,
+        # terminal completion) shared across live frontiers -- those really are
+        # joint outcomes, but the dense shaping above them is not.
+        live = act["mask"].float()
+        n_live = live.sum(dim=1, keepdim=True).clamp_min(1.0)
+        frontier_r = step.reward + (step.board_reward.unsqueeze(1) / n_live) * live
         buf.add(
             obs=obs,
             action=act["action"],
@@ -128,6 +134,8 @@ def collect(env: RouteEnv, policy, buf: RolloutBuffer, n_steps: int, obs):
             mask=act["mask"],
             board_reward=board_r,
             value=act["value"],
+            frontier_reward=frontier_r,
+            frontier_value=act["value_f"],
             done=step.done * torch.ones(board_r.shape[0], device=board_r.device),
         )
         obs = step.obs
@@ -166,6 +174,11 @@ def main() -> int:
                    help="override the stage's episode length. Single-ended "
                         "(copper-seeded) growth needs roughly double, since one "
                         "frontier covers the whole route instead of two halves")
+    p.add_argument("--per-frontier-adv", action="store_true",
+                   help="per-frontier advantage instead of one board advantage "
+                        "broadcast to every frontier (GPAE-style). The MAPPO "
+                        "shared advantage is the one blocker that gets WORSE "
+                        "as net count grows -- SNR falls as 1/N")
     p.add_argument("--copper-seeded", action="store_true",
                    help="one field per NET (distance to its trunk) instead of one "
                         "per frontier targeting a static pad; implies trunk+spokes. "
@@ -235,6 +248,7 @@ def main() -> int:
     ppo_cfg = PPOConfig(
         lr=args.lr, bc_coef=bc, epochs=args.epochs,
         minibatches=args.minibatches, entropy_coef=args.entropy_coef,
+        per_frontier_adv=args.per_frontier_adv,
     )
 
     start, best = 0, -1.0
@@ -264,9 +278,10 @@ def main() -> int:
         obs = collect(env, policy, buf, args.rollout, obs)
         t_collect = time.time() - t0
         with torch.no_grad():
-            last_v = policy.act(obs, deterministic=False)["value"]
+            _last = policy.act(obs, deterministic=False)
+        last_v, last_vf = _last["value"], _last["value_f"]
         t1 = time.time()
-        m = ppo_update(policy, opt, buf, last_v, ppo_cfg)
+        m = ppo_update(policy, opt, buf, last_v, ppo_cfg, last_value_f=last_vf)
         t_ppo = time.time() - t1
         dt = time.time() - t0
 

@@ -48,6 +48,8 @@ class PolicyOutput:
     logits: dict[str, torch.Tensor]
     #: (B,) board value V(s).
     value: torch.Tensor
+    #: (B, F) per-frontier value, zero where the frontier is dead.
+    value_f: torch.Tensor
 
 
 def _head_sizes(num_layers: int) -> dict[str, int]:
@@ -168,6 +170,17 @@ class PriorPolicy(nn.Module):
             nn.SiLU(),
             nn.Linear(token_width, 1),
         )
+        # Per-FRONTIER value, for per-agent advantage estimation.
+        #
+        # MAPPO assumes A_i(s,a) = A_global(s,a) for every agent, which here
+        # means one board advantage broadcast over every frontier: it cannot
+        # express "frontier B specifically should have stopped". GPAE (arXiv
+        # 2603.02654) replaces that with a per-agent value; on 5m_vs_6m it took
+        # a 3.1% MAPPO win rate to 93.7%, for +6% wall-clock and a cost that
+        # does not grow with agent count -- which is the property that matters
+        # if this is ever to run thousands of nets, where MAPPO's per-frontier
+        # signal-to-noise falls as 1/N.
+        self.value_frontier = nn.Linear(token_width, 1)
         self._init_heads()
 
     def _init_heads(self) -> None:
@@ -241,7 +254,10 @@ class PriorPolicy(nn.Module):
         m = obs.frontier_mask.unsqueeze(-1).float()
         pooled = (tok * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
         value = self.value(torch.cat([g, pooled], dim=-1)).squeeze(-1)
-        return PolicyOutput(logits=logits, value=value)
+        # Dead frontiers must value exactly zero: their future reward is zero,
+        # so the TD error has to vanish rather than carry a learned constant.
+        value_f = self.value_frontier(tok).squeeze(-1) * obs.frontier_mask.float()
+        return PolicyOutput(logits=logits, value=value, value_f=value_f)
 
     # -- rollout / update API -------------------------------------------
 
@@ -268,6 +284,7 @@ class PriorPolicy(nn.Module):
             "action": action,
             "logp": total_logp,          # (B, F)
             "value": out.value,          # (B,)
+            "value_f": out.value_f,      # (B, F)
             "mask": obs.frontier_mask,
         }
 
@@ -293,4 +310,5 @@ class PriorPolicy(nn.Module):
             "logp": logp * m,            # (B, F)
             "entropy": (ent * m).sum() / m.sum().clamp_min(1.0),
             "value": out.value,          # (B,)
+            "value_f": out.value_f,      # (B, F)
         }

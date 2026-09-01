@@ -42,6 +42,9 @@ class PPOConfig:
     lr: float = 3e-4
     #: Behaviour-cloning loss weight, annealed by the trainer. 0 disables it.
     bc_coef: float = 0.0
+    #: Per-FRONTIER advantage instead of one board advantage broadcast to every
+    #: frontier. See `compute_gae_frontier`.
+    per_frontier_adv: bool = False
 
 
 def compute_gae(
@@ -64,6 +67,42 @@ def compute_gae(
     return adv, adv + values
 
 
+def compute_gae_frontier(
+    rewards: torch.Tensor,      # (T, B, F) per-frontier reward
+    values: torch.Tensor,       # (T, B, F) per-frontier value, 0 where dead
+    last_value: torch.Tensor,   # (B, F)
+    dones: torch.Tensor,        # (T, B) 1.0 on the final step of an episode
+    masks: torch.Tensor,        # (T, B, F) 1.0 where the frontier is alive
+    cfg: PPOConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-frontier GAE. Returns (advantages, returns), each (T, B, F).
+
+    MAPPO gives every agent the same advantage -- stated in the GPAE paper
+    (arXiv 2603.02654) as ``A_i(s,a) = A_global(s,a)`` for all i -- which here
+    is one board scalar broadcast over every frontier. That signal cannot
+    express "frontier B should have stopped while frontier A was right to
+    move", and its per-frontier signal-to-noise falls as 1/N: 2 frontiers share
+    it at one net, ~2000 at a thousand nets. It is the one blocker in this
+    design that gets *worse* as the problem gets bigger.
+
+    `env/rewards.py::step_reward` already returns a per-frontier reward; the
+    trainer was summing it away one line before PPO saw it. This keeps it.
+
+    A dead frontier values exactly zero (masked in the policy), so its TD error
+    vanishes and it contributes no gradient rather than a learned constant.
+    """
+    T, B, F = rewards.shape
+    adv = torch.zeros(T, B, F, device=rewards.device)
+    gae = torch.zeros(B, F, device=rewards.device)
+    for t in reversed(range(T)):
+        next_v = last_value if t == T - 1 else values[t + 1]
+        nonterminal = (1.0 - dones[t]).unsqueeze(-1)
+        delta = rewards[t] + cfg.gamma * next_v * nonterminal - values[t]
+        gae = delta + cfg.gamma * cfg.gae_lambda * nonterminal * gae
+        adv[t] = gae * masks[t]
+    return adv, adv + values
+
+
 class RolloutBuffer:
     """Holds one batch of rollout data, transitions flattened to (T*B, ...)."""
 
@@ -76,14 +115,19 @@ class RolloutBuffer:
         self.values: list[torch.Tensor] = []    # (B,)
         self.dones: list[torch.Tensor] = []     # (B,)
         self.bc_actions: list[dict | None] = []
+        self.f_rewards: list = []   # (B, F) per-frontier reward
+        self.f_values: list = []    # (B, F) per-frontier value
 
-    def add(self, obs, action, logp, mask, board_reward, value, done, bc_action=None):
+    def add(self, obs, action, logp, mask, board_reward, value, done, bc_action=None,
+            frontier_reward=None, frontier_value=None):
         self.obs.append(obs)
         self.actions.append(action)
         self.logp.append(logp.detach())
         self.masks.append(mask)
         self.rewards.append(board_reward.detach())
         self.values.append(value.detach())
+        self.f_rewards.append(None if frontier_reward is None else frontier_reward.detach())
+        self.f_values.append(None if frontier_value is None else frontier_value.detach())
         self.dones.append(done)
         self.bc_actions.append(bc_action)
 
@@ -97,6 +141,7 @@ def ppo_update(
     buf: RolloutBuffer,
     last_value: torch.Tensor,
     cfg: PPOConfig,
+    last_value_f: torch.Tensor | None = None,
 ) -> dict:
     """One PPO update over a filled buffer. Returns a metrics dict."""
     T = len(buf)
@@ -107,9 +152,23 @@ def ppo_update(
     values = torch.stack(buf.values)                   # (T, B)
     dones = torch.stack(buf.dones).float()             # (T, B)
     adv, returns = compute_gae(rewards, values, last_value, dones, cfg)
-
-    # Normalise advantages across the whole batch (standard PPO).
     adv = (adv - adv.mean()) / (adv.std().clamp_min(1e-6))
+
+    per_frontier = cfg.per_frontier_adv and buf.f_rewards and buf.f_rewards[0] is not None
+    if per_frontier:
+        f_rew = torch.stack(buf.f_rewards)                          # (T, B, F)
+        f_val = torch.stack(buf.f_values)                           # (T, B, F)
+        f_mask = torch.stack(buf.masks).float()                     # (T, B, F)
+        f_adv, f_ret = compute_gae_frontier(
+            f_rew, f_val, last_value_f, dones, f_mask, cfg
+        )
+        # Normalise over LIVE frontiers only -- dead ones are exact zeros and
+        # would drag the mean and shrink the std toward nothing.
+        live = f_mask > 0.5
+        if bool(live.any()):
+            mu = f_adv[live].mean()
+            sd = f_adv[live].std().clamp_min(1e-6)
+            f_adv = ((f_adv - mu) / sd) * f_mask
 
     idx = list(range(T))
     metrics = {k: 0.0 for k in ("policy_loss", "value_loss", "entropy", "clip_frac", "bc_loss", "approx_kl")}
@@ -135,6 +194,13 @@ def ppo_update(
             mb_oldlp = torch.cat([buf.logp[t] for t in steps], dim=0)           # (k*B, F)
             mb_adv = adv[steps].reshape(k * B, 1)
             mb_ret = returns[steps].reshape(k * B)
+            if per_frontier:
+                # The whole point: each frontier is scored on its OWN advantage
+                # rather than the board's, so "this one should have stopped" is
+                # expressible.
+                mb_adv = torch.cat([f_adv[t] for t in steps], dim=0)     # (k*B, F)
+                mb_fret = torch.cat([f_ret[t] for t in steps], dim=0)
+                mb_foldval = torch.cat([buf.f_values[t] for t in steps], dim=0)
 
             mb_oldval = torch.cat([buf.values[tt] for tt in steps], dim=0)     # (k*B,)
 
@@ -149,6 +215,11 @@ def ppo_update(
             v = ev["value"]
             v_clipped = mb_oldval + (v - mb_oldval).clamp(-cfg.value_clip, cfg.value_clip)
             val_loss = torch.maximum((v - mb_ret).pow(2), (v_clipped - mb_ret).pow(2)).mean()
+            if per_frontier:
+                vf = ev["value_f"]
+                vf_c = mb_foldval + (vf - mb_foldval).clamp(-cfg.value_clip, cfg.value_clip)
+                vf_loss = torch.maximum((vf - mb_fret).pow(2), (vf_c - mb_fret).pow(2))
+                val_loss = val_loss + (vf_loss * mb_mask).sum() / n_live
             ent_term = ev["entropy"]
 
             with torch.no_grad():
