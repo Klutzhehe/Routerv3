@@ -1,17 +1,20 @@
-"""Replay Buffer and Generalized Advantage Estimation (GAE) for PCBRouterNet.
+"""Replay Buffer and Generalized Advantage Estimation (GAE) for PCB Router.
+
+Supports both flat observations (legacy) and Dict observations (line geometry).
 """
 
 from __future__ import annotations
 
 import torch
 import numpy as np
+from typing import Union, Dict, Any
 
 
 class RolloutBuffer:
     def __init__(
         self,
         buffer_size: int,
-        obs_shape: tuple[int, ...],
+        obs_shape: Union[tuple[int, ...], Dict[str, tuple[int, ...]], None],
         device: torch.device,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
@@ -22,8 +25,25 @@ class RolloutBuffer:
         self.gamma = gamma
         self.gae_lambda = gae_lambda
 
-        self.observations = torch.zeros((buffer_size, *obs_shape), dtype=torch.float32, device=device)
-        self.actions = torch.zeros((buffer_size,), dtype=torch.long, device=device)
+        self.is_dict_obs = isinstance(obs_shape, dict)
+
+        if self.is_dict_obs:
+            # Dict observation: store each key separately
+            self.observations = {
+                key: torch.zeros((buffer_size, *shape), dtype=torch.float32, device=device)
+                for key, shape in obs_shape.items()
+            }
+            # segment_mask is bool
+            if "segment_mask" in self.observations:
+                self.observations["segment_mask"] = torch.zeros(
+                    (buffer_size, *obs_shape["segment_mask"]), dtype=torch.bool, device=device
+                )
+        else:
+            # Flat observation
+            self.observations = torch.zeros((buffer_size, *obs_shape), dtype=torch.float32, device=device)
+
+        # Actions: continuous for line geometry, discrete for legacy
+        self.actions = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
         self.log_probs = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
         self.rewards = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
         self.dones = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
@@ -36,7 +56,7 @@ class RolloutBuffer:
 
     def add(
         self,
-        obs: torch.Tensor,
+        obs: Union[torch.Tensor, Dict[str, torch.Tensor]],
         action: torch.Tensor,
         log_prob: torch.Tensor,
         reward: float,
@@ -44,7 +64,11 @@ class RolloutBuffer:
         value: torch.Tensor,
     ):
         idx = self.ptr
-        self.observations[idx].copy_(obs)
+        if self.is_dict_obs:
+            for key, tensor in obs.items():
+                self.observations[key][idx].copy_(tensor)
+        else:
+            self.observations[idx].copy_(obs)
         self.actions[idx] = action
         self.log_probs[idx] = log_prob
         self.rewards[idx] = float(reward)
@@ -73,8 +97,12 @@ class RolloutBuffer:
         indices = np.random.permutation(self.buffer_size)
         for start_idx in range(0, self.buffer_size, batch_size):
             batch_indices = indices[start_idx : start_idx + batch_size]
+            if self.is_dict_obs:
+                batch_obs = {key: tensor[batch_indices] for key, tensor in self.observations.items()}
+            else:
+                batch_obs = self.observations[batch_indices]
             yield (
-                self.observations[batch_indices],
+                batch_obs,
                 self.actions[batch_indices],
                 self.log_probs[batch_indices],
                 self.advantages[batch_indices],

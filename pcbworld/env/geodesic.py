@@ -135,15 +135,23 @@ class GeodesicField:
     the agent for it would punish it for geometry it did not create.
     """
 
-    __slots__ = ("cost", "origin_x", "origin_y", "cell", "nx", "ny", "reachable")
+    __slots__ = ("cost", "origin_x", "origin_y", "cell", "nx", "ny", "reachable", "blocked")
 
-    def __init__(self, cost, origin_x, origin_y, cell, reachable):
+    def __init__(self, cost, origin_x, origin_y, cell, reachable, blocked=None):
         self.cost = cost
         self.origin_x = origin_x
         self.origin_y = origin_y
         self.cell = cell
         self.ny, self.nx = cost.shape
         self.reachable = reachable
+        # Which cells are inside an obstacle's inflated footprint. Kept
+        # because `cost` alone cannot answer it: `_fill_blocked` deliberately
+        # gives blocked cells a finite value so the RL head, which spends
+        # 10-45% of its steps inside copper, still gets a smooth potential.
+        # A caller TRACING a path needs the opposite -- those filled values
+        # are a shortcut straight through the obstacle -- so it needs the mask
+        # to refuse them. Optional so a hand-built field still constructs.
+        self.blocked = blocked
 
     # -- construction ----------------------------------------------------
 
@@ -195,6 +203,7 @@ class GeodesicField:
         cost = cls._relax(blocked, ti, tj, cell)
         field.reachable = bool(np.isfinite(cost[hi, hj]))
         field.cost = cls._fill_blocked(cost, blocked, cell)
+        field.blocked = blocked
         return field
 
     @staticmethod
@@ -369,6 +378,17 @@ class GeodesicField:
             if c < best_cost:
                 best_cost, best_theta = c, theta
         return None if best_theta is None else float(best_theta)
+
+    def is_blocked(self, x: float, y: float) -> bool:
+        """Is (x, y) inside an obstacle's inflated footprint?
+
+        False when no mask was stored, so a hand-built field behaves as it
+        did before this existed.
+        """
+        if self.blocked is None:
+            return False
+        i, j = self._cell_of(x, y)
+        return bool(self.blocked[i, j])
 
     def cost_to_go(self, x: float, y: float) -> float:
         """Bilinearly interpolated distance to the target, in nm.

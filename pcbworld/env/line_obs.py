@@ -170,10 +170,16 @@ class LineObsConfig:
     k_nearest: int = 32
     length_scale: float = 10.0 * MM
     max_steps: int = 80
+    # Env-specific globals appended AFTER the segment rows -- the leg-kind
+    # one-hot the diff-pair/tune env needs, and nothing else so far. They go
+    # at the tail rather than inside the global block so GLOBAL_INDEX stays a
+    # fixed lookup: a stage that adds a feature must not renumber
+    # geodesic_dist for every stage that does not.
+    extra_globals: int = 0
 
     @property
     def flat_size(self) -> int:
-        return NUM_GLOBAL + self.k_nearest * NUM_SEGMENT_FEATURES
+        return NUM_GLOBAL + self.k_nearest * NUM_SEGMENT_FEATURES + self.extra_globals
 
 
 @dataclasses.dataclass
@@ -351,6 +357,7 @@ def build_observation(
     clearance_now: float | None = None,
     clearance_ahead: float | None = None,
     geodesic_direction: float | None = None,
+    extra: np.ndarray | None = None,
 ) -> np.ndarray:
     """The flat observation vector: globals, then k_nearest segment rows.
 
@@ -404,6 +411,15 @@ def build_observation(
         gd = geodesic_direction - bearing
         obs[13], obs[14] = math.cos(gd), math.sin(gd)
 
+    if config.extra_globals:
+        if extra is None:
+            extra = np.zeros(config.extra_globals, dtype=np.float32)
+        if len(extra) != config.extra_globals:
+            raise ValueError(
+                f"config.extra_globals={config.extra_globals} but got {len(extra)} extras"
+            )
+        obs[NUM_GLOBAL + config.k_nearest * NUM_SEGMENT_FEATURES :] = extra
+
     if not segments:
         return obs
 
@@ -445,7 +461,8 @@ def build_observation(
     lx1, lx2 = np.where(swap, lx2, lx1), np.where(swap, lx1, lx2)
     ly1, ly2 = np.where(swap, ly2, ly1), np.where(swap, ly1, ly2)
 
-    rows = obs[NUM_GLOBAL:].reshape(config.k_nearest, NUM_SEGMENT_FEATURES)
+    row_end = NUM_GLOBAL + config.k_nearest * NUM_SEGMENT_FEATURES
+    rows = obs[NUM_GLOBAL:row_end].reshape(config.k_nearest, NUM_SEGMENT_FEATURES)
     for row, idx, ax1, ay1, ax2, ay2 in zip(rows, nearest, lx1, ly1, lx2, ly2):
         seg = segments[idx]
         row[0] = ax1 / scale
@@ -459,3 +476,42 @@ def build_observation(
         row[11] = 1.0  # valid
 
     return obs
+
+
+def split_observation(obs, extra_globals: int = 0):
+    """Flat observation -> (globals, segment rows, validity mask).
+
+    `build_observation` returns one flat array so a single Box space covers
+    it (see its docstring). Networks that keep a separate per-segment encoder
+    want the three pieces back, and every caller doing that reshape by hand
+    is a place the feature counts can drift out of sync with this module --
+    which is exactly how an observation carrying 15 globals ended up being
+    read as 8, silently dropping geodesic_dist, both clearances and both
+    geodesic-direction components on the floor.
+
+    Works on a numpy array or a torch tensor, batched (B, flat) or not, so
+    the env, the trainer and the eval loop all use one implementation.
+    """
+    batched = obs.ndim == 2
+    flat = obs if batched else obs[None, ...]
+
+    row_end = flat.shape[1] - extra_globals
+    rows = flat[:, NUM_GLOBAL:row_end].reshape(flat.shape[0], -1, NUM_SEGMENT_FEATURES)
+    mask = rows[..., SEGMENT_FEATURES.index("valid")] > 0.5
+
+    # The tail extras ride with the globals: they are per-state scalars, and
+    # the policy's global MLP is where they belong.
+    if extra_globals:
+        head = flat[:, :NUM_GLOBAL]
+        tail = flat[:, row_end:]
+        globals_ = (
+            np.concatenate([head, tail], axis=1)
+            if isinstance(flat, np.ndarray)
+            else __import__("torch").cat([head, tail], dim=1)
+        )
+    else:
+        globals_ = flat[:, :NUM_GLOBAL]
+
+    if batched:
+        return globals_, rows, mask
+    return globals_[0], rows[0], mask[0]
