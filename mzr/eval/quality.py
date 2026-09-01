@@ -28,7 +28,6 @@ import math
 
 import torch
 
-from mzr.eval.render import _bends
 from mzr.world.spec import NUM_ENDS
 
 _SQ2 = math.sqrt(2.0)
@@ -56,6 +55,11 @@ def route_quality(world) -> dict:
     middle, so a healthy leg is two runs of about half each; two long runs
     means they mirror-routed past each other and both pad-snapped.
     """
+    # Imported here, not at module scope: render.py pulls in
+    # diagnose_stage0 -> training.run, and run.py imports this module, so a
+    # top-level import is a cycle.
+    from mzr.eval.render import _bends
+
     rv = world.route_v.cpu().numpy()
     rn = world.route_n.cpu().numpy()
     pad = world.net_pad.cpu().numpy()
