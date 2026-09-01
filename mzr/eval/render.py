@@ -73,8 +73,12 @@ def _bends(pts: list[list[int]]) -> dict:
 
 
 @torch.no_grad()
-def export(policy, stage, device: str, seeds: list[int], deterministic: bool = True) -> dict:
-    env = make_env(stage, batch=len(seeds), device=device, seed=0)
+def export(policy, stage, device: str, seeds: list[int], deterministic: bool = True,
+           *, copper_seeded: bool = False, geodesic_refresh: int = 8) -> dict:
+    # The env must match the one the policy was TRAINED in. A copper-seeded
+    # policy measured in a pad-targeted world is measuring a different game.
+    env = make_env(stage, batch=len(seeds), device=device, seed=0,
+                   copper_seeded=copper_seeded, geodesic_refresh=geodesic_refresh)
     obs = env.reset(seeds=seeds)
 
     # Keepouts are static, so capture them before any copper is laid --
@@ -161,6 +165,7 @@ def main() -> int:
     p.add_argument("--boards", type=int, default=9)
     p.add_argument("--seeds", type=int, nargs="*", default=None,
                    help="explicit seeds; default is the first --boards eval seeds")
+    p.add_argument("--copper-seeded", action="store_true")
     p.add_argument("--sampled", action="store_true", help="export a sampled rollout instead of argmax")
     p.add_argument("--out", default="routes.json")
     args = p.parse_args()
@@ -169,7 +174,8 @@ def main() -> int:
     stage = STAGES[args.stage]
     seeds = args.seeds if args.seeds else EVAL_SEEDS[: args.boards]
     policy, _, _ = load_policy(args.ckpt, stage, args.device)
-    blob = export(policy, stage, args.device, seeds, deterministic=not args.sampled)
+    blob = export(policy, stage, args.device, seeds, deterministic=not args.sampled,
+                  copper_seeded=args.copper_seeded)
 
     with open(args.out, "w") as f:
         json.dump(blob, f, separators=(",", ":"))
