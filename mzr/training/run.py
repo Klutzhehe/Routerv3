@@ -36,6 +36,7 @@ import torch
 from mzr.env.route_env import EnvConfig, RouteEnv
 from mzr.models.policy import PriorPolicy
 from mzr.eval.quality import ProfileAccumulator, quality_verdict, route_quality
+from mzr.training.bc import ExpertActions
 from mzr.training.curriculum import EVAL_SEEDS, STAGES
 from mzr.training.ppo import PPOConfig, RolloutBuffer, ppo_update
 from mzr.world.engine import WorldConfig
@@ -128,10 +129,17 @@ def evaluate(policy, stage, device: str, eval_seeds: list[int], with_sampled: bo
     return out
 
 
-def collect(env: RouteEnv, policy, buf: RolloutBuffer, n_steps: int, obs):
-    """Run `n_steps` macro-steps, filling `buf`. Returns the trailing obs."""
+def collect(env: RouteEnv, policy, buf: RolloutBuffer, n_steps: int, obs,
+            expert: ExpertActions | None = None):
+    """Run `n_steps` macro-steps, filling `buf`. Returns the trailing obs.
+
+    `expert` supplies the behaviour-cloning demonstration. Without it
+    `bc_action` stays None and ppo.py's BC term short-circuits to zero -- which
+    is what `--bc-coef` silently did before this argument existed.
+    """
     for _ in range(n_steps):
         act = policy.act(obs, deterministic=False)
+        bc_action = expert.action(obs) if expert is not None else None
         step = env.step(act["action"])
         board_r = step.reward.sum(dim=1) + step.board_reward
         # Per-frontier reward, with the board-level term (failure penalty,
@@ -150,6 +158,7 @@ def collect(env: RouteEnv, policy, buf: RolloutBuffer, n_steps: int, obs):
             frontier_reward=frontier_r,
             frontier_value=act["value_f"],
             done=step.done * torch.ones(board_r.shape[0], device=board_r.device),
+            bc_action=bc_action,
         )
         obs = step.obs
         if step.done:
@@ -209,6 +218,11 @@ def main() -> int:
     p.add_argument("--leg-progress", type=float, default=None,
                    help="shape on the leg's closing gap instead of per-frontier "
                         "distance, so a leg is paid once for ground covered")
+    p.add_argument("--bc-negotiate", action="store_true",
+                   help="run PathFinder negotiation when planning demonstrations. "
+                        "Off by default: negotiation is what makes the expert a "
+                        "strong BASELINE, but for a demonstration the extra "
+                        "iterations mostly cost wall-clock in the collect loop.")
     p.add_argument("--bc-coef", type=float, default=None,
                    help="override the stage's BC weight (default: 0 -- pure RL)")
     p.add_argument("--field-width", type=int, default=40)
@@ -293,11 +307,19 @@ def main() -> int:
     print(f"gate: argmax {kind} >= {thr}, sustained 3 evals | bc_coef {bc} | kill: {stage.kill}")
 
     obs = env.reset()
+    expert = None
+    if bc > 0.0:
+        expert = ExpertActions(env, negotiate=args.bc_negotiate)
+        expert.plan()
+        print(f"BC on: expert demonstrations, coef {bc}, "
+              f"negotiate={args.bc_negotiate}, cloning direction+step only")
     hits = 0
     for u in range(start, args.updates):
         t0 = time.time()
         buf = RolloutBuffer()
-        obs = collect(env, policy, buf, args.rollout, obs)
+        if expert is not None and env.t == 0:
+            expert.plan()
+        obs = collect(env, policy, buf, args.rollout, obs, expert=expert)
         t_collect = time.time() - t0
         with torch.no_grad():
             _last = policy.act(obs, deterministic=False)
