@@ -694,6 +694,38 @@ def test_prior_policy_is_greedy_at_init_and_ppo_consistent() -> None:
         f"max delta {float((ev['logp'] - sampled['logp']).abs().max()):.1e}",
     )
 
+    # The joint (direction, step) mask, checked as a JOINT constraint.
+    #
+    # `obs.safety` is (B, F, 8, 3) and agrees with the engine's own `_plan`
+    # exactly (measured: 3384/3384 entries, 0 disagreements either way). The
+    # bug was never the mask, it was applying its two MARGINALS to two heads
+    # that sample independently: direction 3 legal at 1 cell, step 4 legal in
+    # some other direction, and the pair (3, 4-cell) forbidden by neither.
+    #
+    # That is the stage-0 livelock. A rejected move writes nothing, so the next
+    # observation is identical, and a deterministic policy re-picks the same
+    # illegal action until `max_stuck_steps` retires the net -- turning 23-of-24
+    # legal options into a guaranteed failure. Measured cost before the fix:
+    # 14 of 512 held-out boards, every one at 0.000 completion with 0 copper.
+    live = obs.frontier_mask
+    for arm, det in (("argmax", True), ("sampled", False)):
+        a = pol.act(obs, deterministic=det)["action"]
+        ok = torch.gather(
+            obs.safety, 2,
+            a["direction"].view(*a["direction"].shape, 1, 1)
+            .expand(*a["direction"].shape, 1, obs.safety.shape[-1]),
+        ).squeeze(2)                                   # (B, F, n_steps)
+        chosen = torch.gather(ok, 2, a["step"].unsqueeze(-1)).squeeze(-1)
+        # Only frontiers that HAVE a legal move can be held to this.
+        has_legal = obs.safety.any(dim=-1).any(dim=-1)
+        must = live & has_legal & (a["layer"] == 0)    # a via has its own mask
+        bad = int((must & ~chosen).sum())
+        check(
+            f"{arm} never selects a jointly-illegal (direction, step)",
+            bad == 0,
+            f"{bad} illegal of {int(must.sum())} live non-via actions",
+        )
+
     # The per-frontier value head is only reached through `value_f`, so a loss
     # built from `value` alone leaves it grad-less and this check calls a
     # healthy head dead. It fired that way from the moment --per-frontier-adv

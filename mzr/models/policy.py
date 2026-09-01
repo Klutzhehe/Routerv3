@@ -219,15 +219,32 @@ class PriorPolicy(nn.Module):
         nothing in `neuroroute/` once weight-driven logits grew during training.
         """
         d = logits["direction"]                                  # (B, F, 8)
-        s = logits["step"]                                       # (B, F, 3)
-        safe = obs.safety.float()                                # (B, F, 8, 3)
-        # A direction is available if it is safe at *some* step length; a step
-        # length is available if it is safe in *some* direction. Suppress the
-        # rest.
-        dir_ok = safe.amax(dim=-1) > 0.5
-        step_ok = safe.amax(dim=-2) > 0.5
+        safe = obs.safety                                        # (B, F, 8, 3) bool
+        # A direction is available if it is safe at *some* step length. That
+        # marginal is correct for the direction head.
+        #
+        # The STEP head is deliberately NOT masked here. Its marginal ("legal
+        # in some direction") is unsound, because direction and step are
+        # sampled independently from factored heads: marginalising the joint
+        # mask lets the policy pick a direction that is legal at 1 cell and a
+        # step of 4 cells that is legal in some *other* direction, and land on
+        # a combination neither marginal forbids.
+        #
+        # That is not hypothetical -- it is the stage-0 livelock. Measured on
+        # the failing seeds: 23 of 24 actions legal, and argmax picked the one
+        # illegal (direction, step) pair on all 16 steps until `max_stuck_steps`
+        # retired the net. Because a rejected move writes nothing, the next
+        # observation is identical and a deterministic policy re-picks it
+        # forever. `_step_logits_given_direction` applies the joint constraint
+        # exactly, conditioned on the direction actually chosen.
+        dir_ok = safe.any(dim=-1)                                # (B, F, 8)
+        # A frontier with no legal direction at all is genuinely entombed.
+        # Masking everything would make the logits all -inf and the Categorical
+        # NaN, so leave it unmasked and let the engine's stuck counter retire
+        # it -- which is that counter's correct remaining job.
+        dir_ok = torch.where(dir_ok.any(dim=-1, keepdim=True), dir_ok,
+                             torch.ones_like(dir_ok))
         logits["direction"] = d - _BIG * (~dir_ok).float()
-        logits["step"] = s - _BIG * (~step_ok).float()
 
         via_ok = obs.via_safe.float()                            # (B, F, L)
         stay = torch.ones_like(via_ok[..., :1])
@@ -261,16 +278,55 @@ class PriorPolicy(nn.Module):
 
     # -- rollout / update API -------------------------------------------
 
+    @staticmethod
+    def _step_logits_given_direction(
+        step_logits: torch.Tensor, safety: torch.Tensor, direction: torch.Tensor
+    ) -> torch.Tensor:
+        """Mask the step head by the legality of (direction, step) JOINTLY.
+
+        `safety` is egocentric-indexed, and so is the `direction` head, so this
+        is a direct gather with no rotation.
+
+        Applied identically in `act()` and `evaluate()`. That is not a detail:
+        the PPO ratio is exp(evaluate_logp - act_logp), so if only one of them
+        conditioned the step head the two would be different distributions and
+        the ratio would be noise with nothing raising an error --  the failure
+        `verify_world`'s "act() and evaluate() give identical log-probs" check
+        exists to catch.
+        """
+        B, F, _, n_steps = safety.shape
+        idx = direction.view(B, F, 1, 1).expand(B, F, 1, n_steps)
+        ok = torch.gather(safety, 2, idx).squeeze(2)             # (B, F, n_steps)
+        # No legal step in the chosen direction: leave unmasked rather than
+        # emit all -inf. Only reachable when the direction head was itself
+        # unmasked because every direction was blocked (true entombment).
+        ok = torch.where(ok.any(dim=-1, keepdim=True), ok, torch.ones_like(ok))
+        return step_logits - _BIG * (~ok).float()
+
     def _dists(self, logits: dict[str, torch.Tensor]) -> dict[str, torch.distributions.Categorical]:
         return {k: torch.distributions.Categorical(logits=v) for k, v in logits.items()}
 
     @torch.no_grad()
     def act(self, obs: Observation, deterministic: bool = False) -> dict:
         out = self.forward(obs)
-        dists = self._dists(out.logits)
+        logits = dict(out.logits)
         action, logp = {}, {}
-        for k, dist in dists.items():
-            a = dist.probs.argmax(dim=-1) if deterministic else dist.sample()
+
+        # Direction first: the step head's mask depends on which direction was
+        # actually chosen, so the action is drawn autoregressively over exactly
+        # these two heads. Everything else stays conditionally independent.
+        pick = (lambda dist: dist.probs.argmax(dim=-1)) if deterministic else (lambda dist: dist.sample())
+        d_dist = torch.distributions.Categorical(logits=logits["direction"])
+        action["direction"] = pick(d_dist)
+        logp["direction"] = d_dist.log_prob(action["direction"])
+
+        logits["step"] = self._step_logits_given_direction(
+            logits["step"], obs.safety, action["direction"]
+        )
+        for k, dist in self._dists(
+            {k: v for k, v in logits.items() if k != "direction"}
+        ).items():
+            a = pick(dist)
             action[k] = a
             logp[k] = dist.log_prob(a)
         m = obs.frontier_mask.float()
@@ -290,7 +346,13 @@ class PriorPolicy(nn.Module):
 
     def evaluate(self, obs: Observation, action: dict[str, torch.Tensor]) -> dict:
         out = self.forward(obs)
-        dists = self._dists(out.logits)
+        logits = dict(out.logits)
+        # Condition on the direction that was actually taken, so this is the
+        # same distribution act() drew from. See _step_logits_given_direction.
+        logits["step"] = self._step_logits_given_direction(
+            logits["step"], obs.safety, action["direction"]
+        )
+        dists = self._dists(logits)
         m = obs.frontier_mask.float()
         logp = torch.zeros_like(m)
         ent = torch.zeros_like(m)
