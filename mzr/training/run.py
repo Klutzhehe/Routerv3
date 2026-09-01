@@ -154,6 +154,10 @@ def main() -> int:
     p.add_argument("--tip-progress", type=float, default=None,
                    help="dense weight on closing the distance to this frontier's "
                         "partner (the other end of its own leg)")
+    p.add_argument("--tip-progress", type=float, default=None,
+                   help="dense reward for closing on the partner frontier (the "
+                        "other end of the same leg); the only term that charges "
+                        "back a redundant traverse")
     p.add_argument("--leg-progress", type=float, default=None,
                    help="shape on the leg's closing gap instead of per-frontier "
                         "distance, so a leg is paid once for ground covered")
@@ -193,6 +197,8 @@ def main() -> int:
     opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
     if args.progress_coef is not None:
         stage.reward.progress = args.progress_coef
+    if args.tip_progress is not None:
+        stage.reward.tip_progress = args.tip_progress
     if args.leg_progress is not None:
         stage.reward.leg_progress = args.leg_progress
     if args.tip_progress is not None:

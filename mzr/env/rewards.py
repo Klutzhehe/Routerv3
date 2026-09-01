@@ -150,6 +150,8 @@ def step_reward(
         r = cfg.progress * (res.progress / LENGTH_SCALE)
     if cfg.tip_progress > 0.0:
         r = r + cfg.tip_progress * (res.tip_progress / LENGTH_SCALE)
+    if cfg.tip_progress > 0.0:
+        r = r + cfg.tip_progress * (res.tip_progress / LENGTH_SCALE)
     r = r - cfg.step_cost * live
     r = r - cfg.rejection * res.rejected.float()
     r = r - cfg.contended * res.contended.float()
