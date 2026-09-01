@@ -47,6 +47,9 @@ def make_env(stage, batch: int, device: str, seed: int) -> RouteEnv:
             world=WorldConfig(
                 batch_size=batch,
                 max_nets=stage.generator.num_nets + 6,
+                # A k-pin net needs k-1 legs; a diff pair needs 2. This
+                # multiplies F and therefore fr_geo, the dominant memory term.
+                max_legs=max(2, stage.generator.max_pins_per_net - 1),
                 max_macro_steps=stage.max_macro_steps,
                 max_steps_per_frontier=stage.max_macro_steps,
                 ripup=stage.ripup,

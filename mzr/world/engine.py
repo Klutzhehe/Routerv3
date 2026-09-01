@@ -30,10 +30,11 @@ Two consequences worth stating because they are the reason the design works:
   in NeuroRoute. `step()` is **plan -> arbitrate -> commit**, which makes it
   impossible rather than unlikely.
 
-Frontier indexing: ``f = (net * 2 + leg) * 2 + end``, so all frontier state is
-``(B, F, ...)`` with ``F = max_nets * 2 * 2``. Leg 1 exists only for
-differential pairs; end 0 grows from `src`, end 1 from `dst`, and each targets
-the *other* end's pad.
+Frontier indexing: ``f = (net * max_legs + leg) * NUM_ENDS + end``, so all
+frontier state is ``(B, F, ...)`` with ``F = max_nets * max_legs * NUM_ENDS``.
+A k-pin net decomposes into k-1 spanning-tree legs; a differential pair uses
+exactly 2 (its P and N conductors). End 0 grows from `src`, end 1 from `dst`,
+and each targets the *other* end's pad.
 """
 
 from __future__ import annotations
@@ -92,6 +93,14 @@ class WorldConfig:
     #: purpose: at stages 1+ a frontier may be blocked for several steps by
     #: copper that a rip-up round is about to clear.
     max_stuck_steps: int = 16
+    #: Legs (two-pin connections) a net may have. A k-pin net decomposes into
+    #: k-1 spanning-tree legs, so this is the maximum pin count minus one; a
+    #: differential pair uses exactly 2 (its P and N conductors).
+    #:
+    #: It multiplies `F`, and `fr_geo` -- a coarse 3-D geodesic field PER
+    #: FRONTIER -- is the dominant memory term in the whole system, so raising
+    #: this is a real memory decision, not a free generalisation.
+    max_legs: int = 2
     #: Cells within which a frontier may snap onto its target pad, or onto its
     #: partner frontier. MUST be >= max(STEP_LENGTHS) / 2, or a long step jumps
     #: clean over the snap zone and the frontier orbits its target forever -- a
@@ -189,7 +198,7 @@ class SimultaneousRouterWorld:
         self.tables = geo.build_tables(spec.rules, self.device)
 
         B, N = cfg.batch_size, cfg.max_nets
-        F = N * 2 * NUM_ENDS
+        F = N * cfg.max_legs * NUM_ENDS
         L, H, W = spec.num_layers, spec.height_cells, spec.width_cells
         ds = cfg.geodesic_downsample
         h, w = max(1, H // ds), max(1, W // ds)
@@ -205,13 +214,13 @@ class SimultaneousRouterWorld:
 
         # -- net table --
         #: (B, N, leg, end, 3) -- pad cell of each end of each leg.
-        self.net_pad = z(B, N, 2, NUM_ENDS, 3)
+        self.net_pad = z(B, N, cfg.max_legs, NUM_ENDS, 3)
         self.net_kind = z(B, N)
         self.net_width = z(B, N)
         self.net_group = torch.full((B, N), -1, dtype=torch.int64, device=dev)
         self.net_status = torch.full((B, N), STATUS_DONE, dtype=torch.int64, device=dev)
         self.net_valid = torch.zeros(B, N, dtype=torch.bool, device=dev)
-        self.net_len = torch.zeros(B, N, 2, dtype=torch.float32, device=dev)
+        self.net_len = torch.zeros(B, N, cfg.max_legs, dtype=torch.float32, device=dev)
         self.net_target_len = torch.full((B, N), -1.0, dtype=torch.float32, device=dev)
         self.net_vias = z(B, N)
         self.net_split = torch.zeros(B, N, dtype=torch.float32, device=dev)
@@ -219,8 +228,8 @@ class SimultaneousRouterWorld:
         self.ripup_count = z(B)
 
         #: (B, N, leg) -- does this leg exist, and is it connected end-to-end?
-        self.leg_valid = torch.zeros(B, N, 2, dtype=torch.bool, device=dev)
-        self.leg_done = torch.zeros(B, N, 2, dtype=torch.bool, device=dev)
+        self.leg_valid = torch.zeros(B, N, cfg.max_legs, dtype=torch.bool, device=dev)
+        self.leg_done = torch.zeros(B, N, cfg.max_legs, dtype=torch.bool, device=dev)
 
         # -- frontier table --
         self.fr_pos = z(B, F, 3)
@@ -239,8 +248,8 @@ class SimultaneousRouterWorld:
         #: Pad-to-pad geodesic per leg, and the gap still to close between its
         #: two frontiers. gap = d_src_end + d_dst_end - D, which starts at D and
         #: reaches 0 exactly when the pair has collectively covered the route.
-        self.leg_D = torch.zeros(B, cfg.max_nets, 2, dtype=torch.float32, device=dev)
-        self.leg_gap = torch.zeros(B, cfg.max_nets, 2, dtype=torch.float32, device=dev)
+        self.leg_D = torch.zeros(B, cfg.max_nets, cfg.max_legs, dtype=torch.float32, device=dev)
+        self.leg_gap = torch.zeros(B, cfg.max_nets, cfg.max_legs, dtype=torch.float32, device=dev)
         #: Distance from each frontier to its partner, in cells.
         self.fr_tip = torch.zeros(B, F, dtype=torch.float32, device=dev)
         self.fr_prev = torch.zeros(B, F, dtype=torch.float32, device=dev)
@@ -276,9 +285,9 @@ class SimultaneousRouterWorld:
         return (net * 2 + leg) * NUM_ENDS + end
 
     def _fr_view(self, t: torch.Tensor) -> torch.Tensor:
-        """(B, F, ...) -> (B, N, 2, 2, ...), for leg- or end-wise reductions."""
+        """(B, F, ...) -> (B, N, max_legs, NUM_ENDS, ...), for leg/end reductions."""
         B = t.shape[0]
-        return t.view(B, self.cfg.max_nets, 2, NUM_ENDS, *t.shape[2:])
+        return t.view(B, self.cfg.max_nets, self.cfg.max_legs, NUM_ENDS, *t.shape[2:])
 
     # -- loading ------------------------------------------------------------
 
@@ -324,16 +333,25 @@ class SimultaneousRouterWorld:
         self.pour.copy_(torch.from_numpy(pour).to(self.device))
         self.occ.copy_(self.static)
 
-        pad = np.zeros((B, N, 2, NUM_ENDS, 3), dtype=np.int64)
+        pad = np.zeros((B, N, self.cfg.max_legs, NUM_ENDS, 3), dtype=np.int64)
         kind = np.zeros((B, N), dtype=np.int64)
         width = np.zeros_like(kind)
         group = np.full_like(kind, -1)
         valid = np.zeros((B, N), dtype=bool)
-        leg_valid = np.zeros((B, N, 2), dtype=bool)
+        leg_valid = np.zeros((B, N, self.cfg.max_legs), dtype=bool)
 
         for bi, board in enumerate(boards):
             for ni, net in enumerate(board.netlist.nets[:N]):
-                for li, (s, d) in enumerate(net.endpoints()):
+                legs = net.endpoints()
+                if len(legs) > self.cfg.max_legs:
+                    # Truncating here would drop pins silently and read later as
+                    # a routing failure on a net that was never fully loaded.
+                    raise ValueError(
+                        f"net {ni} needs {len(legs)} legs "
+                        f"({len(net.pins)} pins) but WorldConfig.max_legs is "
+                        f"{self.cfg.max_legs}"
+                    )
+                for li, (s, d) in enumerate(legs):
                     pad[bi, ni, li, END_SRC] = s
                     pad[bi, ni, li, END_DST] = d
                     leg_valid[bi, ni, li] = True
@@ -367,8 +385,8 @@ class SimultaneousRouterWorld:
         each other and meet in the middle.
         """
         B, N = net_mask.shape
-        alive = net_mask.view(B, N, 1, 1) & self.leg_valid.view(B, N, 2, 1)
-        alive = alive.expand(B, N, 2, NUM_ENDS).reshape(B, self.F)
+        alive = net_mask.view(B, N, 1, 1) & self.leg_valid.view(B, N, self.cfg.max_legs, 1)
+        alive = alive.expand(B, N, self.cfg.max_legs, NUM_ENDS).reshape(B, self.F)
         pos = self.net_pad.view(B, self.F, 3)
 
         self.fr_alive = torch.where(alive, torch.ones_like(alive), self.fr_alive & ~alive)
@@ -411,7 +429,7 @@ class SimultaneousRouterWorld:
 
         b_i = bb[mask]
         f_i = torch.arange(self.F, device=self.device).view(1, self.F).expand(B, self.F)[mask]
-        n_i = f_i // (2 * NUM_ENDS)
+        n_i = f_i // (self.cfg.max_legs * NUM_ENDS)
         tgt = self._target_pad()[mask]
 
         own = (n_i + 1).view(-1, 1, 1, 1).to(self.occ.dtype)
@@ -439,7 +457,7 @@ class SimultaneousRouterWorld:
         """
         B, F = self.cfg.batch_size, self.F
         return (
-            self.fr_pos.view(B, self.cfg.max_nets, 2, NUM_ENDS, 3)
+            self.fr_pos.view(B, self.cfg.max_nets, self.cfg.max_legs, NUM_ENDS, 3)
             .flip(dims=[3])
             .reshape(B, F, 3)
         )
@@ -486,7 +504,7 @@ class SimultaneousRouterWorld:
         M = B * F
         bb = torch.arange(B, device=self.device).view(B, 1).expand(B, F).reshape(M)
         pos = self.fr_pos.reshape(M, 3)
-        n_i = (torch.arange(F, device=self.device) // (2 * NUM_ENDS)).view(1, F).expand(B, F).reshape(M)
+        n_i = (torch.arange(F, device=self.device) // (self.cfg.max_legs * NUM_ENDS)).view(1, F).expand(B, F).reshape(M)
         w_i = self.net_width.gather(1, n_i.view(B, F)).reshape(M)
 
         free = geo.raycast(
@@ -538,8 +556,8 @@ class SimultaneousRouterWorld:
 
         bb = torch.arange(B, device=dev).view(B, 1).expand(B, F)
         f_idx = torch.arange(F, device=dev).view(1, F).expand(B, F)
-        net = f_idx // (2 * NUM_ENDS)
-        leg = (f_idx // NUM_ENDS) % 2
+        net = f_idx // (self.cfg.max_legs * NUM_ENDS)
+        leg = (f_idx // NUM_ENDS) % self.cfg.max_legs
 
         live = self.fr_alive & (self.net_status.gather(1, net) == STATUS_ROUTING)
         is_pair = self.net_kind.gather(1, net) == KIND_DIFF_PAIR
@@ -555,8 +573,8 @@ class SimultaneousRouterWorld:
         coupled = is_pair & (couple > 0) & live
         v = lambda t: self._fr_view(t)  # noqa: E731
         # Leg 0's action is the shared one when coupled.
-        lead = lambda t: v(t)[:, :, 0:1].expand(B, self.cfg.max_nets, 2, NUM_ENDS).reshape(B, F)  # noqa: E731
-        cpl_any = v(coupled).any(dim=2, keepdim=True).expand(B, self.cfg.max_nets, 2, NUM_ENDS).reshape(B, F)
+        lead = lambda t: v(t)[:, :, 0:1].expand(B, self.cfg.max_nets, self.cfg.max_legs, NUM_ENDS).reshape(B, F)  # noqa: E731
+        cpl_any = v(coupled).any(dim=2, keepdim=True).expand(B, self.cfg.max_nets, self.cfg.max_legs, NUM_ENDS).reshape(B, F)
         direction = torch.where(cpl_any, lead(direction), direction)
         step_class = torch.where(cpl_any, lead(step_class), step_class)
         layer_action = torch.where(cpl_any, lead(layer_action), layer_action)
@@ -631,7 +649,7 @@ class SimultaneousRouterWorld:
         # once the partner retires there is nothing left to converge on, and
         # paying for it would reward chasing a frontier that has stopped.
         new_tip = self._tip_dist()
-        partner_live = live.view(B, self.cfg.max_nets, 2, NUM_ENDS).flip(dims=[3]).reshape(B, F)
+        partner_live = live.view(B, self.cfg.max_nets, self.cfg.max_legs, NUM_ENDS).flip(dims=[3]).reshape(B, F)
         tip_progress = torch.where(
             live & partner_live, self.fr_tip - new_tip, torch.zeros_like(new_tip)
         )
@@ -643,7 +661,7 @@ class SimultaneousRouterWorld:
         self.leg_gap = gap
         # Split across the leg's frontiers so the pair collects it once.
         leg_progress = (
-            (leg_delta * 0.5).unsqueeze(-1).expand(B, self.cfg.max_nets, 2, NUM_ENDS).reshape(B, F)
+            (leg_delta * 0.5).unsqueeze(-1).expand(B, self.cfg.max_nets, self.cfg.max_legs, NUM_ENDS).reshape(B, F)
         )
 
         self.fr_steps = torch.where(live, self.fr_steps + 1, self.fr_steps)
@@ -656,7 +674,7 @@ class SimultaneousRouterWorld:
         # A leg is done when it is connected; a net is done when every valid
         # leg is. Frontiers of a done leg stop.
         leg_live = self.leg_valid & ~self.leg_done
-        self.fr_alive &= leg_live.unsqueeze(-1).expand(B, self.cfg.max_nets, 2, NUM_ENDS).reshape(B, F)
+        self.fr_alive &= leg_live.unsqueeze(-1).expand(B, self.cfg.max_nets, self.cfg.max_legs, NUM_ENDS).reshape(B, F)
 
         routing = self.net_status == STATUS_ROUTING
         net_done = routing & self.net_valid & (self.leg_done | ~self.leg_valid).all(dim=-1)
@@ -792,7 +810,7 @@ class SimultaneousRouterWorld:
         did_via = go & plan.want_via
         did_move = go & plan.want_move
 
-        leg = ((torch.arange(F, device=self.device) // NUM_ENDS) % 2).view(1, F).expand(B, F).reshape(M)
+        leg = ((torch.arange(F, device=self.device) // NUM_ENDS) % self.cfg.max_legs).view(1, F).expand(B, F).reshape(M)
         self.net_vias.view(-1).scatter_add_(
             0,
             (b_i * self.cfg.max_nets + n_i)[did_via],
@@ -876,7 +894,7 @@ class SimultaneousRouterWorld:
         M = B * F
         r = self.cfg.snap_radius
 
-        pv = self.fr_pos.view(B, N, 2, NUM_ENDS, 3)
+        pv = self.fr_pos.view(B, N, self.cfg.max_legs, NUM_ENDS, 3)
         a = pv[:, :, :, END_SRC]  # (B, N, 2, 3)
         c = pv[:, :, :, END_DST]
         alive = self._fr_view(self.fr_alive)
@@ -893,7 +911,7 @@ class SimultaneousRouterWorld:
             return
         # Expressed as a connect from the END_SRC frontier to the END_DST
         # frontier's live position, so it shares one code path with pad snap.
-        sel = torch.zeros(B, N, 2, NUM_ENDS, dtype=torch.bool, device=self.device)
+        sel = torch.zeros(B, N, self.cfg.max_legs, NUM_ENDS, dtype=torch.bool, device=self.device)
         sel[:, :, :, END_SRC] = near
         target = torch.zeros_like(pv)
         target[:, :, :, END_SRC] = c
@@ -932,7 +950,7 @@ class SimultaneousRouterWorld:
             return
         geo.write_claims(self.occ, sflat, svalid, n_i, done)
 
-        leg = ((torch.arange(F, device=self.device) // NUM_ENDS) % 2).view(1, F).expand(B, F).reshape(M)
+        leg = ((torch.arange(F, device=self.device) // NUM_ENDS) % self.cfg.max_legs).view(1, F).expand(B, F).reshape(M)
         dy = (tgt[:, 1] - pos[:, 1]).float()
         dx = (tgt[:, 2] - pos[:, 2]).float()
         self.net_len.view(-1).scatter_add_(
@@ -955,7 +973,7 @@ class SimultaneousRouterWorld:
         self.net_status = torch.where(
             net_mask, torch.full_like(self.net_status, status), self.net_status
         )
-        stop = net_mask.view(B, N, 1, 1).expand(B, N, 2, NUM_ENDS).reshape(B, self.F)
+        stop = net_mask.view(B, N, 1, 1).expand(B, N, self.cfg.max_legs, NUM_ENDS).reshape(B, self.F)
         self.fr_alive &= ~stop
         return net_mask.sum(dim=1)
 
@@ -1035,7 +1053,7 @@ class SimultaneousRouterWorld:
             sel, torch.full_like(self.net_status, STATUS_ROUTING), self.net_status
         )
         self._seed_frontiers(sel)
-        stop = sel.view(B, N, 1, 1).expand(B, N, 2, NUM_ENDS).reshape(B, self.F)
+        stop = sel.view(B, N, 1, 1).expand(B, N, self.cfg.max_legs, NUM_ENDS).reshape(B, self.F)
         self._refresh_geodesic(stop & self.fr_alive)
 
     # -- metrics ------------------------------------------------------------

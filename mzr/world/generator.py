@@ -50,6 +50,15 @@ class GeneratorConfig:
     length_group_size: int = 4
     #: Fraction of nets asking for a non-minimum track width.
     wide_net_frac: float = 0.0
+    #: Fraction of plain nets that get more than two pins, and the most pins
+    #: such a net may have. Real netlists are full of these -- a power or clock
+    #: net routinely has many pins -- and a k-pin net routes as k-1 legs.
+    #:
+    #: `max_pins_per_net - 1` is the `WorldConfig.max_legs` a board needs, and
+    #: max_legs multiplies `F` and therefore `fr_geo`, the dominant memory term.
+    #: Raising this is a memory decision.
+    multi_pin_frac: float = 0.0
+    max_pins_per_net: int = 2
     #: Rectangular keepouts (mounting holes, connectors, antenna clearance).
     num_keepouts: int = 0
     keepout_max_cells: int = 10
@@ -75,9 +84,17 @@ class GeneratedBoard:
 
 
 def _pins_required(cfg: GeneratorConfig) -> int:
-    """Pins the requested netlist needs. A differential pair needs four."""
+    """Pins the requested netlist needs.
+
+    A differential pair needs four. A multi-pin net needs up to
+    `max_pins_per_net`, and the budget assumes the worst case -- running short
+    silently yields fewer nets than asked for, which drags completion down for
+    a reason that has nothing to do with routing skill.
+    """
     pairs = int(round(cfg.num_nets * cfg.diff_pair_frac))
-    return 2 * (cfg.num_nets - pairs) + 4 * pairs
+    plain = cfg.num_nets - pairs
+    multi = int(round(plain * cfg.multi_pin_frac)) if cfg.max_pins_per_net > 2 else 0
+    return 4 * pairs + 2 * (plain - multi) + cfg.max_pins_per_net * multi
 
 
 def _component_pins(
@@ -263,7 +280,14 @@ def generate_board(
 
     # --- plain single nets ---------------------------------------------------
     while len(nets) < cfg.num_nets:
-        sel = take(2)
+        # A multi-pin net takes k pins from the same pool; NetSpec.endpoints()
+        # spans them with an MST, so nothing downstream needs to know.
+        k = 2
+        if cfg.max_pins_per_net > 2 and rng.random() < cfg.multi_pin_frac:
+            k = int(rng.integers(3, cfg.max_pins_per_net + 1))
+        sel = take(k)
+        if sel is None and k > 2:
+            sel = take(2)          # not enough pins left for a multi-pin net
         if sel is None:
             break
         wide = rng.random() < cfg.wide_net_frac
@@ -272,6 +296,7 @@ def generate_board(
             NetSpec(
                 src=tuple(int(v) for v in sel[0]),
                 dst=tuple(int(v) for v in sel[1]),
+                extra_pins=tuple(tuple(int(v) for v in q) for q in sel[2:]),
                 kind=KIND_SINGLE,
                 width_class=wc,
             )

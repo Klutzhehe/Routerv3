@@ -103,7 +103,8 @@ def export(policy, stage, device: str, seeds: list[int], deterministic: bool = T
 
     boards = []
     for b, seed in enumerate(seeds):
-        # One polyline per frontier. Frontier f belongs to net f // (2*NUM_ENDS);
+        # One polyline per frontier. Frontier f belongs to net
+        # f // (max_legs * NUM_ENDS);
         # each net grows from both pads, so a finished leg is two runs that meet
         # in the middle rather than one path from src to dst.
         traces = []
@@ -112,7 +113,7 @@ def export(policy, stage, device: str, seeds: list[int], deterministic: bool = T
             if n < 2:
                 continue
             pts = rv[b, f, :n].astype(int).tolist()
-            traces.append({"net": f // (2 * NUM_ENDS), "frontier": f,
+            traces.append({"net": f // (w.cfg.max_legs * NUM_ENDS), "frontier": f,
                            "pts": pts, "bends": _bends(pts)})
 
         nets = []

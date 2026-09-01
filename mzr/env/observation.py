@@ -193,7 +193,7 @@ def build_observation(world) -> Observation:
     ds = world.cfg.geodesic_downsample
 
     f_idx = torch.arange(F, device=dev).view(1, F).expand(B, F)
-    net = f_idx // (2 * NUM_ENDS)
+    net = f_idx // (world.cfg.max_legs * NUM_ENDS)
     b_flat = torch.arange(B, device=dev).view(B, 1).expand(B, F).reshape(M)
     n_flat = net.reshape(M)
 
@@ -294,7 +294,11 @@ def build_observation(world) -> Observation:
         1, net.unsqueeze(-1).expand(B, F, 2)
     ).reshape(M, 2).sum(dim=-1) / LENGTH_SCALE
     steps_used = world.fr_steps.reshape(M).float() / max(1, world.cfg.max_steps_per_frontier)
-    partner = world.fr_pos.view(B, N, 2, NUM_ENDS, 3).flip(dims=[3]).reshape(M, 3)
+    partner = (
+        world.fr_pos.view(B, N, world.cfg.max_legs, NUM_ENDS, 3)
+        .flip(dims=[3])
+        .reshape(M, 3)
+    )
     to_partner = (partner[:, 1:] - pos[:, 1:]).float().norm(dim=-1) / LENGTH_SCALE
     own_price = price[b_flat, pos[:, 0], pos[:, 1], pos[:, 2]]
 

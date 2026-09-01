@@ -235,6 +235,14 @@ class NetSpec:
     #: Second leg, diff pairs only.
     src_n: tuple[int, int, int] | None = None
     dst_n: tuple[int, int, int] | None = None
+    #: Extra pins beyond `src`/`dst`, for a multi-pin net. A real netlist is
+    #: full of these -- a power or clock net routinely has many pins -- and a
+    #: k-pin net is routed as **k-1 two-pin legs**, not as one path.
+    #:
+    #: Not usable with `KIND_DIFF_PAIR`: that kind already spends both legs on
+    #: the P and N conductors, and the pair semantics (`couple`, `pair_gap`,
+    #: `pair_skew`) are meaningless across tree edges.
+    extra_pins: tuple[tuple[int, int, int], ...] = ()
     #: Nominal edge-to-edge pair gap, in cells. 1 = adjacent lattice tracks.
     pair_gap_cells: int = 1
     #: Length-matched group id, or -1. Members of a group are tuned to the
@@ -250,13 +258,54 @@ class NetSpec:
     def is_pair(self) -> bool:
         return self.kind == KIND_DIFF_PAIR
 
+    @property
+    def pins(self) -> list[tuple[int, int, int]]:
+        """Every pin on this net, in a stable order."""
+        return [self.src, self.dst, *self.extra_pins]
+
     def endpoints(self) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
-        """(src, dst) per leg. One entry for a single net, two for a pair."""
-        legs = [(self.src, self.dst)]
+        """(src, dst) per leg.
+
+        * A two-pin net is one leg.
+        * A differential pair is two legs -- the P and N conductors, which are
+          separate wires that must stay parallel, NOT a tree over four pins.
+        * A k-pin net is **k-1 legs**, a minimum spanning tree over its pins
+          under planar distance.
+
+        The spanning tree is why a k-pin net does not need a new frontier
+        concept: each leg is still an ordinary two-ended connection, so a pin
+        shared by two tree edges simply hosts two frontiers and becomes a
+        branch point. A real router would use a rectilinear *Steiner* tree,
+        which may branch away from any pin and is shorter; an MST is the
+        standard cheap approximation and never exceeds ~1.5x its length.
+        """
         if self.is_pair:
             if self.src_n is None or self.dst_n is None:
                 raise ValueError("a diff-pair NetSpec needs src_n and dst_n")
-            legs.append((self.src_n, self.dst_n))
+            if self.extra_pins:
+                raise ValueError("a diff-pair NetSpec cannot also carry extra_pins")
+            return [(self.src, self.dst), (self.src_n, self.dst_n)]
+
+        pins = self.pins
+        if len(pins) <= 2:
+            return [(self.src, self.dst)]
+
+        # Prim's algorithm on planar distance. Pin counts here are small (a
+        # netlist pin field, not a graph problem), so O(k^2) is the right call.
+        def d2(a, b):
+            return (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
+
+        connected = [0]
+        remaining = list(range(1, len(pins)))
+        legs: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+        while remaining:
+            best = min(
+                ((c, r) for c in connected for r in remaining),
+                key=lambda cr: d2(pins[cr[0]], pins[cr[1]]),
+            )
+            legs.append((pins[best[0]], pins[best[1]]))
+            connected.append(best[1])
+            remaining.remove(best[1])
         return legs
 
 
@@ -271,8 +320,13 @@ class Netlist:
 
     @property
     def num_legs(self) -> int:
-        """Legs across all nets. A diff pair has two."""
-        return sum(2 if n.is_pair else 1 for n in self.nets)
+        """Legs across all nets: two for a diff pair, k-1 for a k-pin net."""
+        return sum(len(n.endpoints()) for n in self.nets)
+
+    @property
+    def max_legs(self) -> int:
+        """Legs on the busiest net -- the `WorldConfig.max_legs` this needs."""
+        return max((len(n.endpoints()) for n in self.nets), default=1)
 
     @property
     def num_frontiers(self) -> int:

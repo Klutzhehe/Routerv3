@@ -125,7 +125,7 @@ class RouteEnv:
         self._leg_done_prev = w.leg_done.clone()
         arrived = (
             newly.unsqueeze(-1)
-            .expand(B, self.cfg.world.max_nets, 2, NUM_ENDS)
+            .expand(B, self.cfg.world.max_nets, self.cfg.world.max_legs, NUM_ENDS)
             .reshape(B, F)
         )
 
