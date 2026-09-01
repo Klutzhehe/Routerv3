@@ -62,6 +62,20 @@ class RewardConfig:
     #: covered once and pays nothing for a frontier that keeps going after the
     #: work is done.
     leg_progress: float = 0.0
+    #: Dense weight on closing the distance to this frontier's **partner** --
+    #: the other end of its own leg. Added to `progress`, not a replacement.
+    #:
+    #: This is the only shaping term whose sign flips on a redundant traverse.
+    #: Two frontiers mirror-routing around opposite sides of an obstacle end up
+    #: SWAPPING positions, so tip distance runs D -> narrow -> D and the second
+    #: half of the detour is charged. `progress` (distance to the far pad) and
+    #: `leg_progress` (the leg gap) both keep paying straight through that swap,
+    #: which is why neither stopped the loop -- measured, twice.
+    #:
+    #: Pairing is per-LEG, so it generalises to any net count, and a
+    #: differential pair's two legs pair up independently rather than the P leg
+    #: chasing the N leg.
+    tip_progress: float = 0.0
     #: Flat per-step cost, so finishing sooner is strictly better.
     step_cost: float = 0.01
     #: This frontier's move was illegal. See calibration note 2.
@@ -134,6 +148,8 @@ def step_reward(
         r = cfg.leg_progress * (res.leg_progress / LENGTH_SCALE)
     else:
         r = cfg.progress * (res.progress / LENGTH_SCALE)
+    if cfg.tip_progress > 0.0:
+        r = r + cfg.tip_progress * (res.tip_progress / LENGTH_SCALE)
     r = r - cfg.step_cost * live
     r = r - cfg.rejection * res.rejected.float()
     r = r - cfg.contended * res.contended.float()

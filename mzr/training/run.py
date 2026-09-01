@@ -151,6 +151,9 @@ def main() -> int:
                         "line, charged per completed net across BOTH frontiers")
     p.add_argument("--corner", type=float, default=None,
                    help="per 45-degree octant of bend beyond the first")
+    p.add_argument("--tip-progress", type=float, default=None,
+                   help="dense weight on closing the distance to this frontier's "
+                        "partner (the other end of its own leg)")
     p.add_argument("--leg-progress", type=float, default=None,
                    help="shape on the leg's closing gap instead of per-frontier "
                         "distance, so a leg is paid once for ground covered")
@@ -192,6 +195,8 @@ def main() -> int:
         stage.reward.progress = args.progress_coef
     if args.leg_progress is not None:
         stage.reward.leg_progress = args.leg_progress
+    if args.tip_progress is not None:
+        stage.reward.tip_progress = args.tip_progress
     if args.wirelength is not None:
         stage.reward.wirelength = args.wirelength
     if args.corner is not None:

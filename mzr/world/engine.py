@@ -166,6 +166,17 @@ class StepResult:
     #: laid ~2.2x the necessary copper in a closed loop, while `completion` read
     #: 1.000 because the net was connected -- twice.
     leg_progress: torch.Tensor
+    #: (B, F) reduction this step in the distance to this frontier's PARTNER --
+    #: the other end of its own leg, never another net.
+    #:
+    #: This is the only shaping term that can stop double-routing, because it is
+    #: the only one whose sign flips when a frontier keeps going after the pair
+    #: has passed each other. Two frontiers that mirror-route around opposite
+    #: sides of an obstacle end up SWAPPING positions, so tip distance runs
+    #: D -> narrow -> D and the second half of the detour is charged. Distance
+    #: to the far pad (`progress`) and the leg gap (`leg_progress`) both keep
+    #: paying through that swap, which is why neither stopped the loop.
+    tip_progress: torch.Tensor
 
 
 class SimultaneousRouterWorld:
@@ -230,6 +241,8 @@ class SimultaneousRouterWorld:
         #: reaches 0 exactly when the pair has collectively covered the route.
         self.leg_D = torch.zeros(B, cfg.max_nets, 2, dtype=torch.float32, device=dev)
         self.leg_gap = torch.zeros(B, cfg.max_nets, 2, dtype=torch.float32, device=dev)
+        #: Distance from each frontier to its partner, in cells.
+        self.fr_tip = torch.zeros(B, F, dtype=torch.float32, device=dev)
         self.fr_prev = torch.zeros(B, F, dtype=torch.float32, device=dev)
         # fp16: a coarse field's values are small (a 128-cell board at ds=4 is
         # ~32 coarse cells across) so half precision is ample, and the cache is
@@ -298,6 +311,7 @@ class SimultaneousRouterWorld:
         self.fr_dir.fill_(-1)
         self.leg_D.zero_()
         self.leg_gap.zero_()
+        self.fr_tip.zero_()
         self.fr_prev.zero_()
         self.route_n.zero_()
         self.price.reset()
@@ -365,6 +379,7 @@ class SimultaneousRouterWorld:
         ripped = self._fr_view(alive).any(dim=3)
         tot = self._fr_view(self.fr_prev).sum(dim=3)
         self.leg_gap = torch.where(ripped, (tot - self.leg_D).clamp_min(0.0), self.leg_gap)
+        self.fr_tip = torch.where(alive, self._tip_dist(), self.fr_tip)
         self.route_n = torch.where(alive, torch.ones_like(self.route_n), self.route_n)
         self.route_v[:, :, 0] = torch.where(
             alive.unsqueeze(-1), pos.to(torch.int16), self.route_v[:, :, 0]
@@ -415,12 +430,32 @@ class SimultaneousRouterWorld:
         self.fr_geo[b_i, f_i] = fld.to(self.fr_geo.dtype)
         self.fr_prev[b_i, f_i] = self._geo_at(fld, self.fr_pos[b_i, f_i])
 
+    def _partner_pos(self) -> torch.Tensor:
+        """(B, F, 3) each frontier's partner: the other end of its own leg.
+
+        Flipping the NUM_ENDS axis swaps end 0 with end 1, which is exactly the
+        pairing -- so this holds for any net count, and a differential pair's
+        two legs pair up independently.
+        """
+        B, F = self.cfg.batch_size, self.F
+        return (
+            self.fr_pos.view(B, self.cfg.max_nets, 2, NUM_ENDS, 3)
+            .flip(dims=[3])
+            .reshape(B, F, 3)
+        )
+
+    def _tip_dist(self) -> torch.Tensor:
+        """(B, F) planar distance to the partner frontier, in cells."""
+        d = (self._partner_pos()[..., 1:] - self.fr_pos[..., 1:]).float()
+        return torch.linalg.vector_norm(d, dim=-1)
+
     def _seed_leg_gap(self) -> None:
         """Both frontiers of a leg start at distance D from the opposite pad, so
         their sum is 2D and the pad-to-pad distance is half of it."""
         tot = self._fr_view(self.fr_prev).sum(dim=3)
         self.leg_D = torch.nan_to_num(tot * 0.5, posinf=0.0, nan=0.0)
         self.leg_gap = (tot - self.leg_D).clamp_min(0.0)
+        self.fr_tip = self._tip_dist()
 
     def _geo_at(self, coarse: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         """Sample a coarse geodesic field at fine-lattice positions, in fine
@@ -592,6 +627,16 @@ class SimultaneousRouterWorld:
         turn = torch.where(moved_f & (self.fr_dir >= 0), oct_dist, torch.zeros_like(oct_dist))
         self.fr_dir = torch.where(moved_f, new_dir, self.fr_dir)
 
+        # Closing on the partner. Paid only while BOTH ends are still live --
+        # once the partner retires there is nothing left to converge on, and
+        # paying for it would reward chasing a frontier that has stopped.
+        new_tip = self._tip_dist()
+        partner_live = live.view(B, self.cfg.max_nets, 2, NUM_ENDS).flip(dims=[3]).reshape(B, F)
+        tip_progress = torch.where(
+            live & partner_live, self.fr_tip - new_tip, torch.zeros_like(new_tip)
+        )
+        self.fr_tip = new_tip
+
         tot = self._fr_view(self.fr_prev).sum(dim=3)
         gap = torch.nan_to_num((tot - self.leg_D).clamp_min(0.0), posinf=0.0, nan=0.0)
         leg_delta = self.leg_gap - gap
@@ -645,6 +690,7 @@ class SimultaneousRouterWorld:
             contended=contended,
             turn=turn.float(),
             leg_progress=leg_progress * live.float(),
+            tip_progress=tip_progress * live.float(),
         )
 
     # -- plan / commit ------------------------------------------------------
