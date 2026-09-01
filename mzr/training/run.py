@@ -41,7 +41,8 @@ from mzr.world.engine import WorldConfig
 
 
 def make_env(stage, batch: int, device: str, seed: int,
-             leg_budget: float = 0.0) -> RouteEnv:
+             leg_budget: float = 0.0, copper_seeded: bool = False,
+             geodesic_refresh: int = 16) -> RouteEnv:
     return RouteEnv(
         EnvConfig(
             spec=stage.board_spec(),
@@ -52,6 +53,8 @@ def make_env(stage, batch: int, device: str, seed: int,
                 # multiplies F and therefore fr_geo, the dominant memory term.
                 max_legs=max(2, stage.generator.max_pins_per_net - 1),
                 leg_budget_frac=leg_budget,
+                copper_seeded=copper_seeded,
+                geodesic_refresh=geodesic_refresh,
                 max_macro_steps=stage.max_macro_steps,
                 max_steps_per_frontier=stage.max_macro_steps,
                 ripup=stage.ripup,
@@ -69,7 +72,8 @@ _EVAL_ENV: RouteEnv | None = None
 
 
 @torch.no_grad()
-def evaluate(policy, stage, device: str, eval_seeds: list[int], with_sampled: bool = True) -> dict:
+def evaluate(policy, stage, device: str, eval_seeds: list[int], with_sampled: bool = True,
+             *, copper_seeded: bool = False, geodesic_refresh: int = 16) -> dict:
     """Held-out completion on the fixed seeds.
 
     Reuses one persistent env across calls -- rebuilding it (and regenerating
@@ -83,7 +87,9 @@ def evaluate(policy, stage, device: str, eval_seeds: list[int], with_sampled: bo
     global _EVAL_ENV
     policy.eval()
     if _EVAL_ENV is None or _EVAL_ENV.cfg.world.batch_size != len(eval_seeds):
-        _EVAL_ENV = make_env(stage, batch=len(eval_seeds), device=device, seed=0)
+        _EVAL_ENV = make_env(stage, batch=len(eval_seeds), device=device, seed=0,
+                             copper_seeded=copper_seeded,
+                             geodesic_refresh=geodesic_refresh)
     env = _EVAL_ENV
 
     out: dict = {}
@@ -156,6 +162,12 @@ def main() -> int:
                         "line, charged per completed net across BOTH frontiers")
     p.add_argument("--corner", type=float, default=None,
                    help="per 45-degree octant of bend beyond the first")
+    p.add_argument("--copper-seeded", action="store_true",
+                   help="one field per NET (distance to its trunk) instead of one "
+                        "per frontier targeting a static pad; implies trunk+spokes. "
+                        "See mzr/DESIGN_COPPER_SEEDED.md")
+    p.add_argument("--geodesic-refresh", type=int, default=16,
+                   help="macro-steps between field refreshes when --copper-seeded")
     p.add_argument("--leg-budget", type=float, default=0.0,
                    help="fraction of the leg geodesic ONE frontier may route "
                         "before retiring (0.6 = half plus slack; 0 disables). "
@@ -193,7 +205,8 @@ def main() -> int:
     eval_seeds = EVAL_SEEDS[: args.eval_boards]
 
     env = make_env(stage, args.batch, dev, seed=1_000 + args.seed,
-                   leg_budget=args.leg_budget)
+                   leg_budget=args.leg_budget, copper_seeded=args.copper_seeded,
+                   geodesic_refresh=args.geodesic_refresh)
     policy = PriorPolicy(
         num_layers=stage.layers,
         field_width=args.field_width,
@@ -264,7 +277,9 @@ def main() -> int:
         if (u + 1) % args.eval_every == 0 or u == args.updates - 1:
             n_eval = (u + 1) // args.eval_every
             ev = evaluate(policy, stage, dev, eval_seeds,
-                          with_sampled=(n_eval % args.sampled_every == 0))
+                          with_sampled=(n_eval % args.sampled_every == 0),
+                          copper_seeded=args.copper_seeded,
+                          geodesic_refresh=args.geodesic_refresh)
             line.update(
                 {k: (round(v, 4) if isinstance(v, float) else v) for k, v in ev.items()}
             )
