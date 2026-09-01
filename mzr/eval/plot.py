@@ -88,9 +88,24 @@ def draw_board(ax, bd, H, W, layers, show_corners=True):
 
 
 def contact_sheet(blob=None, *, ckpt=None, stage="0", device="cpu", boards=9,
-                  seeds=None, sampled=False, cols=3, save=None, show_corners=True):
+                  seeds=None, sampled=False, cols=3, save=None, show_corners=True,
+                  copper_seeded=False, geodesic_refresh=16):
     """Draw a grid of routed boards. Pass `blob` from `mzr.eval.render.export`,
-    or a `ckpt` path to route the boards here."""
+    or a `ckpt` path to route the boards here.
+
+    **`copper_seeded` must match the run that produced the checkpoint.**
+    `export()` warns that "a copper-seeded policy measured in a pad-targeted
+    world is measuring a different game", and this function used to ignore
+    that and take the default -- so a copper-seeded checkpoint was drawn
+    growing TWO frontiers per net, in the very world copper-seeding exists to
+    replace. The picture then showed boards completing at 100% that the
+    matching eval had scored 0.000, because the two runs were not the same
+    experiment. A contact sheet whose numbers contradict the eval is worse
+    than no contact sheet.
+
+    `geodesic_refresh` defaults to 16 to match `training/run.py`'s default
+    rather than `export()`'s 8, for the same reason.
+    """
     import matplotlib.pyplot as plt
 
     if blob is None:
@@ -104,7 +119,8 @@ def contact_sheet(blob=None, *, ckpt=None, stage="0", device="cpu", boards=9,
         st = STAGES[stage]
         sd = seeds if seeds else EVAL_SEEDS[:boards]
         policy, _, _ = load_policy(ckpt, st, device)
-        blob = export(policy, st, device, sd, deterministic=not sampled)
+        blob = export(policy, st, device, sd, deterministic=not sampled,
+                      copper_seeded=copper_seeded, geodesic_refresh=geodesic_refresh)
 
     bs = blob["boards"]
     rows = (len(bs) + cols - 1) // cols
