@@ -445,6 +445,23 @@ class RipupRules:
     include_settled: bool = False
     interval: int = 8
     #: Fraction of unfinished nets ripped per round, most-congested first.
+    #:
+    #: **`ripup_round` takes `floor(n_eligible * fraction)`, so this silently
+    #: disables rip-up entirely at small net counts.** At stage 1 -- 3 nets,
+    #: fraction 0.25 -- that is `floor(0.75) = 0`, and the measured rip-up count
+    #: over 48 boards is exactly 0.0. The congestion price is still computed,
+    #: still handed to the policy as two observation channels and still charged
+    #: in the reward, while nothing ever acts on it. Stage 1 has therefore only
+    #: ever tested simultaneous *greedy* growth, and its 123/144 plateau is that
+    #: ceiling. Stage 2 (5 nets -> k=1) and stage 3 (8 nets -> k=2) do fire.
+    #:
+    #: Raising it so `k >= 1` at stage 1 makes completion *worse*
+    #: (0.8542 -> 0.5625 at fraction 0.5), because whole-net rip-up is too
+    #: destructive for a single episode: a net ripped at step 40 of 96 needs
+    #: ~25 steps to re-route and often does not get them. PathFinder survives
+    #: this only because it iterates to convergence. The fix is the *partial
+    #: retraction* DESIGN.md section 3 specifies, not a bigger fraction.
+    #: See `mzr/DESIGN.md` section 7.3.
     fraction: float = 0.25
 
     def __post_init__(self) -> None:

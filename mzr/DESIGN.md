@@ -524,6 +524,127 @@ double-route badly even under copper-seeded growth, so the trunk/spoke handling
 of a branch point is wrong. 1m is off the main spine, but that number should not
 be trusted until it is chased.
 
+### 7.3 Stage 1's plateau: the negotiation substrate never runs
+
+Stage 1 sits at **exactly 123 of 144 legs (0.8542)** for `layer_hop`, and every
+trained policy converges to it (best 0.8490). That number is invariant under:
+
+| swept | values | completion |
+|---|---|---|
+| `geodesic_downsample` | 4, 2, 1 | 0.8542 |
+| `geodesic_refresh` | 16, 8, 4, 2, 1 | 0.8542 |
+| `max_idle_steps` | 12, 24, off | 0.8542 |
+| `max_steps_per_frontier` | 96, 192 | 0.8542 |
+| width dilation of the field | off, on | 0.8542 |
+| corner-cutting rule in the field | off, on | 0.8542 |
+| entropy coef / advantage / BC | many | 0.79 - 0.849 |
+
+An invariant that stubborn is a structural fact, not a tuning surface.
+
+**The failing legs are not stuck for any of the obvious reasons.** Measured on
+the 21 that fail:
+
+* **Not entombed.** A plain flood fill over free-or-own cells reaches the
+  target from the frontier tip for **21 of 21**.
+* **Not out of time.** The field reports a *finite* 13.0-cell path, with 74 of
+  96 macro-steps unspent.
+* **Not a termination artefact.** Disabling `max_idle_steps` entirely and
+  doubling the step budget changes nothing.
+
+**The cause: `ripup_round` never fires at stage 1.**
+
+```python
+k = int(math.floor(n_elig * r.fraction))
+if k <= 0:
+    return torch.zeros(...)          # <- always taken at stage 1
+```
+
+Stage 1 has 3 nets and `RipupRules.fraction = 0.25`, so
+`k = floor(3 * 0.25) = 0`. Measured `ripups = 0.0` over 48 boards. The
+congestion price is computed, handed to the policy as two observation channels,
+and charged in the reward -- and **nothing ever acts on it**. Stage 1 has been
+testing simultaneous *greedy* growth all along, and 123/144 is that ceiling.
+
+The trap is specific to small net counts: stage 2 (5 nets) gives `k = 1` and
+stage 3 (8 nets) `k = 2`, so both do rip up. Stage 1, the rung whose entire
+purpose is *"does the prior policy negotiate at all?"*, is the one where the
+negotiation mechanism is switched off by integer arithmetic.
+
+**Forcing it on does not rescue it, and that matters too.** With
+`fraction = 0.5` so `k = 1`:
+
+| include_settled | interval | fraction | completion | ripups |
+|---|---|---|---|---|
+| False | 8 | 0.25 | 0.8542 (123/144) | **0.0** |
+| False | 8 | 0.50 | 0.5625 (81/144) | 11.5 |
+| False | 4 | 0.50 | 0.3819 (55/144) | 24.0 |
+| True | 8 | 0.50 | 0.3472 (50/144) | 12.0 |
+| True | 4 | 0.50 | 0.2292 (33/144) | 24.0 |
+
+Whole-net rip-up is too destructive at this scale: a net ripped at step 40 of
+96 needs ~25 steps to re-route and frequently does not get them. PathFinder
+survives this because it runs many full iterations to convergence; one episode
+does not. `include_settled` (added here so rip-up *can* reclaim a finished
+net's copper, which it otherwise never can) makes it worse still, because
+ripping a completed net destroys work that had already succeeded.
+
+Section 3 of this document specifies the gentler mechanism and the
+implementation diverged from it:
+
+> Every `T` macro-steps, frontiers sitting on the worst-priced cells **retract
+> N cells** while historical price stays elevated.
+
+`RipupRules` instead says *"Whole nets are ripped, not partial frontier
+retractions"*. The retraction form is the one the horizon can afford.
+
+**So the two things to fix, in order:**
+
+1. `floor` -> at least 1 eligible net, so the substrate is live at small net
+   counts at all. On its own this makes stage 1 *worse*, which is the point:
+   it exposes that the mechanism was never being exercised.
+2. Implement the partial retraction section 3 actually specifies, instead of
+   whole-net rip-up, and give the episode the budget to re-converge.
+
+Until then, no result at stage 1 or above is evidence about whether
+simultaneous growth negotiates -- only about how well a field-follower does
+without negotiation.
+
+### 7.4 Two field bugs fixed on the way, neither of which moved completion
+
+Both are real and both are kept; recording them so they are not "rediscovered"
+as candidate causes of the plateau.
+
+**The field planned through gaps the trace cannot enter.**
+`engine._refresh_net_geo` / `_refresh_geodesic` built `blocked` per *cell*,
+while `check_moves` / `move_claims` test the width-dilated footprint.
+`expert.py::_dilate` had already fixed exactly this on the planner side, with
+its docstring recording the cost -- "every one of 24 legs planned successfully
+and only 46% of them stamped". The engine's own field never got the same
+treatment. Fixed in `geo.dilate_blocked`.
+
+**The field cut corners the mover forbids.** A 45-degree move reserves corner
+guards beside itself, so a diagonal that clips an obstacle corner is illegal --
+but the relaxation propagated diagonally regardless. Caught at a stuck frontier:
+
+```
+ dir  (dy,dx)   free cells   field 1 ahead
+   1   (1, 1)            0        3.414    <- best, and ILLEGAL
+   0   (0, 1)            1        3.828
+   2   (1, 0)            1        4.414
+```
+
+The only descending direction was forbidden and every legal one went uphill --
+a local minimum manufactured by field/mover disagreement, in a field that is
+supposed to have none. `_relax_octile` now takes the blocked mask and permits a
+diagonal only when both flanking orthogonals are free.
+
+**Two diagnostics reported during this investigation were wrong**, and the
+corrections are the reason 7.3 landed where it did. The first called
+`route_world_board_live` *after* the net was already marked FAILED, so the
+planner skipped that net and returned no path -- misread as entombment. The
+second let the planner route through the net's own copper. The flood-fill test
+in 7.3 is the one to trust: it uses no planner and no dilation.
+
 ### Expert demonstrations are not optional — add them from stage 1
 
 **PRIMAL** (Sartoretti et al. 2019) is the closest published analogue to what
