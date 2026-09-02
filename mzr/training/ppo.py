@@ -231,12 +231,26 @@ def ppo_update(
                 clip_term = (((ratio - 1.0).abs() > cfg.clip).float() * mb_mask).sum() / n_live
 
             bc_term = torch.zeros((), device=dev)
-            if cfg.bc_coef > 0.0 and buf.bc_actions[steps[0]] is not None:
+            # A demonstration can be missing for SOME steps of a minibatch --
+            # `ExpertActions.action()` returns None whenever no live frontier
+            # sits on the expert's route. Guarding on `steps[0]` alone and then
+            # indexing every `t` raised TypeError on the first BC run. Weight
+            # the absent steps to zero instead, so the BC loss averages over the
+            # frontiers that actually have a demonstration.
+            have = [t for t in steps if buf.bc_actions[t] is not None]
+            if cfg.bc_coef > 0.0 and have:
+                zero = {k: torch.zeros_like(v)
+                        for k, v in buf.bc_actions[have[0]]["action"].items()}
+                blank_m = torch.zeros_like(buf.bc_actions[have[0]]["mask"])
                 mb_bc = {
-                    key: torch.cat([buf.bc_actions[t]["action"][key] for t in steps], dim=0)
-                    for key in buf.bc_actions[steps[0]]["action"]
+                    key: torch.cat(
+                        [(buf.bc_actions[t]["action"][key] if buf.bc_actions[t] is not None
+                          else zero[key]) for t in steps], dim=0)
+                    for key in buf.bc_actions[have[0]]["action"]
                 }
-                w = torch.cat([buf.bc_actions[t]["mask"] for t in steps], dim=0).float()
+                w = torch.cat(
+                    [(buf.bc_actions[t]["mask"] if buf.bc_actions[t] is not None
+                      else blank_m) for t in steps], dim=0).float()
                 # Reuse the forward pass the PPO term already computed --
                 # same observation, so the field encoder must not run twice.
                 evb = policy.evaluate(mb_obs, mb_bc, out=_fwd)

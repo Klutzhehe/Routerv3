@@ -181,6 +181,15 @@ def collect(env: RouteEnv, policy, buf: RolloutBuffer, n_steps: int, obs,
         obs = step.obs
         if step.done:
             obs = env.reset()
+            # Re-plan, or the rest of this rollout clones demonstrations for the
+            # PREVIOUS boards. `ExpertActions` plans once per reset and holds the
+            # plan by cell, so after a mid-rollout reset no live frontier matches
+            # any route: `action()` returns None (its mask is empty) and every
+            # remaining step in the buffer carries no demonstration. That was
+            # showing up as a TypeError in `ppo_update`, but the silent half --
+            # BC training against another board's routes -- is the worse bug.
+            if expert is not None:
+                expert.plan()
     return obs
 
 
