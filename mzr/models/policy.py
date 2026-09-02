@@ -181,6 +181,12 @@ class PriorPolicy(nn.Module):
         # if this is ever to run thousands of nets, where MAPPO's per-frontier
         # signal-to-noise falls as 1/N.
         self.value_frontier = nn.Linear(token_width, 1)
+        #: Gain on the geodesic skip into the layer logits (see
+        #: `_layer_geo_skip`). LENGTH_SCALE is 32 and a via costs 4 cells, so a
+        #: layer that is genuinely better reads ~4/32 = 0.125 here; a gain of
+        #: 24 turns that into ~3.0 logits, which beats the `stay` bias of
+        #: log(3L) and makes the untrained argmax `layer_hop`.
+        self.layer_geo_scale = nn.Parameter(torch.tensor(24.0))
         self._init_heads()
 
     def _init_heads(self) -> None:
@@ -252,6 +258,44 @@ class PriorPolicy(nn.Module):
         logits["layer"] = logits["layer"] - _BIG * (layer_ok < 0.5).float()
         return logits
 
+    def _layer_geo_skip(self, logits: dict[str, torch.Tensor], obs: Observation) -> dict[str, torch.Tensor]:
+        """Add the exact per-layer cost-to-go straight onto the via logits.
+
+        `obs.geo_layer[..., l]` is ``(cost_here_on_this_layer - cost_here_on l)
+        / LENGTH_SCALE`` -- positive exactly when layer `l` is closer. That is
+        the whole of `world.baselines.layer_hop_action`, already computed, and
+        this is the same principle the action features already follow: **hand
+        the policy the geometry, do not ask it to reconstruct it.**
+
+        Without it the layer head has to decode "is another layer better here"
+        out of a token embedding, and it does not. Measured on stage 0v, where
+        ~25% of boards cannot be routed without a via:
+
+            u24/u49/u74   argmax 0.781, 0.781, 0.781   via_frac 0.000 at every eval
+
+        0.781 is `greedy` (0.75) plus noise -- the argmax policy never placed a
+        single via. It is not a capacity problem: `ent_layer` stayed at
+        0.64-0.80 (the head is not collapsed) and *sampled* completion reached
+        0.922, so the via works when it is drawn. The argmax simply never
+        selected it, because a misplaced via costs ~0.8 reward and a correct
+        one gains ~0.2, so early gradients say "never via" and the policy never
+        gets far enough to find where a via pays.
+
+        `layer_geo_scale` is a real parameter, not a constant: it is
+        initialised big enough that the untrained argmax reproduces
+        `layer_hop` -- which scores **1.0000 completion on stage 0v** -- and
+        training is free to turn it down. This is the layer-head analogue of
+        direction index 0 being the geodesic bearing, and it is the fix the
+        stage's own kill-note pre-registered.
+        """
+        # (B, F, L) -> the via-to-layer-l slots, which start at index 1.
+        logits["layer"] = torch.cat(
+            [logits["layer"][..., :1],
+             logits["layer"][..., 1:] + self.layer_geo_scale * obs.geo_layer],
+            dim=-1,
+        )
+        return logits
+
     def forward(self, obs: Observation) -> PolicyOutput:
         z, g = self.field(obs.field)                             # z:(B,d,L,h,w) g:(B,Gd)
         B, d, L, h, w = z.shape
@@ -267,7 +311,8 @@ class PriorPolicy(nn.Module):
         z_gather = z[bidx, :, fl, fy, fx]                        # (B, F, d)
 
         tok = self.tokens(obs.frontiers, crop, z_gather, g, obs.frontier_mask)
-        logits = self._suppress(self._split(self.head(tok)), obs)
+        # Skip BEFORE suppression, so an illegal via is still masked out.
+        logits = self._suppress(self._layer_geo_skip(self._split(self.head(tok)), obs), obs)
         m = obs.frontier_mask.unsqueeze(-1).float()
         pooled = (tok * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
         value = self.value(torch.cat([g, pooled], dim=-1)).squeeze(-1)

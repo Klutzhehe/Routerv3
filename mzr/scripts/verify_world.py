@@ -679,12 +679,31 @@ def test_prior_policy_is_greedy_at_init_and_ppo_consistent() -> None:
 
     det = pol.act(obs, deterministic=True)["action"]
     live = obs.frontier_mask
-    greedy = (
+    # The untrained argmax is `layer_hop`, not `greedy`: direction 0 (down the
+    # geodesic bearing) and step 0 (one cell) as before, but the LAYER head now
+    # reads the exact per-layer cost-to-go through `_layer_geo_skip`, so it
+    # hops whenever the field says another layer is closer -- which is exactly
+    # `world.baselines.layer_hop_action`.
+    #
+    # That is deliberate and it is the point: `greedy` cannot finish a net
+    # whose pads sit on different layers, and on stage 0v that is ~25% of
+    # boards. Starting at `greedy` there capped the policy at 0.781 with
+    # via_frac 0.000 after 74 updates; starting at `layer_hop` starts it at
+    # 1.0000. Compare against the baseline directly rather than against zeros.
+    from mzr.world.baselines import layer_hop_action
+
+    want_layer = layer_hop_action(env.world)
+    check(
+        "untrained argmax is exactly the layer_hop action",
         float((det["direction"][live] == 0).float().mean()) == 1.0
         and float((det["step"][live] == 0).float().mean()) == 1.0
-        and float((det["layer"][live] == 0).float().mean()) == 1.0
+        and bool((det["layer"][live] == want_layer[live]).all()),
+        f"direction d0 {float((det['direction'][live] == 0).float().mean()):.0%}, "
+        f"step 1-cell {float((det['step'][live] == 0).float().mean()):.0%}, "
+        f"layer matches layer_hop on "
+        f"{float((det['layer'][live] == want_layer[live]).float().mean()):.0%} of frontiers "
+        f"({int((want_layer[live] > 0).sum())} of {int(live.sum())} want a via)",
     )
-    check("untrained argmax is exactly the greedy action", greedy)
 
     sampled = pol.act(obs, deterministic=False)
     ev = pol.evaluate(obs, sampled["action"])
