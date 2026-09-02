@@ -1290,7 +1290,15 @@ class SimultaneousRouterWorld:
         """
         B, N = self.cfg.batch_size, self.cfg.max_nets
         r = self.cfg.ripup
-        eligible = self.net_valid & (self.net_status == STATUS_ROUTING)
+        # A settled net's copper is permanent unless `include_settled`: an early
+        # finisher can wall off a net that has not routed yet, and rip-up could
+        # never reclaim the corridor. `_clear_nets` already resurrects a net
+        # (pads restored, leg_done cleared, status back to ROUTING), so the only
+        # thing that ever gated this was the filter below.
+        if self.cfg.ripup.include_settled:
+            eligible = self.net_valid.clone()
+        else:
+            eligible = self.net_valid & (self.net_status == STATUS_ROUTING)
         n_elig = int(eligible.sum(dim=1).max())
         k = int(math.floor(n_elig * r.fraction))
         if k <= 0:

@@ -430,6 +430,19 @@ class RipupRules:
 
     #: Macro-steps between rip-up rounds. 0 disables rip-up entirely (stage 0,
     #: where there is one net and nothing to negotiate with).
+    #: Also rip up nets that have already SETTLED -- finished or failed.
+    #:
+    #: Off by default, which is what the engine has always done implicitly:
+    #: ``eligible = net_valid & (net_status == STATUS_ROUTING)``. That makes a
+    #: finished net's copper permanent, so an early finisher can wall off a net
+    #: that has not routed yet and nothing can ever reclaim the corridor. It is
+    #: the "first nets block later nets" disease `mzr/DESIGN.md` section 0 names
+    #: as the reason this project exists, reintroduced by the rip-up filter.
+    #:
+    #: PathFinder rips and reroutes **every** net each iteration, which is
+    #: exactly why the expert reaches 144/144 legs on stage 1 where the
+    #: simultaneous field-follower is pinned at 123/144.
+    include_settled: bool = False
     interval: int = 8
     #: Fraction of unfinished nets ripped per round, most-congested first.
     fraction: float = 0.25
