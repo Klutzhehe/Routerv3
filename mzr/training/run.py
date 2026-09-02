@@ -218,6 +218,14 @@ def main() -> int:
     p.add_argument("--leg-progress", type=float, default=None,
                    help="shape on the leg's closing gap instead of per-frontier "
                         "distance, so a leg is paid once for ground covered")
+    p.add_argument("--bc-decay", type=int, default=0,
+                   help="linearly decay --bc-coef to 0 over this many updates "
+                        "(0 = constant). Keyed on UPDATE COUNT, not completion: "
+                        "DESIGN.md prescribes decaying 'as completion rises', but "
+                        "a run where BC is holding completion flat never triggers "
+                        "that -- measured, bc_coef 0.5 sat at completion 0.72 for "
+                        "250 updates with entropy RISING, so a completion-keyed "
+                        "anneal would have held it at 0.5 forever.")
     p.add_argument("--bc-negotiate", action="store_true",
                    help="run PathFinder negotiation when planning demonstrations. "
                         "Off by default: negotiation is what makes the expert a "
@@ -311,7 +319,9 @@ def main() -> int:
     if bc > 0.0:
         expert = ExpertActions(env, negotiate=args.bc_negotiate)
         expert.plan()
-        print(f"BC on: expert demonstrations, coef {bc}, "
+        sched = (f"decaying to 0 over {args.bc_decay} updates"
+                 if args.bc_decay > 0 else "CONSTANT (no decay)")
+        print(f"BC on: expert demonstrations, coef {bc} {sched}, "
               f"negotiate={args.bc_negotiate}, cloning direction+step only")
     hits = 0
     for u in range(start, args.updates):
@@ -325,12 +335,18 @@ def main() -> int:
             _last = policy.act(obs, deterministic=False)
         last_v, last_vf = _last["value"], _last["value_f"]
         t1 = time.time()
+        # Anneal BC. Strong early to teach the expert's step/direction habits
+        # (right-angle 27% by update 24, against 75% without), then out of the
+        # way so PPO can actually converge -- at a constant 0.5 the two
+        # objectives fought and neither won.
+        if bc > 0.0 and args.bc_decay > 0:
+            ppo_cfg.bc_coef = bc * max(0.0, 1.0 - u / float(args.bc_decay))
         m = ppo_update(policy, opt, buf, last_v, ppo_cfg, last_value_f=last_vf)
         t_ppo = time.time() - t1
         dt = time.time() - t0
 
         line = {"update": u, "sec": round(dt, 2), "collect_s": round(t_collect, 2),
-                "ppo_s": round(t_ppo, 2), "bc_coef": bc,
+                "ppo_s": round(t_ppo, 2), "bc_coef": round(ppo_cfg.bc_coef, 4),
                 **{k: round(v, 4) for k, v in m.items()}}
         # A heartbeat every update -- so "is it stuck or just slow" is answerable
         # without waiting for the next eval.
