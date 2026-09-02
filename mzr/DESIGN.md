@@ -524,7 +524,7 @@ double-route badly even under copper-seeded growth, so the trunk/spoke handling
 of a branch point is wrong. 1m is off the main spine, but that number should not
 be trusted until it is chased.
 
-### 7.3 Stage 1's plateau: the negotiation substrate never runs
+### 7.3 Stage 1's plateau: the negotiation substrate never ran (fixed)
 
 Stage 1 sits at **exactly 123 of 144 legs (0.8542)** for `layer_hop`, and every
 trained policy converges to it (best 0.8490). That number is invariant under:
@@ -597,17 +597,47 @@ implementation diverged from it:
 `RipupRules` instead says *"Whole nets are ripped, not partial frontier
 retractions"*. The retraction form is the one the horizon can afford.
 
-**So the two things to fix, in order:**
+**Resolved.** `retract_round` implements the section 3 mechanism -- score live
+frontiers by the congestion price under their tip, pull the worst back a couple
+of vertices, leave historical price elevated -- and `retract_fraction` uses
+`max(1, round(...))` so it cannot silently floor to zero. Measured on
+`layer_hop`, 48 held-out boards, **no learning anywhere**:
 
-1. `floor` -> at least 1 eligible net, so the substrate is live at small net
-   counts at all. On its own this makes stage 1 *worse*, which is the point:
-   it exposes that the mechanism was never being exercised.
-2. Implement the partial retraction section 3 actually specifies, instead of
-   whole-net rip-up, and give the episode the budget to re-converge.
+| stage | rip-up never fired | with retraction | delta |
+|---|---|---|---|
+| **1** | 0.8542 (123/144) | **0.9444 (136/144)** | **+9.0 pts** |
+| **2** | 0.7917 | **0.8500** | +5.8 |
+| **3** | 0.6719 | **0.7995** | +12.8 |
+| **1m** | 0.4722 | **0.5625** | +9.0 |
 
-Until then, no result at stage 1 or above is evidence about whether
-simultaneous growth negotiates -- only about how well a field-follower does
-without negotiation.
+Route quality improves *alongside* completion rather than trading against it:
+stage 1 right-angle 0.119 -> 0.084 (0.034 at `retract_steps=2`), stage 3
+0.173 -> 0.063. Stage 1's kill-number is "can't clear 0.90 in 2000 updates";
+the non-learned baseline now clears 0.90 with no training at all.
+
+The shape of the sweep is the substantive finding, not the peak value:
+
+```
+retract_steps  interval  completion
+      1            4     0.9444  (136/144)   <- default
+      2            4     0.9375  (135/144)   RA 0.034
+      2            2     0.6181  ( 89/144)
+      3            2     0.6181  ( 89/144)
+      8            8     0.6389  ( 92/144)
+```
+
+Gentle and frequent wins; retract too much or too often and it self-destructs
+exactly as whole-net rip-up did. That is PathFinder's gradualness argument --
+section 3's reason for a *gradual* penalty rather than Nair's infinite one --
+reproduced on this problem, and it is why the whole-net form could never have
+worked at a 96-step horizon.
+
+**What this does not fix.** Stage 1m still shows `doubled = 82` of 144 at
+copper 2.49x under every baseline: multi-pin branch points double-route
+regardless of retraction, which is a separate defect in trunk/spoke handling.
+And no stage reaches its 1.0 gate, so there is still real headroom for a policy
+to earn -- which is now the point, because for the first time that headroom is
+being measured against a substrate where negotiation actually runs.
 
 ### 7.4 Two field bugs fixed on the way, neither of which moved completion
 
