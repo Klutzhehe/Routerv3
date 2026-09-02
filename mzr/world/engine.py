@@ -587,12 +587,19 @@ class SimultaneousRouterWorld:
         )
         if prev is not None and not torch.isfinite(prev).any():
             prev = None
+        pw = float(self.cfg.price.field_weight)
+        # A toll can RAISE distances, so relaxing down from the previous field
+        # would be wrong -- recompute from scratch whenever the price is priced in.
+        if pw > 0.0:
+            prev = None
+        price_n = self._price_per_net() if pw > 0.0 else None
         fld = geo.geodesic_field_multi(
             blocked, trunk, prev=prev,
             iterations=self.cfg.geodesic_iterations if prev is None else 24,
             via_cost=VIA_LENGTH_COST,
             downsample=self.cfg.geodesic_downsample,
             upsample=False,
+            price=price_n, price_weight=pw,
         )
         self.net_geo = fld.reshape(B, N, L, *self._geo_shape).to(torch.float16)
         self._rebaseline_fr_prev()
@@ -612,6 +619,7 @@ class SimultaneousRouterWorld:
                 blocked, tip_src, prev=None,
                 iterations=self.cfg.geodesic_iterations,
                 via_cost=VIA_LENGTH_COST,
+                price=price_n, price_weight=pw,
                 downsample=self.cfg.geodesic_downsample,
                 upsample=False,
             )
@@ -633,6 +641,23 @@ class SimultaneousRouterWorld:
 
     def _dilate_for_nets(self, blocked: torch.Tensor) -> torch.Tensor:
         return geo.dilate_blocked(blocked, self._field_radius(self.net_width.reshape(-1)))
+
+    def _price_per_net(self) -> torch.Tensor:
+        """(B*N, L, H, W) price, one copy per net.
+
+        Each net's field is relaxed separately, so the toll has to be broadcast
+        to match. Every net sees the same board-wide price -- a cell is
+        contested regardless of who is asking, which is what makes the toll a
+        shared signal the nets negotiate through rather than a private cost.
+        """
+        B, N = self.cfg.batch_size, self.cfg.max_nets
+        L, H, W = self.shape
+        return (
+            self.price.field()
+            .unsqueeze(1)
+            .expand(B, N, L, H, W)
+            .reshape(B * N, L, H, W)
+        )
 
     def _rebaseline_fr_prev(self) -> None:
         """Re-measure every frontier's distance against the NEW field.
@@ -715,6 +740,7 @@ class SimultaneousRouterWorld:
         blocked = geo.dilate_blocked(blocked, self._field_radius(
             self.net_width.gather(1, n_i.view(1, -1)).reshape(-1)))
 
+        pw = float(self.cfg.price.field_weight)
         fld = geo.geodesic_field(
             blocked,
             tgt[:, 0],
@@ -723,6 +749,8 @@ class SimultaneousRouterWorld:
             iterations=self.cfg.geodesic_iterations,
             downsample=ds,
             upsample=False,
+            price=(self.price.field()[b_i] if pw > 0.0 else None),
+            price_weight=pw,
         )
         self.fr_geo[b_i, f_i] = fld.to(self.fr_geo.dtype)
         self.fr_prev[b_i, f_i] = self._geo_at(fld, self.fr_pos[b_i, f_i])

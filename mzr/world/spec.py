@@ -382,6 +382,19 @@ class PriceRules:
     training budget.
     """
 
+    #: Weight of the congestion price as a **toll on entering a cell** inside
+    #: the geodesic field, in cells of extra travel per unit price.
+    #:
+    #: 0 reproduces the old behaviour, which was that the field ignored
+    #: congestion entirely: the price was computed, handed to the policy as two
+    #: observation channels and charged in the reward, but never entered the
+    #: cost the route is actually chosen by. `layer_hop` and any field-follower
+    #: therefore routed as if no other net existed. `expert.py::field` has taken
+    #: `price` from the start and its docstring states the principle -- "price
+    #: multiplies the cost of entering a cell, which is the whole of
+    #: PathFinder: a contested channel is not forbidden, just expensive" -- and
+    #: the expert is the only router here that reaches 1.0000 on stage 1.
+    field_weight: float = 0.0
     #: Added to h(c) each macro-step a cell is over-subscribed. PathFinder
     #: raises history slowly so early contention does not permanently poison a
     #: corridor before the policy has had a chance to route around it.

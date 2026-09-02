@@ -583,6 +583,23 @@ def dilate_blocked(blocked: torch.Tensor, radius: int) -> torch.Tensor:
     return grown.reshape(m, L, H, W) > 0.5
 
 
+def coarsen_price(price: torch.Tensor, downsample: int) -> torch.Tensor:
+    """Average a full-resolution price field down to the geodesic grid.
+
+    Mean, not max: price is a *toll* on entering a cell, so a coarse cell should
+    cost what crossing it typically costs, and a max would let one hot cell shut
+    a whole corridor -- which is Nair's infinite penalty, the thing PathFinder
+    exists to replace with a gradual one.
+    """
+    ds = max(1, int(downsample))
+    if ds == 1:
+        return price
+    m, L, H, W = price.shape
+    return F.avg_pool2d(price.reshape(m * L, 1, H, W), ds, ds).reshape(
+        m, L, max(1, H // ds), max(1, W // ds)
+    )
+
+
 def geodesic_field_multi(
     blocked: torch.Tensor,
     sources: torch.Tensor,
@@ -592,6 +609,8 @@ def geodesic_field_multi(
     via_cost: float = 4.0,
     downsample: int = 4,
     upsample: bool = True,
+    price: torch.Tensor | None = None,
+    price_weight: float = 0.0,
 ) -> torch.Tensor:
     """Cost-to-go to the **nearest of many source cells**, batched.
 
@@ -656,8 +675,19 @@ def geodesic_field_multi(
         dist = prev.clone().float()
     dist = torch.where(src, torch.zeros_like(dist), dist)
 
+    # PathFinder's toll: entering a contested cell costs extra, so a busy
+    # channel is expensive rather than forbidden and nets negotiate around it.
+    # Without this the field routes as if no other net existed -- the price was
+    # computed, shown to the policy and charged in the reward while never
+    # entering the cost the route is actually chosen by.
+    toll = None
+    if price is not None and price_weight > 0.0:
+        toll = price_weight * coarsen_price(price.float(), ds)
+
     for _ in range(iterations):
         cand = _relax_octile(dist, coarse)
+        if toll is not None:
+            cand = cand + toll
 
         if L > 1:
             up = torch.full_like(dist, float("inf"))
@@ -702,6 +732,8 @@ def geodesic_field(
     via_cost: float = 4.0,
     downsample: int = 4,
     upsample: bool = True,
+    price: torch.Tensor | None = None,
+    price_weight: float = 0.0,
 ) -> torch.Tensor:
     """Obstacle-aware, **multi-layer** cost-to-go, batched.
 
@@ -759,9 +791,15 @@ def geodesic_field(
     idx = torch.arange(m, device=blocked.device)
     dist[idx, tl, ty, tx] = 0.0
 
+    toll = None
+    if price is not None and price_weight > 0.0:
+        toll = price_weight * coarsen_price(price.float(), ds)
+
     for _ in range(iterations):
         # In-plane relaxation: octile-weighted, no corner cutting.
         cand = _relax_octile(dist, coarse)
+        if toll is not None:
+            cand = cand + toll
 
         # Cross-layer relaxation: a via costs `via_cost` cells of travel.
         if L > 1:
