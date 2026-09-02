@@ -69,6 +69,16 @@ STATUS_ROUTING = 0
 STATUS_DONE = 1
 STATUS_FAILED = 2
 
+#: Cost-to-go returned by `_geo_at` for a cell the field cannot reach. It is a
+#: sentinel, not a distance, and it must never enter an arithmetic difference:
+#: `progress` is `fr_prev - new_dist`, so a frontier crossing between reachable
+#: and unreachable would score +/-1e6 cells of "progress" and, at
+#: `RewardConfig.progress` 4.0 over a LENGTH_SCALE of 32, +/-125,000 reward in a
+#: single step. Observed as `value_loss` 1.5e9 on the first stage-1 run after
+#: retraction landed -- retraction makes those crossings common, but any
+#: unreachable frontier could always trigger it.
+UNREACHABLE = 1e5
+
 #: Length charged for a via, in cell units. A via is cheap in lattice cells but
 #: expensive in reality (drill cost, stub, reliability). Without a charge a
 #: free via action will drill its way out of every problem instead of learning
@@ -1118,7 +1128,10 @@ class SimultaneousRouterWorld:
                else self.fr_geo.reshape(M, L, *self._geo_shape).float())
         new_dist = self._geo_at(fld, pos)
         prev = self.fr_prev.reshape(M)
-        prog = torch.where(plan.live, prev - new_dist, torch.zeros_like(prev))
+        # A step is only worth scoring when BOTH ends are real distances. See
+        # UNREACHABLE: differencing the sentinel is worth 125,000 reward.
+        scorable = plan.live & (prev < UNREACHABLE) & (new_dist < UNREACHABLE)
+        prog = torch.where(scorable, prev - new_dist, torch.zeros_like(prev))
         self.fr_prev = new_dist.view(B, F)
         laid = torch.where(did_move, plan.seg_len, torch.zeros_like(plan.seg_len))
         return prog, did_move, did_via, laid
