@@ -36,7 +36,14 @@ import torch
 import torch.nn.functional as F
 
 import mzr.world.geometry as geo
-from mzr.world.spec import DIRECTION_VECTORS, END_DST, END_SRC, OCC_FREE, BoardSpec
+from mzr.world.spec import (
+    DIRECTION_VECTORS,
+    END_DST,
+    END_SRC,
+    NUM_ENDS,
+    OCC_FREE,
+    BoardSpec,
+)
 
 #: Cost of a layer change, in cell units. Matches `engine.VIA_LENGTH_COST` so
 #: the expert and the learned policy optimise comparable objectives.
@@ -435,4 +442,66 @@ def route_world_board(
             legs.append((n, leg, src, dst, int(world.net_width[b, n])))
     return route_board(
         world.spec, world.static[b], legs, cfg, negotiate=negotiate, device=world.device
+    )
+
+
+def route_world_board_live(
+    world,
+    board_index: int,
+    cfg: ExpertConfig | None = None,
+    *,
+    negotiate: bool = False,
+) -> ExpertResult:
+    """Re-plan a board's **still-open** legs from where their frontiers actually
+    are, against **live occupancy**.
+
+    `route_world_board` above plans from the static layer once, which is what
+    makes it a fair baseline. It is the wrong thing to *demonstrate* from. In a
+    simultaneous world the other nets lay copper as the episode runs, so a plan
+    fixed at reset goes stale mid-episode and starts pointing the frontier into
+    copper that now exists. Measured on stage 1 with `--bc-coef 0.5`, cloning
+    that stale plan made the run oscillate 0.755 / 0.693 / 0.823 / 0.599 while
+    `dir_d0_frac` swung 0.32 -> 0.01 -> 0.65 -> 0.07: the policy was being pulled
+    between a dead plan and the live field.
+
+    Three differences from the static version, and each one matters:
+
+    * **Live occupancy, not static.** `_BoardRouter.hard_blocked` blocks cells
+      that are neither free nor this net's own, so handing it `world.occ[b]`
+      makes other nets' committed copper a hard obstacle while the net's own
+      trail stays passable. Within a pass the remaining legs may still share
+      cells with *each other* -- that is PathFinder's over-subscription signal
+      and it must not be suppressed (see `hard_blocked`).
+    * **Only open legs.** A finished leg needs no demonstration, and a failed
+      net is gone. Re-planning them wastes the budget this runs on.
+    * **From the frontier, not the pad.** A leg is planned trunk-end -> live
+      frontier, so `bc.py`'s "END_DST walks the path BACKWARDS" rule carries the
+      frontier toward the copper it still has to reach, from where it actually
+      stands rather than from a pad it left twenty steps ago.
+
+    `negotiate` defaults to **False** here, unlike the reset-time plan. Already
+    committed copper has resolved most of the contention the negotiation loop
+    exists to find, and this runs inside the collection loop: a negotiating pass
+    is `ExpertConfig.iterations` (6) full passes over every leg.
+    """
+    b = board_index
+    w = world
+    legs = []
+    per_leg = NUM_ENDS
+    for n in range(w.cfg.max_nets):
+        if not bool(w.net_valid[b, n]) or int(w.net_status[b, n]) != 0:
+            continue
+        for leg in range(w.cfg.max_legs):
+            if not bool(w.leg_valid[b, n, leg]) or bool(w.leg_done[b, n, leg]):
+                continue
+            base = (n * w.cfg.max_legs + leg) * per_leg
+            src = tuple(int(v) for v in w.fr_pos[b, base + END_SRC])
+            dst = tuple(int(v) for v in w.fr_pos[b, base + END_DST])
+            if src == dst:
+                continue
+            legs.append((n, leg, src, dst, int(w.net_width[b, n])))
+    if not legs:
+        return ExpertResult()
+    return route_board(
+        w.spec, w.occ[b], legs, cfg, negotiate=negotiate, device=w.device
     )

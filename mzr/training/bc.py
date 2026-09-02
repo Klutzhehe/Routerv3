@@ -52,7 +52,11 @@ from __future__ import annotations
 
 import torch
 
-from mzr.world.expert import ExpertConfig, route_world_board
+from mzr.world.expert import (
+    ExpertConfig,
+    route_world_board,
+    route_world_board_live,
+)
 from mzr.world.spec import END_SRC, NUM_ENDS
 
 #: The expert emits unit steps only (verify_world: "410/410 steps are unit
@@ -70,29 +74,64 @@ class ExpertActions:
     """
 
     def __init__(self, env, *, negotiate: bool = False,
-                 cfg: ExpertConfig | None = None) -> None:
+                 cfg: ExpertConfig | None = None, replan_every: int = 0) -> None:
         self.env = env
         self.negotiate = negotiate
         self.cfg = cfg
         self._paths: list[dict] = []
+        #: Macro-steps between in-episode re-plans against live occupancy.
+        #: 0 keeps the old behaviour -- plan once per reset from the static
+        #: layer and let it go stale. See `replan()`.
+        self.replan_every = replan_every
+        self._since = 0
+
+    def _index(self, res) -> dict:
+        """Index a plan by cell, so a wandering frontier can find where it
+        rejoins, and keep the ordered list for "which way is forward"."""
+        return {key: (pts, {tuple(p): i for i, p in enumerate(pts)})
+                for key, pts in res.paths.items()}
 
     def plan(self) -> None:
-        """Plan every board. Call once per `env.reset()`.
+        """Plan every board from the STATIC layer. Call once per `env.reset()`.
 
         `negotiate=False` by default: PathFinder's rip-up loop is what makes
         the expert a strong *baseline*, but for a demonstration the extra
         iterations mostly cost wall-clock inside the collection loop.
         """
         w = self.env.world
-        self._paths = []
+        self._paths = [self._index(route_world_board(w, b, self.cfg,
+                                                     negotiate=self.negotiate))
+                       for b in range(w.cfg.batch_size)]
+        self._since = 0
+
+    def replan(self) -> None:
+        """Re-plan the still-open legs from the live frontiers against live
+        occupancy, replacing the stale demonstration.
+
+        A plan fixed at reset stops being a demonstration once other nets have
+        laid copper across it -- it starts pointing the frontier into cells that
+        are now occupied. Cloning that made stage 1 oscillate (0.755 / 0.693 /
+        0.823 / 0.599 at `--bc-coef 0.5`).
+
+        Boards with no open legs left keep whatever they had; there is nothing
+        to demonstrate and re-planning them only costs time.
+        """
+        w = self.env.world
         for b in range(w.cfg.batch_size):
-            res = route_world_board(w, b, self.cfg, negotiate=self.negotiate)
-            # Index each path by cell so a wandering frontier can find where it
-            # rejoins, and keep the ordered list for "which way is forward".
-            idx = {}
-            for key, pts in res.paths.items():
-                idx[key] = (pts, {tuple(p): i for i, p in enumerate(pts)})
-            self._paths.append(idx)
+            res = route_world_board_live(w, b, self.cfg, negotiate=False)
+            if res.paths:
+                self._paths[b] = self._index(res)
+        self._since = 0
+
+    def maybe_replan(self) -> bool:
+        """Tick the cadence. Returns True when a re-plan actually ran."""
+        if self.replan_every <= 0 or not self._paths:
+            return False
+        self._since += 1
+        if self._since < self.replan_every:
+            return False
+        self.replan()
+        return True
 
     @torch.no_grad()
     def action(self, obs) -> dict | None:

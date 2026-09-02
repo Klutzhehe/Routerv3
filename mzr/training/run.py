@@ -157,6 +157,11 @@ def collect(env: RouteEnv, policy, buf: RolloutBuffer, n_steps: int, obs,
     """
     for _ in range(n_steps):
         act = policy.act(obs, deterministic=False)
+        if expert is not None:
+            # Refresh the demonstration against live occupancy before reading
+            # it. A plan fixed at reset points the frontier into copper other
+            # nets have laid since. See ExpertActions.replan.
+            expert.maybe_replan()
         bc_action = expert.action(obs) if expert is not None else None
         step = env.step(act["action"])
         board_r = step.reward.sum(dim=1) + step.board_reward
@@ -263,6 +268,12 @@ def main() -> int:
                         "that -- measured, bc_coef 0.5 sat at completion 0.72 for "
                         "250 updates with entropy RISING, so a completion-keyed "
                         "anneal would have held it at 0.5 forever.")
+    p.add_argument("--bc-replan", type=int, default=12,
+                   help="macro-steps between re-planning the demonstration "
+                        "against LIVE occupancy (0 = plan once per reset and "
+                        "let it go stale, the old behaviour). A reset-time plan "
+                        "points the frontier into copper other nets have laid "
+                        "since, which made stage 1 oscillate under BC")
     p.add_argument("--bc-negotiate", action="store_true",
                    help="run PathFinder negotiation when planning demonstrations. "
                         "Off by default: negotiation is what makes the expert a "
@@ -357,12 +368,14 @@ def main() -> int:
     obs = env.reset()
     expert = None
     if bc > 0.0:
-        expert = ExpertActions(env, negotiate=args.bc_negotiate)
+        expert = ExpertActions(env, negotiate=args.bc_negotiate,
+                               replan_every=args.bc_replan)
         expert.plan()
         sched = (f"decaying to 0 over {args.bc_decay} updates"
                  if args.bc_decay > 0 else "CONSTANT (no decay)")
         print(f"BC on: expert demonstrations, coef {bc} {sched}, "
-              f"negotiate={args.bc_negotiate}, cloning direction+step only")
+              f"negotiate={args.bc_negotiate}, cloning direction+step only, "
+              f"replan every {args.bc_replan or 'never'} macro-steps")
     hits = 0
     for u in range(start, args.updates):
         t0 = time.time()
