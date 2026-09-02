@@ -497,27 +497,56 @@ def flood_component(
 DIAG_COST = math.sqrt(2.0)
 
 
-def _relax_octile(dist: torch.Tensor) -> torch.Tensor:
-    """One in-plane relaxation sweep with **octile** costs.
+def _relax_octile(dist: torch.Tensor, blocked: torch.Tensor | None = None) -> torch.Tensor:
+    """One in-plane relaxation sweep with **octile** costs and **no corner cutting**.
 
     Orthogonal neighbours cost 1.0, diagonal neighbours `DIAG_COST`. Done as
     eight shifts of the negated field rather than one 3x3 max-pool, because a
     max-pool cannot charge the two neighbour classes differently -- and that
     single shared cost was the Chebyshev bug (see `DIAG_COST`).
 
-    `dist` is (m, L, h, w) with `inf` for unreached cells.
+    **Corner rule.** A diagonal step is allowed only when both orthogonal cells
+    flanking it are free. The engine already enforces this: a 45-degree move
+    reserves corner guards beside itself, so `check_moves` rejects a diagonal
+    that clips an obstacle corner. The field did not, and the disagreement
+    stalled routing outright. Measured at a stuck stage-1 frontier:
+
+         dir  (dy,dx)   free cells   field 1 ahead
+           1   (1, 1)            0        3.414    <- best, and ILLEGAL
+           0   (0, 1)            1        3.828
+           2   (1, 0)            1        4.414
+
+    The field advertised a diagonal shortcut the mover would never permit, so
+    the only descending direction was forbidden and every legal direction went
+    uphill -- a local minimum manufactured by the inconsistency. A frontier
+    there never escapes, which is why stage 1 sat at exactly 123/144 legs under
+    every field resolution, refresh cadence, idle threshold and step budget
+    tried against it.
+
+    `dist` is (m, L, h, w) with `inf` for unreached cells. `blocked` is the same
+    shape; when omitted the corner rule is skipped (callers that have no mask).
     """
     neg_inf = -1e9
     nd = torch.where(torch.isinf(dist), torch.full_like(dist, neg_inf), -dist)
     p = F.pad(nd, (1, 1, 1, 1), value=neg_inf)
-    ortho = torch.maximum(
-        torch.maximum(p[..., 1:-1, :-2], p[..., 1:-1, 2:]),
-        torch.maximum(p[..., :-2, 1:-1], p[..., 2:, 1:-1]),
-    )
-    diag = torch.maximum(
-        torch.maximum(p[..., :-2, :-2], p[..., :-2, 2:]),
-        torch.maximum(p[..., 2:, :-2], p[..., 2:, 2:]),
-    )
+    up, dn = p[..., :-2, 1:-1], p[..., 2:, 1:-1]
+    lf, rt = p[..., 1:-1, :-2], p[..., 1:-1, 2:]
+    ortho = torch.maximum(torch.maximum(lf, rt), torch.maximum(up, dn))
+
+    ul, ur = p[..., :-2, :-2], p[..., :-2, 2:]
+    dl, dr = p[..., 2:, :-2], p[..., 2:, 2:]
+    if blocked is not None:
+        # A diagonal neighbour may only be used if BOTH orthogonals flanking it
+        # are open -- exactly the engine's corner-guard rule.
+        bp = F.pad(blocked, (1, 1, 1, 1), value=True)
+        b_up, b_dn = bp[..., :-2, 1:-1], bp[..., 2:, 1:-1]
+        b_lf, b_rt = bp[..., 1:-1, :-2], bp[..., 1:-1, 2:]
+        block = lambda v, a, b: torch.where(a | b, torch.full_like(v, neg_inf), v)  # noqa: E731
+        ul = block(ul, b_up, b_lf)
+        ur = block(ur, b_up, b_rt)
+        dl = block(dl, b_dn, b_lf)
+        dr = block(dr, b_dn, b_rt)
+    diag = torch.maximum(torch.maximum(ul, ur), torch.maximum(dl, dr))
     return torch.minimum(-ortho + 1.0, -diag + DIAG_COST)
 
 
@@ -628,7 +657,7 @@ def geodesic_field_multi(
     dist = torch.where(src, torch.zeros_like(dist), dist)
 
     for _ in range(iterations):
-        cand = _relax_octile(dist)
+        cand = _relax_octile(dist, coarse)
 
         if L > 1:
             up = torch.full_like(dist, float("inf"))
@@ -731,8 +760,8 @@ def geodesic_field(
     dist[idx, tl, ty, tx] = 0.0
 
     for _ in range(iterations):
-        # In-plane 8-connected relaxation, octile-weighted (see _relax_octile).
-        cand = _relax_octile(dist)
+        # In-plane relaxation: octile-weighted, no corner cutting.
+        cand = _relax_octile(dist, coarse)
 
         # Cross-layer relaxation: a via costs `via_cost` cells of travel.
         if L > 1:
