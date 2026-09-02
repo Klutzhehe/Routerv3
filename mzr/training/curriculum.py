@@ -180,6 +180,15 @@ STAGES: dict[str, Stage] = {
         max_macro_steps=96,
         gate=("absolute", 1.0),
         kill="can't reach 0.95 in 500 updates -> geometry or reward bug, not a hard problem",
+        # The entropy floor is disabled here for exactly the reason
+        # `max_d0_frac` is (see Stage.max_d0_frac): on ONE net with an exact
+        # geodesic field, following the field IS the optimal policy, so a
+        # direction head that collapses onto d0 has learned the right thing.
+        # Measured on the first post-fix run: argmax completion 1.000 on every
+        # eval with `ent_direction` at 0.003 -- the gate was failing a policy
+        # that routed all 64 held-out boards perfectly. It stays armed from
+        # stage 1, where leaving your own gradient is the task.
+        min_dir_entropy=0.0,
     ),
     "0v": Stage(
         name="0v: single net, two layers -- the via is mandatory",
@@ -193,6 +202,15 @@ STAGES: dict[str, Stage] = {
         gate=("absolute", 1.0),
         kill="can't reach 0.95 in 1000 updates -> the via penalty is drowning "
              "discovery; drop RewardConfig.via or seed the layer head from layer_hop",
+        # The entropy floor is disabled here for exactly the reason
+        # `max_d0_frac` is (see Stage.max_d0_frac): on ONE net with an exact
+        # geodesic field, following the field IS the optimal policy, so a
+        # direction head that collapses onto d0 has learned the right thing.
+        # Measured on the first post-fix run: argmax completion 1.000 on every
+        # eval with `ent_direction` at 0.003 -- the gate was failing a policy
+        # that routed all 64 held-out boards perfectly. It stays armed from
+        # stage 1, where leaving your own gradient is the task.
+        min_dir_entropy=0.0,
     ),
     "1": Stage(
         name="1: 3 simultaneous nets, price on",

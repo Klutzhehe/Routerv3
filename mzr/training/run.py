@@ -210,6 +210,10 @@ def main() -> int:
                         "line, charged per completed net across BOTH frontiers")
     p.add_argument("--corner", type=float, default=None,
                    help="per 45-degree octant of bend beyond the first")
+    p.add_argument("--length-cost", type=float, default=None,
+                   help="per cell of copper laid. A flat --step-cost discounts "
+                        "long steps; this charges what they actually lay, which "
+                        "is what right-angle rate tracks")
     p.add_argument("--max-macro-steps", type=int, default=None,
                    help="override the stage's episode length. Single-ended "
                         "(copper-seeded) growth needs roughly double, since one "
@@ -299,6 +303,8 @@ def main() -> int:
         stage.reward.wirelength = args.wirelength
     if args.corner is not None:
         stage.reward.corner = args.corner
+    if args.length_cost is not None:
+        stage.reward.length_cost = args.length_cost
     bc = stage.bc_coef0 if args.bc_coef is None else args.bc_coef
     ppo_cfg = PPOConfig(
         lr=args.lr, bc_coef=bc, epochs=args.epochs,

@@ -211,6 +211,25 @@ class StepResult:
     congestion_delta: torch.Tensor
     #: (B,) frontiers whose move was arbitrated away by another net this step.
     contended: torch.Tensor
+    #: (B, F) cells of copper this frontier actually laid this step, in octile
+    #: units (a diagonal cell is sqrt(2)). Zero for a via -- `via_placed`
+    #: already prices that -- and zero for a rejected move.
+    #:
+    #: The reward charges this rather than a flat per-step cost. A flat cost is
+    #: a *discount* on long steps: four 1-cell steps pay 4x what one 4-cell step
+    #: pays for the same distance closed. Measured with the direction held at
+    #: d0 and only the step class varied, over 48 held-out stage-0 boards:
+    #:
+    #:     step=1  completion 1.0000  copper 1.000  right-angle 0.000
+    #:     step=2  completion 0.8750  copper 1.000  right-angle 0.213
+    #:     step=4  completion 0.8125  copper 1.040  right-angle 0.476
+    #:
+    #: A multi-cell step is a straight run in one octant, so it cannot track a
+    #: diagonal-then-straight geodesic without quantisation error, and that
+    #: error surfaces as right angles. The first trained policy went to
+    #: `step_mean` 1.899 and landed at right-angle 0.433 -- exactly on that
+    #: curve -- because the reward paid it to.
+    laid: torch.Tensor
     #: (B, F) how sharply this frontier turned, in 45-degree octants: 0 straight,
     #: 1 = 45, 2 = 90, 3 = 135, 4 = reversal. Zero for a frontier that did not
     #: move or has no previous heading. Fab practice routes 45-degree bends and
@@ -840,7 +859,7 @@ class SimultaneousRouterWorld:
         self._prev_congestion = congestion
 
         # --- commit -----------------------------------------------------------
-        progress, moved, via_placed = self._commit(plan, go, b_flat, n_flat, w_flat)
+        progress, moved, via_placed, laid = self._commit(plan, go, b_flat, n_flat, w_flat)
         rejected = (plan.live & ~go).view(B, F)
 
         # Turn magnitude, measured only on moves that were actually committed.
@@ -940,6 +959,7 @@ class SimultaneousRouterWorld:
             moved=moved.view(B, F),
             via_placed=via_placed.view(B, F),
             progress=progress.view(B, F),
+            laid=laid.view(B, F),
             live=live,
             nets_done=nets_done,
             nets_failed=nets_failed,
@@ -1073,7 +1093,8 @@ class SimultaneousRouterWorld:
         prev = self.fr_prev.reshape(M)
         prog = torch.where(plan.live, prev - new_dist, torch.zeros_like(prev))
         self.fr_prev = new_dist.view(B, F)
-        return prog, did_move, did_via
+        laid = torch.where(did_move, plan.seg_len, torch.zeros_like(plan.seg_len))
+        return prog, did_move, did_via, laid
 
     def _via_span(self, cur: torch.Tensor, tgt: torch.Tensor):
         if self.spec.layers.through_only:

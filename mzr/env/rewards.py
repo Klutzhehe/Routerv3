@@ -76,8 +76,34 @@ class RewardConfig:
     #: differential pair's two legs pair up independently rather than the P leg
     #: chasing the N leg.
     tip_progress: float = 0.0
-    #: Flat per-step cost, so finishing sooner is strictly better.
+    #: Flat per-step cost, so finishing sooner is strictly better. Kept small:
+    #: the *copper* charge below is what should drive route economy, and a flat
+    #: per-step cost pulls the other way (see `length_cost`).
     step_cost: float = 0.01
+    #: Per cell of copper actually laid this step, in octile units.
+    #:
+    #: Without this the only time pressure is `step_cost`, which is flat per
+    #: step and therefore a **discount on long steps**: four 1-cell moves pay
+    #: 4x what one 4-cell move pays to close the same distance. The policy took
+    #: that discount. Measured on 48 held-out stage-0 boards with the direction
+    #: held at d0 and only the step class varied:
+    #:
+    #:     step=1  completion 1.0000  copper 1.000  right-angle 0.000
+    #:     step=2  completion 0.8750  copper 1.000  right-angle 0.213
+    #:     step=4  completion 0.8125  copper 1.040  right-angle 0.476
+    #:
+    #: A multi-cell step is a straight run in one octant and cannot track a
+    #: diagonal-then-straight geodesic without quantisation error, which shows
+    #: up as right angles. The first run after the substrate fix reached 1.000
+    #: completion and stayed there, but went to `step_mean` 1.899 and
+    #: right-angle 0.433 -- on that curve, and failing the quality gate.
+    #:
+    #: Charging copper instead makes a long step **neutral** when it runs
+    #: straight down the field (same cells closed, same cells laid) and
+    #: **expensive** when it overshoots. Sized against `progress`: a cell of
+    #: distance closed is worth 4.0/32 = 0.125, so 0.03 is a real charge that
+    #: cannot invert the sign of genuine progress.
+    length_cost: float = 0.03
     #: This frontier's move was illegal. See calibration note 2.
     rejection: float = 0.10
     #: This frontier lost a cell to another net in arbitration -- not its
@@ -151,6 +177,8 @@ def step_reward(
     if cfg.tip_progress > 0.0:
         r = r + cfg.tip_progress * (res.tip_progress / LENGTH_SCALE)
     r = r - cfg.step_cost * live
+    # Copper laid, not steps taken. See RewardConfig.length_cost.
+    r = r - cfg.length_cost * res.laid
     r = r - cfg.rejection * res.rejected.float()
     r = r - cfg.contended * res.contended.float()
     r = r - cfg.via * res.via_placed.float()
