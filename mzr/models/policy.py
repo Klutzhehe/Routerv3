@@ -39,7 +39,24 @@ from mzr.env.observation import FIELD_CHANNELS, Observation, frontier_feature_di
 from mzr.models.encoder import FieldEncoder, FrontierCropEncoder, _norm
 from mzr.world.spec import NUM_DIRECTIONS, NUM_KINDS, NUM_STEPS
 
-_BIG = 30.0  # logit suppression magnitude for a fixed, non-learned mask
+#: Logit suppression for a fixed, non-learned mask.
+#:
+#: This was **additive** (`logits - 30.0`), which a trained network simply
+#: outgrows: once a head's learned logit exceeds the constant, the mask stops
+#: masking. Measured on a stage-1 policy at update 224 -- 392 real via attempts,
+#: 317 rejected, and **not one of them had been marked safe by either mask**.
+#: The policy was selecting actions the mask had already forbidden.
+#:
+#: `mzr/DESIGN.md` records this exact failure one layer down: a learned bias
+#: with the same intent "decayed to nothing in `neuroroute/` once weight-driven
+#: logits grew during training", which is why suppression was supposed to be
+#: fixed and non-learned in the first place. An additive constant is not.
+#:
+#: Applied with `masked_fill` now, so a forbidden action is unreachable at any
+#: weight scale. Finite rather than -inf because every masking site already
+#: falls back to leaving a row open when EVERY option is forbidden, and -inf
+#: would NaN the Categorical in the window before that guard applies.
+_BIG = 1e9
 
 
 @dataclass
@@ -250,12 +267,12 @@ class PriorPolicy(nn.Module):
         # it -- which is that counter's correct remaining job.
         dir_ok = torch.where(dir_ok.any(dim=-1, keepdim=True), dir_ok,
                              torch.ones_like(dir_ok))
-        logits["direction"] = d - _BIG * (~dir_ok).float()
+        logits["direction"] = d.masked_fill(~dir_ok, -_BIG)
 
         via_ok = obs.via_safe.float()                            # (B, F, L)
         stay = torch.ones_like(via_ok[..., :1])
         layer_ok = torch.cat([stay, via_ok], dim=-1)             # (B, F, 1+L)
-        logits["layer"] = logits["layer"] - _BIG * (layer_ok < 0.5).float()
+        logits["layer"] = logits["layer"].masked_fill(layer_ok < 0.5, -_BIG)
         return logits
 
     def _layer_geo_skip(self, logits: dict[str, torch.Tensor], obs: Observation) -> dict[str, torch.Tensor]:
@@ -353,7 +370,7 @@ class PriorPolicy(nn.Module):
         # Categorical -- leave both cases open.
         ok = torch.where((layer > 0).unsqueeze(-1), ok, torch.ones_like(ok))
         ok = torch.where(ok.any(dim=-1, keepdim=True), ok, torch.ones_like(ok))
-        return via_logits - _BIG * (~ok).float()
+        return via_logits.masked_fill(~ok, -_BIG)
 
     @staticmethod
     def _step_logits_given_direction(
@@ -378,7 +395,7 @@ class PriorPolicy(nn.Module):
         # emit all -inf. Only reachable when the direction head was itself
         # unmasked because every direction was blocked (true entombment).
         ok = torch.where(ok.any(dim=-1, keepdim=True), ok, torch.ones_like(ok))
-        return step_logits - _BIG * (~ok).float()
+        return step_logits.masked_fill(~ok, -_BIG)
 
     def _dists(self, logits: dict[str, torch.Tensor]) -> dict[str, torch.distributions.Categorical]:
         return {k: torch.distributions.Categorical(logits=v) for k, v in logits.items()}
