@@ -455,7 +455,7 @@ is not testing what it claims to test; and if a parameter-free heuristic
 *cannot* clear it, neither can a policy initialised at `greedy`.
 
 
-### 7.2 Stage 0 is now solved at initialisation — and PPO degrades it
+### 7.2 Stage 0 is solved at initialisation; PPO dips, then recovers
 
 Measured after the fixes in 7.1, on 64 held-out seeds, with an **untrained**
 `PriorPolicy`:
@@ -471,20 +471,22 @@ That is the design's own claim — *"a near-zero-init policy starts at the greed
 baseline"* — holding for the first time. It was false before 7.1: the same init
 scored 0.7500 completion, 2.00x copper and 40.4% right angles.
 
-**But training makes it worse.** Across three runs with materially different
-rewards, the trained policy converged within ~20 updates to the *same* degraded
-behaviour — copper 1.035, right-angle 0.22, direction entropy 0.01 — identical
-to three decimal places each time:
+Training then **dips below the init before recovering**, and how far it recovers
+depends on one term nobody had sized. Right-angle fraction by update:
 
-| run | change | right-angle at u24 / u49 |
-|---|---|---|
-| A | `length_cost` 0 → 0.03 | 0.220 / 0.220 |
-| B | + `corner` 0.08 → 0.25, `entropy_coef` 0.004 → 0.02 | 0.200 / 0.220 |
-| C | + `gamma` 0.99 → 0.999 | 0.220 / 0.220 |
+| run | change | u24 | u49 | u74 |
+|---|---|---|---|---|
+| A | `length_cost` 0 → 0.03 | 0.220 | 0.220 | 0.220 |
+| B | + `corner` 0.08 → 0.25, `entropy_coef` 0.004 → 0.02 | 0.200 | 0.220 | 0.220 |
+| C | + **`gamma` 0.99 → 0.999** | 0.220 | 0.220 | **0.000** |
 
-Reward changes moving nothing is itself the diagnosis: the reward is not what
-selects the behaviour. Rolling out fixed step policies under the *actual*
-reward confirms the specification is right:
+Runs A and B never came back. Run C did, to copper 1.000 / right-angle 0.000 /
+completion 1.000 — a clean gate hit. Completion held at 1.000 throughout all
+three; only route *quality* dipped.
+
+The reason A and B could not recover is that neither touched the term that was
+paying for the bad behaviour. Rolling out fixed step policies under the actual
+reward:
 
 ```
 discounted episode return, direction held at d0, 48 held-out boards
@@ -493,18 +495,21 @@ discounted episode return, direction held at d0, 48 held-out boards
   step=4: return  +9.594  completion 0.8125  copper 1.040  right-angle 0.476
 ```
 
-Step 1 wins by +2.2, and it is what the init bias already selects. The policy
-moves *away* from the optimum and cannot return: direction entropy is 0.03 by
-update 20, and `value_loss` starts at 14–18, so the first few updates take a
-large policy step on advantages the critic cannot yet estimate. This is
-ordinary premature convergence, and it is a **training-stability** problem, not
-a routing one — but it will follow the policy up the curriculum, so it is the
-next thing to fix rather than something to tune around.
+Step 1 wins by +2.2 — but only once `gamma` is 0.999. At 0.99, with a terminal
+payout of ~12, halving time-to-arrival from 40 steps to 20 was worth ~1.79
+while the right angles it caused cost ~0.34 per board, so haste paid ~5x what
+quality charged and the policy correctly took the trade.
 
-The measured handle on it: 91% of the trained policy's actions were 2-cell
+The measured handle on it: 91% of the degraded policy's actions were 2-cell
 steps, and **66 of 66 right angles were preceded by a 2-cell segment.** A
 multi-cell step is a straight run in one octant and cannot track a
 diagonal-then-straight geodesic without quantisation error.
+
+**What is still open:** the dip itself. Direction entropy is 0.03 by update 20
+and `value_loss` starts at 14–18, so the first updates take a large policy step
+on advantages the critic cannot yet estimate. Stage 0 recovers because its
+optimum is also its init; a stage whose optimum is elsewhere may not be so
+lucky, so critic warm-up is worth doing before it costs a real rung.
 
 ### Expert demonstrations are not optional — add them from stage 1
 
