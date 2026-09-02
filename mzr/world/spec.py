@@ -394,6 +394,13 @@ class PriceRules:
     #: multiplies the cost of entering a cell, which is the whole of
     #: PathFinder: a contested channel is not forbidden, just expensive" -- and
     #: the expert is the only router here that reaches 1.0000 on stage 1.
+    #: Price **route demand** (how many nets' intended routes want a cell)
+    #: instead of same-step claim collisions. See
+    #: `CongestionPrice.absorb_demand` for why the collision measure is always
+    #: ~0: `step()` arbitrates so two nets cannot claim a cell on the same
+    #: macro-step, so the old price measured an event the engine prevents, and
+    #: was flat 1.0 across every cell of every stage.
+    demand_pricing: bool = False
     field_weight: float = 0.0
     #: Added to h(c) each macro-step a cell is over-subscribed. PathFinder
     #: raises history slowly so early contention does not permanently poison a

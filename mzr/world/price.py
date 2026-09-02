@@ -143,7 +143,13 @@ class CongestionPrice:
         decay would be a trap.
         """
         r = self.rules
-        self.present.mul_(r.present_decay)
+        # Under demand pricing `present` is a SNAPSHOT written wholesale by
+        # `absorb_demand` at the field-refresh cadence, not something that
+        # accumulates per step -- decaying it in between just erases it before
+        # anything reads it. Measured: present max 0.000 despite a live demand
+        # field with cells wanted by 3 nets.
+        if not r.demand_pricing:
+            self.present.mul_(r.present_decay)
         self.history.mul_(r.history_decay)
 
     def update(
@@ -178,6 +184,43 @@ class CongestionPrice:
         self.present.add_(hot * r.present_rate).clamp_(0.0, r.max_present)
         self.history.add_(hot * r.history_rate).clamp_(0.0, r.max_history)
         return contested, count
+
+    def absorb_demand(self, demand: torch.Tensor) -> None:
+        """Price **route demand**: how many distinct nets want each cell.
+
+        This is PathFinder's over-subscription, and it is what `update()` was
+        never able to measure. `update()` prices cells two nets CLAIM in the
+        same macro-step -- but `step()` arbitrates exactly so that cannot
+        happen, so it measures an event the engine exists to prevent. Measured
+        over whole episodes on 24 boards:
+
+            stage 1:  0 collisions, present max 0.0000, 0 of 110592 cells priced
+            stage 2:  3 collisions, present max 0.0000, 5 of 393216 cells priced
+            stage 3: 15 collisions, present max 0.0000, 19 of 393216 cells priced
+
+        A price that is flat 1.0 everywhere makes the two observation channels
+        constant, the reward's congestion term zero, the field toll uniform (so
+        it cannot change any route's *relative* cost) and rip-up's scoring a
+        ranking over a constant. The whole negotiation substrate was inert, and
+        nets simply grew first-come-first-served -- the "first nets block later
+        nets" disease section 0 names as the reason this project exists.
+
+        Demand counts a cell once per net whose *intended route* crosses it, so
+        two nets planning through the same channel is over-subscription even
+        though neither has laid copper there yet and neither ever claims it on
+        the same step. That is the signal PathFinder negotiates on: contention
+        is discovered from plans, not from collisions.
+
+        `demand` is (B, L, H, W) counts. Over-subscription is `demand - 1`, so
+        a cell exactly one net wants is free -- using a resource is not a
+        conflict, sharing it is.
+        """
+        r = self.rules
+        over = (demand.to(self.present.dtype) - 1.0).clamp_min(0.0)
+        # Present is a snapshot: replace rather than accumulate, or a corridor
+        # stays "busy" long after the nets that wanted it have gone elsewhere.
+        self.present = (over * r.present_rate).clamp(0.0, r.max_present)
+        self.history.add_(over * r.history_rate).clamp_(0.0, r.max_history)
 
     def field(self) -> torch.Tensor:
         """The PathFinder price, ``(1 + h) * (1 + p)``, as (B, L, H, W).

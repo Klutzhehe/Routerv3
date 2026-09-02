@@ -694,7 +694,10 @@ def geodesic_field_multi(
     # entering the cost the route is actually chosen by.
     toll = None
     if price is not None and price_weight > 0.0:
-        toll = price_weight * coarsen_price(price.float(), ds)
+        # `field()` is (1+h)(1+p), so it is 1.0 on an uncontested cell. Charge
+        # only the EXCESS: a uniform component would add the same cost to every
+        # route and change no relative preference, making the weight meaningless.
+        toll = price_weight * (coarsen_price(price.float(), ds) - 1.0).clamp_min(0.0)
 
     for it in range(iterations):
         cand = _relax_octile(dist, coarse)
@@ -805,7 +808,10 @@ def geodesic_field(
 
     toll = None
     if price is not None and price_weight > 0.0:
-        toll = price_weight * coarsen_price(price.float(), ds)
+        # `field()` is (1+h)(1+p), so it is 1.0 on an uncontested cell. Charge
+        # only the EXCESS: a uniform component would add the same cost to every
+        # route and change no relative preference, making the weight meaningless.
+        toll = price_weight * (coarsen_price(price.float(), ds) - 1.0).clamp_min(0.0)
 
     for it in range(iterations):
         # In-plane relaxation: octile-weighted, no corner cutting.

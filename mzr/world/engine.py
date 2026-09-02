@@ -642,6 +642,62 @@ class SimultaneousRouterWorld:
     def _dilate_for_nets(self, blocked: torch.Tensor) -> torch.Tensor:
         return geo.dilate_blocked(blocked, self._field_radius(self.net_width.reshape(-1)))
 
+    @torch.no_grad()
+    def route_demand(self, horizon: int | None = None) -> torch.Tensor:
+        """(B, L, H, W) -- how many distinct nets' intended routes want each cell.
+
+        Each live frontier walks its own geodesic field downhill from where it
+        stands, and every cell it would cross is marked for its net. Summing
+        over nets gives PathFinder's demand: two nets planning through the same
+        channel over-subscribe it *before* either lays copper there, which is
+        the contention `price.update()` could never see because arbitration
+        prevents same-step claims (see `CongestionPrice.absorb_demand`).
+
+        The walk is the same greedy descent `bearings()` already performs, run
+        forward instead of once, so what is priced is exactly the route the
+        field-follower would take -- not a straight line, and not a re-plan.
+
+        Counted once per NET, not per frontier: a net's two ends walking toward
+        each other must not read as two nets fighting over the middle.
+        """
+        B, N = self.cfg.batch_size, self.cfg.max_nets
+        L, H, W = self.shape
+        F = self.F
+        dev = self.device
+        K = int(horizon if horizon is not None else max(H, W))
+
+        f_idx = torch.arange(F, device=dev).view(1, F).expand(B, F)
+        net = f_idx // (self.cfg.max_legs * NUM_ENDS)
+        live = self.fr_alive & (self.net_status.gather(1, net) == STATUS_ROUTING)
+        if not bool(live.any()):
+            return torch.zeros(B, L, H, W, dtype=torch.float32, device=dev)
+
+        # One plane per (board, net); a cell wanted twice by one net counts once.
+        want = torch.zeros(B * N, L, H, W, dtype=torch.bool, device=dev)
+        bb = torch.arange(B, device=dev).view(B, 1).expand(B, F)
+        bn = (bb * N + net).reshape(-1)
+
+        pos = self.fr_pos.clone().reshape(-1, 3)
+        alive = live.reshape(-1).clone()
+        fld = self._frontier_field()
+        unit = self.tables.path[:, 0, 0]
+        for _ in range(K):
+            if not bool(alive.any()):
+                break
+            want[bn, pos[:, 0], pos[:, 1], pos[:, 2]] |= alive
+            d = geo.bearing_from_field(
+                fld, pos[:, 0], pos[:, 1], pos[:, 2], self.tables,
+                self.cfg.geodesic_downsample,
+            )
+            step = unit[d]
+            ny = (pos[:, 1] + step[:, 0]).clamp(0, H - 1)
+            nx = (pos[:, 2] + step[:, 1]).clamp(0, W - 1)
+            moved = (ny != pos[:, 1]) | (nx != pos[:, 2])
+            pos[:, 1] = torch.where(alive, ny, pos[:, 1])
+            pos[:, 2] = torch.where(alive, nx, pos[:, 2])
+            alive &= moved            # a frontier that cannot descend is done
+        return want.view(B, N, L, H, W).float().sum(dim=1)
+
     def _price_per_net(self) -> torch.Tensor:
         """(B*N, L, H, W) price, one copy per net.
 
@@ -1032,6 +1088,11 @@ class SimultaneousRouterWorld:
             and self.step_count % max(1, self.cfg.geodesic_refresh) == 0
         ):
             self._refresh_net_geo()
+            # Re-price on the SAME cadence as the field, since demand is read
+            # off the field and re-pricing against a stale one would charge
+            # nets for a plan they no longer hold.
+            if self.cfg.price.demand_pricing:
+                self.price.absorb_demand(self.route_demand())
 
         self.step_count += 1
         r = self.cfg.ripup
