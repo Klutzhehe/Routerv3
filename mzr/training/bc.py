@@ -22,10 +22,27 @@ and DRC in any case.)
 
 ## Where the demonstration comes from
 
-The expert plans from the board's STATIC layer -- pads and keepouts -- once per
-reset, never from live occupancy. So the plan is fixed for the episode and each
-step is a lookup rather than a re-plan, which is what makes this affordable
-inside the collection loop.
+The expert plans from the board's STATIC layer -- pads and keepouts -- at each
+`env.reset()`, and then **re-plans against live occupancy every
+`replan_every` macro-steps**.
+
+The re-plan is not optional at stages with more than one net. A plan fixed at
+reset stops being a demonstration as soon as another net lays copper across it:
+it starts pointing the frontier into cells that are now occupied. Measured on
+stage 1, 8 boards, following the demonstration for 10 steps after N steps of
+real routing:
+
+    steps of real routing   static plan            live re-plan
+    8                       78.5% moves closer     99.1% moves closer
+    16                      96.7% moves closer     100.0% moves closer
+
+Cloning the stale version made a `--bc-coef 0.5` run oscillate
+0.755 / 0.693 / 0.823 / 0.599 while `dir_d0_frac` swung 0.32 -> 0.01 -> 0.65.
+
+Coverage falls when re-planning (95% -> 85% of live frontiers at 8 steps)
+because a genuinely blocked leg has no route to demonstrate. That is the right
+trade: `mask` excludes those frontiers, so they contribute nothing to the BC
+loss rather than teaching a move into occupied copper.
 
 The policy will wander off that path. When it does, the demonstration is "head
 for the nearest point on the expert's route, then follow it", which is the
