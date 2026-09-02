@@ -974,7 +974,12 @@ class SimultaneousRouterWorld:
         self.step_count += 1
         r = self.cfg.ripup
         if r.interval > 0 and self.step_count % r.interval == 0:
-            self.ripup_round()
+            # Retraction is the DESIGN.md section 3 mechanism; whole-net rip-up
+            # is the fallback. See RipupRules.retract_steps.
+            if r.retract_steps > 0:
+                self.retract_round()
+            else:
+                self.ripup_round()
 
         return StepResult(
             rejected=rejected,
@@ -1323,6 +1328,119 @@ class SimultaneousRouterWorld:
 
         self._clear_nets(sel)
         self.ripup_count += sel.sum(dim=1)
+        return sel.sum(dim=1)
+
+
+    def retract_round(self) -> torch.Tensor:
+        """Pull the worst-priced frontiers back `retract_steps` vertices.
+
+        The mechanism `mzr/DESIGN.md` section 3 specifies, and the one the
+        horizon can actually afford. `ripup_round` rips WHOLE nets, which at
+        stage 1 measured 0.8542 -> 0.5625 completion because a net ripped at
+        step 40 of 96 cannot re-route in time. A retraction gives back only the
+        last few moves, so the frontier resumes from a position it already
+        reached instead of from its pad, and historical price -- untouched here,
+        exactly as in `ripup_round` -- keeps the vacated corridor expensive so
+        the regrowth goes somewhere else.
+
+        Unstamping a polyline suffix was called out in `RipupRules` as the
+        ambiguity that motivated whole-net rips. It is not ambiguous:
+        `geo.stamp_segments(erase=True)` clears only cells THIS net owns, so a
+        retraction can never punch a hole in another net's copper, and
+        re-stamping the retained prefix afterwards repairs any cell the removed
+        suffix shared with it.
+
+        Returns (B,) counts of frontiers retracted.
+        """
+        B, F = self.cfg.batch_size, self.F
+        r = self.cfg.ripup
+        k = int(r.retract_steps)
+        dev = self.device
+        zero = torch.zeros(B, dtype=torch.int64, device=dev)
+        if k <= 0:
+            return zero
+
+        f_idx = torch.arange(F, device=dev).view(1, F).expand(B, F)
+        net = f_idx // (self.cfg.max_legs * NUM_ENDS)
+        live = (
+            self.fr_alive
+            & (self.net_status.gather(1, net) == STATUS_ROUTING)
+            & (self.route_n > 1)
+        )
+        n_live = int(live.sum(dim=1).max())
+        if n_live == 0:
+            return zero
+        # max(1, ...) on purpose: `fraction` floors to zero and that is what
+        # silently disabled rip-up at stage 1 (DESIGN.md section 7.3).
+        n_sel = max(1, int(round(n_live * float(r.retract_fraction))))
+
+        # Score by the congestion price under each frontier's tip: the frontiers
+        # sitting in the most-contested copper are the ones worth moving.
+        price = self.price.field()
+        pos = self.fr_pos
+        bb = torch.arange(B, device=dev).view(B, 1).expand(B, F)
+        score = price[bb, pos[..., 0], pos[..., 1], pos[..., 2]]
+        score = torch.where(live, score, torch.full_like(score, -1.0))
+        pick = score.topk(min(n_sel, F), dim=1).indices
+        sel = torch.zeros(B, F, dtype=torch.bool, device=dev)
+        sel.scatter_(1, pick, True)
+        sel &= live & (score > 0)
+        if not bool(sel.any()):
+            return zero
+
+        n_old = self.route_n
+        n_new = torch.clamp(n_old - k, min=1)
+        wclass = self.net_width.gather(1, net)
+
+        def seg(i_from: torch.Tensor, i_to: torch.Tensor, active: torch.Tensor, erase: bool):
+            """Stamp or erase the polyline segment between two vertex indices."""
+            a = torch.gather(self.route_v, 2,
+                             i_from.clamp(min=0).view(B, F, 1, 1).expand(B, F, 1, 3)).squeeze(2)
+            c = torch.gather(self.route_v, 2,
+                             i_to.clamp(min=0).view(B, F, 1, 1).expand(B, F, 1, 3)).squeeze(2)
+            m = active & (i_to < n_old) & (i_from >= 0)
+            geo.stamp_segments(
+                self.occ, bb.reshape(-1), a[..., 0].reshape(-1).long(),
+                a[..., 1].reshape(-1).long(), a[..., 2].reshape(-1).long(),
+                c[..., 1].reshape(-1).long(), c[..., 2].reshape(-1).long(),
+                wclass.reshape(-1), net.reshape(-1), self.tables,
+                active=m.reshape(-1), erase=erase,
+            )
+
+        # 1. erase the removed suffix, segment by segment
+        for j in range(k):
+            i0 = (n_new - 1 + j)
+            seg(i0, i0 + 1, sel, erase=True)
+        # 2. re-stamp what is kept -- the suffix may have shared cells with it
+        for j in range(int(n_new.max()) - 1):
+            jj = torch.full_like(n_new, j)
+            seg(jj, jj + 1, sel & (n_new > j + 1), erase=False)
+        # 3. pads are never given back -- an erase may have crossed one
+        touched = self._fr_view(sel).any(dim=(2, 3))          # (B, N) nets affected
+        own = torch.zeros(B, self.cfg.max_nets + 1, dtype=torch.bool, device=dev)
+        own[:, 1:] = touched
+        static_mine = own.gather(1, self.static.long().clamp_min(0).flatten(1)).view_as(self.occ)
+        self.occ = torch.where(static_mine, self.static, self.occ)
+
+        # 4. move the frontier back to the vertex it retreated to
+        tip = torch.gather(self.route_v, 2,
+                           (n_new - 1).view(B, F, 1, 1).expand(B, F, 1, 3)).squeeze(2).long()
+        self.fr_pos = torch.where(sel.unsqueeze(-1), tip, self.fr_pos)
+        self.route_n = torch.where(sel, n_new, n_old)
+        # A retreat is not a corner, and it must not read as one next step.
+        self.fr_dir = torch.where(sel, torch.full_like(self.fr_dir, -1), self.fr_dir)
+        # Give the frontier a clean slate: it was retracted precisely because it
+        # was going nowhere, and carrying the stall counters would retire it.
+        self.fr_stuck = torch.where(sel, torch.zeros_like(self.fr_stuck), self.fr_stuck)
+        self.fr_idle = torch.where(sel, torch.zeros_like(self.fr_idle), self.fr_idle)
+        self.fr_best = torch.where(sel, torch.full_like(self.fr_best, float("inf")), self.fr_best)
+
+        self.ripup_count += sel.sum(dim=1)
+        self._refresh_geodesic(sel)
+        if self.cfg.copper_seeded:
+            self._refresh_net_geo(incremental=False)
+        else:
+            self._rebaseline_fr_prev()
         return sel.sum(dim=1)
 
     def _clear_nets(self, sel: torch.Tensor) -> None:

@@ -443,6 +443,24 @@ class RipupRules:
     #: exactly why the expert reaches 144/144 legs on stage 1 where the
     #: simultaneous field-follower is pinned at 123/144.
     include_settled: bool = False
+    #: Macro-steps of copper each selected frontier gives back, instead of its
+    #: whole net being ripped. **> 0 switches rip-up into retraction mode.**
+    #:
+    #: This is what `mzr/DESIGN.md` section 3 actually specifies -- "frontiers
+    #: sitting on the worst-priced cells retract N cells while historical price
+    #: stays elevated" -- and the whole-net form implemented instead is
+    #: unusable at this horizon: a net ripped at step 40 of 96 needs ~25 steps
+    #: to re-route and often does not get them. Measured on stage 1, whole-net
+    #: rip-up at fraction 0.5 took completion 0.8542 -> 0.5625.
+    #:
+    #: A retraction is counted in VERTICES, i.e. accepted moves, since that is
+    #: what the polyline stores; a vertex is 1, 2 or 4 cells depending on the
+    #: step class that produced it.
+    retract_steps: int = 0
+    #: Fraction of LIVE FRONTIERS retracted per round (retraction mode only).
+    #: Uses `max(1, round(...))`, deliberately unlike `fraction` below, which
+    #: floors to zero and silently disabled rip-up entirely at stage 1.
+    retract_fraction: float = 0.25
     interval: int = 8
     #: Fraction of unfinished nets ripped per round, most-congested first.
     #:

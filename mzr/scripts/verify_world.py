@@ -1190,6 +1190,73 @@ def test_greedy_baseline_is_sane() -> None:
     )
 
 
+def test_retraction_preserves_copper() -> None:
+    """A retracted frontier gives back its own copper and nobody else's.
+
+    `RipupRules` claimed unstamping a polyline suffix was too ambiguous to do,
+    and whole-net rip-up was implemented instead -- which measured
+    0.8542 -> 0.5625 completion on stage 1, because a net ripped late cannot
+    re-route in time (DESIGN.md section 7.3). It is not ambiguous:
+    `stamp_segments(erase=True)` clears only cells the net owns. This check is
+    what makes that safe to rely on, because every way it can go wrong is
+    silent -- a hole in a neighbour's trace, a clobbered pad, or a net still
+    flagged DONE whose copper no longer connects end to end.
+    """
+    import dataclasses
+
+    from mzr.training.curriculum import STAGES
+    from mzr.training.run import make_env
+    from mzr.world import baselines
+
+    stage = STAGES["1"]
+    seeds = list(range(900_000, 900_016))
+    env = make_env(stage, batch=len(seeds), device="cpu", seed=0)
+    env.world.cfg.ripup = dataclasses.replace(
+        env.world.cfg.ripup, retract_steps=4, interval=8
+    )
+    env.reset(seeds)
+    w = env.world
+    baselines.rollout(w, baselines.layer_hop, max_steps=stage.max_macro_steps)
+
+    rv, rn = w.route_v.numpy(), w.route_n.numpy()
+    bad_v = bad_pad = bad_conn = 0
+    for b in range(len(seeds)):
+        for f in range(w.F):
+            n = f // (w.cfg.max_legs * NUM_ENDS)
+            for i in range(int(rn[b, f])):
+                cl, cy, cx = (int(v) for v in rv[b, f, i])
+                if int(w.occ[b, cl, cy, cx]) != n + 1:
+                    bad_v += 1
+        pads = w.static[b] > 0
+        if not bool((w.occ[b][pads] == w.static[b][pads]).all()):
+            bad_pad += 1
+        for n in range(w.cfg.max_nets):
+            if not bool(w.net_valid[b, n]) or int(w.net_status[b, n]) != 1:
+                continue
+            own = w.occ[b] == n + 1
+            src = w.net_pad[b, n, 0, 0]
+            dst = w.net_pad[b, n, 0, 1]
+            seed = torch.zeros_like(own)
+            seed[int(src[0]), int(src[1]), int(src[2])] = True
+            reach = geo.flood_component(own.unsqueeze(0), seed.unsqueeze(0))[0]
+            if not bool(reach[int(dst[0]), int(dst[1]), int(dst[2])]):
+                bad_conn += 1
+
+    total = int(w.ripup_count.sum())
+    check(
+        "retraction gives back only the retracting net's own copper",
+        bad_v == 0 and bad_pad == 0 and bad_conn == 0,
+        f"{total} retractions over {len(seeds)} boards -- {bad_v} stray vertices, "
+        f"{bad_pad} clobbered pads, {bad_conn} DONE-but-disconnected nets",
+    )
+    check(
+        "the retraction check actually exercised retractions",
+        total > 0,
+        f"{total} retractions fired",
+    )
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--quick", action="store_true", help="skip the slower scale checks")
@@ -1219,6 +1286,8 @@ def main() -> int:
     print("\n== step mechanics ==")
     test_rejected_steps_are_no_ops()
     test_determinism()
+
+    test_retraction_preserves_copper()
 
     print("\n== congestion price ==")
     test_price_tracks_contention()
