@@ -93,6 +93,23 @@ class WorldConfig:
     #: purpose: at stages 1+ a frontier may be blocked for several steps by
     #: copper that a rip-up round is about to clear.
     max_stuck_steps: int = 16
+    #: Consecutive macro-steps a frontier may take **legal** moves without ever
+    #: beating its own best cost-to-go, before its net is abandoned.
+    #:
+    #: `max_stuck_steps` counts REJECTED moves only, so it never fires on a
+    #: frontier that legally ping-pongs between two cells -- and a frontier's
+    #: own copper is passable to itself, so nothing stops it. Traced on stage-0
+    #: seed 900006 under the greedy baseline:
+    #:
+    #:     t=15 f0=[0,38,21] d=16.94    t=16 f0=[0,38,22] d=16.94
+    #:     t=17 f0=[0,38,21] d=16.94    t=18 f0=[0,38,22] d=16.94   ... x34
+    #:
+    #: with `fr_stuck` at 0 the whole time. That limit cycle is the cheapest
+    #: absorbing state in the MDP -- it costs `step_cost` (0.01) per step while
+    #: progress alternates +1/-1 and cancels exactly -- so a policy will find
+    #: it. Charging the net's failure penalty makes standing still expensive
+    #: instead of free.
+    max_idle_steps: int = 12
     #: Legs (two-pin connections) a net may have. A k-pin net decomposes into
     #: k-1 spanning-tree legs, so this is the maximum pin count minus one; a
     #: differential pair uses exactly 2 (its P and N conductors).
@@ -278,6 +295,11 @@ class SimultaneousRouterWorld:
         #: stage 0: a frozen run of 48 of 48 steps. Counting consecutive
         #: rejections lets `step()` retire the net instead of spinning.
         self.fr_stuck = z(B, F)
+        #: Best (lowest) cost-to-go this frontier has ever reached, and how many
+        #: consecutive steps it has failed to beat it. See `max_idle_steps`:
+        #: `fr_stuck` cannot see a frontier that oscillates *legally*.
+        self.fr_best = torch.full((B, F), float("inf"), dtype=torch.float32, device=dev)
+        self.fr_idle = z(B, F)
         #: Last accepted absolute heading, or -1 before a frontier has moved.
         #: A via does not change it: a layer change is not a corner.
         self.fr_dir = torch.full((B, F), -1, dtype=torch.long, device=dev)
@@ -368,6 +390,8 @@ class SimultaneousRouterWorld:
         self.fr_alive.zero_()
         self.fr_steps.zero_()
         self.fr_stuck.zero_()
+        self.fr_best.fill_(float("inf"))
+        self.fr_idle.zero_()
         self.fr_dir.fill_(-1)
         self.leg_D.zero_()
         self.leg_gap.zero_()
@@ -457,6 +481,8 @@ class SimultaneousRouterWorld:
         self.fr_pos = torch.where(alive.unsqueeze(-1), pos, self.fr_pos)
         self.fr_steps = torch.where(alive, torch.zeros_like(self.fr_steps), self.fr_steps)
         self.fr_stuck = torch.where(alive, torch.zeros_like(self.fr_stuck), self.fr_stuck)
+        self.fr_best = torch.where(alive, torch.full_like(self.fr_best, float("inf")), self.fr_best)
+        self.fr_idle = torch.where(alive, torch.zeros_like(self.fr_idle), self.fr_idle)
         self.fr_dir = torch.where(alive, torch.full_like(self.fr_dir, -1), self.fr_dir)
         ripped = self._fr_view(alive).any(dim=3)
         tot = self._fr_view(self.fr_prev).sum(dim=3)
@@ -849,6 +875,16 @@ class SimultaneousRouterWorld:
         self.fr_steps = torch.where(live, self.fr_steps + 1, self.fr_steps)
         self.fr_stuck = torch.where(rejected, self.fr_stuck + 1, torch.zeros_like(self.fr_stuck))
 
+        # Idle = took a legal step and still did not beat its own best
+        # cost-to-go. A tolerance of half a cell, so float noise in the field
+        # (and a refresh under `copper_seeded`) does not read as progress.
+        best = torch.minimum(self.fr_best, self.fr_prev)
+        improved = self.fr_prev < self.fr_best - 0.5
+        self.fr_best = torch.where(live, best, self.fr_best)
+        self.fr_idle = torch.where(
+            live & ~improved, self.fr_idle + 1, torch.zeros_like(self.fr_idle)
+        )
+
         # --- connection: pad snap, then partner meeting ----------------------
         self._try_snap(b_flat, n_flat, w_flat, live.reshape(M))
         self._try_meet(b_flat, n_flat, w_flat)
@@ -878,7 +914,12 @@ class SimultaneousRouterWorld:
         # rather than let it burn the rest of the episode re-picking one illegal
         # move.
         wedged = self._fr_view(self.fr_stuck).amax(dim=(2, 3)) >= self.cfg.max_stuck_steps
-        net_failed = routing & self.net_valid & ~net_done & (starved | wedged)
+        # Legal-but-going-nowhere. See WorldConfig.max_idle_steps.
+        if self.cfg.max_idle_steps > 0:
+            idling = self._fr_view(self.fr_idle).amax(dim=(2, 3)) >= self.cfg.max_idle_steps
+        else:
+            idling = torch.zeros_like(wedged)
+        net_failed = routing & self.net_valid & ~net_done & (starved | wedged | idling)
 
         nets_done = self._retire(net_done, STATUS_DONE)
         nets_failed = self._retire(net_failed, STATUS_FAILED)

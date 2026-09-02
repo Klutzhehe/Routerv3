@@ -19,6 +19,7 @@ transposes.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -482,6 +483,44 @@ def flood_component(
     return cur
 
 
+#: Cost of a diagonal lattice move, in cell units. The relaxation below used to
+#: charge 1.0 for all eight neighbours -- a **Chebyshev** metric -- which is
+#: wrong in two ways that both landed on the policy. Measured on an empty
+#: 48x48 board, a (10, 10) displacement read 10.00 in the field while the
+#: copper actually laid is 14.14: shaping paid a diagonal step exactly what it
+#: paid an orthogonal one for 1.41x the copper, and `route_quality` /
+#: `RewardConfig.wirelength` score in octile, so the reward and the metric
+#: disagreed by construction. Worse, Chebyshev makes every path inside an
+#: L-infinity ball equal-cost, so the field is one large plateau and the
+#: `argmin` in `descent_direction` / `bearing_from_field` breaks ties
+#: arbitrarily -- which is what a staircase route is.
+DIAG_COST = math.sqrt(2.0)
+
+
+def _relax_octile(dist: torch.Tensor) -> torch.Tensor:
+    """One in-plane relaxation sweep with **octile** costs.
+
+    Orthogonal neighbours cost 1.0, diagonal neighbours `DIAG_COST`. Done as
+    eight shifts of the negated field rather than one 3x3 max-pool, because a
+    max-pool cannot charge the two neighbour classes differently -- and that
+    single shared cost was the Chebyshev bug (see `DIAG_COST`).
+
+    `dist` is (m, L, h, w) with `inf` for unreached cells.
+    """
+    neg_inf = -1e9
+    nd = torch.where(torch.isinf(dist), torch.full_like(dist, neg_inf), -dist)
+    p = F.pad(nd, (1, 1, 1, 1), value=neg_inf)
+    ortho = torch.maximum(
+        torch.maximum(p[..., 1:-1, :-2], p[..., 1:-1, 2:]),
+        torch.maximum(p[..., :-2, 1:-1], p[..., 2:, 1:-1]),
+    )
+    diag = torch.maximum(
+        torch.maximum(p[..., :-2, :-2], p[..., :-2, 2:]),
+        torch.maximum(p[..., 2:, :-2], p[..., 2:, 2:]),
+    )
+    return torch.minimum(-ortho + 1.0, -diag + DIAG_COST)
+
+
 def geodesic_field_multi(
     blocked: torch.Tensor,
     sources: torch.Tensor,
@@ -555,11 +594,8 @@ def geodesic_field_multi(
         dist = prev.clone().float()
     dist = torch.where(src, torch.zeros_like(dist), dist)
 
-    neg_inf = -1e9
     for _ in range(iterations):
-        nd = torch.where(torch.isinf(dist), torch.full_like(dist, neg_inf), -dist)
-        pooled = F.max_pool2d(nd.reshape(m * L, 1, h, w), 3, stride=1, padding=1)
-        cand = -pooled.reshape(m, L, h, w) + 1.0
+        cand = _relax_octile(dist)
 
         if L > 1:
             up = torch.full_like(dist, float("inf"))
@@ -661,12 +697,9 @@ def geodesic_field(
     idx = torch.arange(m, device=blocked.device)
     dist[idx, tl, ty, tx] = 0.0
 
-    neg_inf = -1e9
     for _ in range(iterations):
-        # In-plane 8-connected relaxation via max-pool on the negated field.
-        nd = torch.where(torch.isinf(dist), torch.full_like(dist, neg_inf), -dist)
-        pooled = F.max_pool2d(nd.reshape(m * L, 1, h, w), 3, stride=1, padding=1)
-        cand = -pooled.reshape(m, L, h, w) + 1.0
+        # In-plane 8-connected relaxation, octile-weighted (see _relax_octile).
+        cand = _relax_octile(dist)
 
         # Cross-layer relaxation: a via costs `via_cost` cells of travel.
         if L > 1:

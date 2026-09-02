@@ -343,6 +343,11 @@ no search at all, and the prior policy alone is a complete working router
 
 ## 7. Curriculum — one mechanism per rung, each with a kill-number
 
+> **Revised 2026-09-02.** Stage 0 was stuck below its gate for many sessions.
+> The cause was measured, and it was not the learner — see §7.1. Stage 0 is now
+> split in two (`0` obstacles, `0v` vias) so each rung tests one skill, and the
+> substrate defects that made the old rung unpassable are fixed.
+
 Start with a single net learning to get around obstacles, and only widen once
 that is genuinely solved. One sharpening, stated honestly: **single-net
 de-risks the *substrate*, not the *architecture bet*.** A lone net has zero
@@ -357,7 +362,8 @@ per rung**, so any regression has exactly one suspect.
 
 | Stage | Board | New mechanism | Gate | **Kill-number** |
 |---|---|---|---|---|
-| **0** | 1 net, static keepouts + pads | engine, export, training loop, checkpointing end-to-end | ≥ **99%**, incl. known-hard seeds | can't reach 95% in 500 updates → geometry or reward bug, not a hard problem |
+| **0** | 1 net, **1 layer**, static keepouts + pads | engine, export, training loop, checkpointing end-to-end. Pure "route around things" | **100%** + quality (copper ≤ 1.15, right-angle ≤ 15%, 0 double-routed) | can't reach 95% in 500 updates → geometry or reward bug, not a hard problem |
+| **0v** | 1 net, **2 layers** | **the via.** Pads land on outer layers, so ~25% of boards cannot be routed without one | **100%** + quality | can't reach 95% in 1000 updates → the via penalty is drowning discovery |
 | **0.5** | 1 net + **frozen random pre-routed copper** (dense) | policy reacts to dense static obstacles; raycast→logit suppression, local crop | ≥ **97%** | plateaus < 90% → spatial encoder inadequate; fix before adding agents |
 | **1** | **2–5 live simultaneous nets**, price field ON, **search OFF** | simultaneous arbitration + congestion price. *Does the prior policy negotiate at all?* | beat **sequential + PathFinder negotiation** (not naive greedy) by ≥ **10 pts** | no gain in 2000 updates → **the simultaneous-growth premise is wrong**; stop and fall back to learned-sequential + negotiation |
 | **2** | 5–20 live nets | add `h/g/f` + value-equivalence losses. **Search still OFF** (MuZero net used as a plain policy/value net) | **diagnostic, not a kill-switch** (see §8 correction): track `g`'s next-step error and its growth with unroll depth vs the analytic "replay the geodesic field forward" baseline | no kill-number — a model can fail an absolute fidelity test and still serve search. Proceed to stage 3 and let *that* gate decide |
@@ -367,6 +373,86 @@ per rung**, so any regression has exactly one suspect.
 | **6** | + **diff pairs** | `couple` head, gap/skew reward | > 80% pairs inside gap tolerance | — |
 | **7** | + **length groups** | refine phase (§12) | > 80% groups inside tolerance | — |
 | **8** | + pours, then 1000–3000 nets held-out scale | generalisation | the actual target | — |
+
+
+### 7.1 Why stage 0 was unpassable — measured, not theorised
+
+Four substrate defects, each verified on the first 48 held-out eval seeds with
+**non-learned baselines**, so no policy is implicated. `layer_hop` is ~30 lines
+in `world/baselines.py`; `greedy` is the all-zero action, i.e. exactly what an
+untrained `PriorPolicy` emits.
+
+| router (48 held-out seeds) | completion | copper (med) | double-routed | right-angle |
+|---|---|---|---|---|
+| `greedy`, old substrate | 0.7500 | 2.00 | 24 / 48 | 40.4% |
+| `layer_hop`, old substrate | 1.0000 | 1.79 | 24 / 48 | 5.1% |
+| `greedy`, **stage 0 now** | **1.0000** | **1.000** | **0** | **0.0%** |
+| `layer_hop`, **stage 0v now** | **1.0000** | **1.024** | **0** | **0.1%** |
+
+**(a) The geodesic field was Chebyshev, not octile.** The relaxation charged
+1.0 for all eight neighbours. Measured on an empty 48×48 board, a (10, 10)
+displacement read `10.00` where the copper laid is `14.14`. Two consequences:
+shaping paid a diagonal step what it paid an orthogonal one for 1.41× the
+copper — while `route_quality` and `RewardConfig.wirelength` score in octile,
+so the reward and the metric disagreed by construction — and every path inside
+an L∞ ball was equal-cost, making the field one large plateau whose `argmin`
+in `bearing_from_field` broke ties arbitrarily. That is a staircase route.
+Fixed in `geometry._relax_octile`; the measured right-angle rate of a pure
+field-follower went **40.4% → 0.0%**.
+
+**(b) `geodesic_downsample=4` hid the obstacles.** On a 48×48 board that is a
+12×12 field, and a coarse cell counts as blocked only when *every* fine cell in
+it is. Measured:
+
+```
+3x3  keepout ->  0 coarse cells blocked   (invisible)
+6x6  keepout ->  0-1, depending on alignment
+10x10 keepout -> 1-4
+```
+
+Stage 0 samples keepouts from [3, 10]. The field the whole obstacle-avoidance
+story rests on could not see most of them. The memory argument for `ds=4` binds
+at 128×128×8, not here; stages 0–3 now run `ds=1` (a few MB) and scale the
+iteration cap with the grid.
+
+**(c) Double-routing was caused by the environment, not the policy.**
+Dual-ended growth toward *static pads* lets the two frontiers mirror around
+each other, swap positions, and each complete the whole run — `completion`
+reads 1.000 for a net drawn twice. `layer_hop`, with no parameters, did this on
+24 of 48 boards at 1.79× copper. Four reward patches (`leg_progress`,
+`tip_progress`, `leg_budget_frac`, `wirelength`×12) were built to price it out
+and none removed it. Copper-seeded single-ended growth removes it by
+construction: **copper 1.79 → 1.00, doubled 24 → 0.** Stages 0–3 now default to
+it (`Stage.copper_seeded`).
+
+**(d) A legal limit cycle was invisible to every stall detector, and was the
+cheapest policy in the MDP.** `fr_stuck` counts *rejected* moves only, and a
+frontier's own copper is passable to itself. Traced on seed 900006 under
+`greedy`:
+
+```
+t=15 f0=[0,38,21] d=16.94    t=16 f0=[0,38,22] d=16.94
+t=17 f0=[0,38,21] d=16.94    t=18 f0=[0,38,22] d=16.94   ... for 34 steps
+```
+
+`fr_stuck` was 0 throughout, so `max_stuck_steps` never fired and the net burned
+its whole budget. Cost of vibrating: `step_cost` = 0.01 per step, with progress
+alternating +1/−1 and cancelling exactly. `WorldConfig.max_idle_steps` now
+retires a frontier that takes legal moves without ever beating its own best
+cost-to-go.
+
+**(e) The corner penalty was unobservable.** `world.fr_dir` was written by the
+engine and read *only* by `RewardConfig.corner`; it was never in the
+observation. The direction head is egocentric to the geodesic bearing, which
+rotates every step, so holding a straight line needs both the previous heading
+and the bearing — the policy had neither, and the term was pure gradient noise.
+The previous heading now enters `build_observation` in the *same egocentric
+frame as the action*.
+
+**The standing rule this produced:** run `layer_hop` against a stage's gate
+*before* training it. If a parameter-free heuristic clears the gate, the stage
+is not testing what it claims to test; and if a parameter-free heuristic
+*cannot* clear it, neither can a policy initialised at `greedy`.
 
 ### Expert demonstrations are not optional — add them from stage 1
 

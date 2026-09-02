@@ -84,6 +84,7 @@ def frontier_feature_dim(num_layers: int) -> int:
         + NUM_DIRECTIONS * NUM_STEPS      # per-(direction, step) safety
         + NUM_DIRECTIONS * NUM_STEPS      # geodesic lookahead per candidate move
         + NUM_DIRECTIONS * NUM_STEPS      # price lookahead per candidate move
+        + NUM_DIRECTIONS + 1              # previous heading, egocentric (+1 = none yet)
         + num_layers                      # current layer one-hot
         + num_layers                      # target layer one-hot
         + num_layers                      # cost-to-go on every layer, from here
@@ -217,6 +218,26 @@ def build_observation(world) -> Observation:
         fld, pos[:, 0], pos[:, 1], pos[:, 2], world.tables, ds, free_units=free
     )                                                   # (M,)
 
+    # The frontier's OWN previous heading, expressed in the same egocentric
+    # frame as the action -- so slot d reads "I last moved in the direction
+    # that action d would take me now", and slot NUM_DIRECTIONS means "I have
+    # not moved yet".
+    #
+    # Without this the corner reward (`RewardConfig.corner`, charged on
+    # `world.fr_dir`) is **unobservable**: the direction head is egocentric to
+    # the geodesic bearing, which rotates every step, so holding a straight
+    # line requires knowing both the previous heading and the bearing and the
+    # policy was handed neither. The term was pure gradient noise, and the
+    # measured right-angle fraction (38-51%) was never something the policy
+    # could act on.
+    prev_dir = world.fr_dir.reshape(M)
+    prev_ego = torch.where(
+        prev_dir >= 0,
+        (prev_dir - bearing) % NUM_DIRECTIONS,
+        torch.full_like(prev_dir, NUM_DIRECTIONS),
+    )
+    prev_onehot = _one_hot(prev_ego, NUM_DIRECTIONS + 1)
+
     # Rotate the absolute-frame raycast into the egocentric frame. The raycast
     # reports absolute directions while every action resolves relative to the
     # bearing; when those two frames drifted apart in NeuroRoute, the
@@ -327,6 +348,7 @@ def build_observation(world) -> Observation:
             safety_ego.reshape(M, -1).float(),
             geo_ray.reshape(M, -1),
             price_ray.reshape(M, -1),
+            prev_onehot,
             _one_hot(pos[:, 0], L),
             _one_hot(tgt[:, 0], L),
             geo_layer,

@@ -74,7 +74,7 @@ def _bends(pts: list[list[int]]) -> dict:
 
 @torch.no_grad()
 def export(policy, stage, device: str, seeds: list[int], deterministic: bool = True,
-           *, copper_seeded: bool = False, geodesic_refresh: int = 8) -> dict:
+           *, copper_seeded: bool | None = None, geodesic_refresh: int | None = None) -> dict:
     # The env must match the one the policy was TRAINED in. A copper-seeded
     # policy measured in a pad-targeted world is measuring a different game.
     env = make_env(stage, batch=len(seeds), device=device, seed=0,
@@ -165,7 +165,8 @@ def main() -> int:
     p.add_argument("--boards", type=int, default=9)
     p.add_argument("--seeds", type=int, nargs="*", default=None,
                    help="explicit seeds; default is the first --boards eval seeds")
-    p.add_argument("--copper-seeded", action="store_true")
+    p.add_argument("--copper-seeded", action=argparse.BooleanOptionalAction, default=None,
+                   help="unset = whatever the STAGE asks for")
     p.add_argument("--sampled", action="store_true", help="export a sampled rollout instead of argmax")
     p.add_argument("--out", default="routes.json")
     args = p.parse_args()

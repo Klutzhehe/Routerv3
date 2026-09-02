@@ -104,7 +104,7 @@ def copper_stats(world, completion) -> list[dict]:
 
 @torch.no_grad()
 def evaluate_seeds(policy, stage, device: str, seeds: list[int], batch: int,
-                   *, copper_seeded: bool = False, geodesic_refresh: int = 16,
+                   *, copper_seeded: bool | None = None, geodesic_refresh: int | None = None,
                    deterministic: bool = True, progress: bool = True):
     """Completion per board, over `seeds`, in chunks of `batch`.
 
@@ -156,8 +156,9 @@ def main() -> int:
     p.add_argument("--token-width", type=int, default=192)
     p.add_argument("--encoder-levels", type=int, default=2)
     p.add_argument("--token-depth", type=int, default=2)
-    p.add_argument("--copper-seeded", action="store_true")
-    p.add_argument("--geodesic-refresh", type=int, default=16)
+    p.add_argument("--copper-seeded", action=argparse.BooleanOptionalAction, default=None,
+                   help="unset = whatever the STAGE asks for")
+    p.add_argument("--geodesic-refresh", type=int, default=None)
     p.add_argument("--sampled", action="store_true",
                    help="evaluate the sampled arm instead of argmax (the gate is argmax)")
     p.add_argument("--max-show", type=int, default=0,

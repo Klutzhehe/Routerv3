@@ -43,8 +43,23 @@ from mzr.world.engine import WorldConfig
 
 
 def make_env(stage, batch: int, device: str, seed: int,
-             leg_budget: float = 0.0, copper_seeded: bool = False,
-             geodesic_refresh: int = 16) -> RouteEnv:
+             leg_budget: float = 0.0, copper_seeded: bool | None = None,
+             geodesic_refresh: int | None = None) -> RouteEnv:
+    """Build the env a stage describes.
+
+    `copper_seeded` / `geodesic_refresh` default to the STAGE's values; passing
+    them explicitly is the CLI override. They used to default to
+    ``False`` / ``16`` here regardless of the stage, which meant the curriculum
+    could not actually choose its own growth mode.
+    """
+    ds = stage.geodesic_downsample
+    H, W = stage.height, stage.width
+    # Relaxation propagates one cell per iteration, so the cap has to scale
+    # with the grid it runs on. At ds=4 a 48x48 board was a 12x12 grid and 96
+    # was plenty; at ds=1 it is 48x48 and a route that winds around obstacles
+    # needs more than that, and an under-relaxed field is worse than a coarse
+    # one. The loop breaks as soon as it converges, so this is a cap, not a cost.
+    iters = max(96, 3 * (H + W) // max(1, ds))
     return RouteEnv(
         EnvConfig(
             spec=stage.board_spec(),
@@ -55,8 +70,11 @@ def make_env(stage, batch: int, device: str, seed: int,
                 # multiplies F and therefore fr_geo, the dominant memory term.
                 max_legs=max(2, stage.generator.max_pins_per_net - 1),
                 leg_budget_frac=leg_budget,
-                copper_seeded=copper_seeded,
-                geodesic_refresh=geodesic_refresh,
+                copper_seeded=stage.copper_seeded if copper_seeded is None else copper_seeded,
+                geodesic_refresh=(stage.geodesic_refresh if geodesic_refresh is None
+                                  else geodesic_refresh),
+                geodesic_downsample=ds,
+                geodesic_iterations=iters,
                 max_macro_steps=stage.max_macro_steps,
                 max_steps_per_frontier=stage.max_macro_steps,
                 ripup=stage.ripup,
@@ -75,7 +93,7 @@ _EVAL_ENV: RouteEnv | None = None
 
 @torch.no_grad()
 def evaluate(policy, stage, device: str, eval_seeds: list[int], with_sampled: bool = True,
-             *, copper_seeded: bool = False, geodesic_refresh: int = 16) -> dict:
+             *, copper_seeded: bool | None = None, geodesic_refresh: int | None = None) -> dict:
     """Held-out completion on the fixed seeds.
 
     Reuses one persistent env across calls -- rebuilding it (and regenerating
@@ -201,12 +219,14 @@ def main() -> int:
                         "broadcast to every frontier (GPAE-style). The MAPPO "
                         "shared advantage is the one blocker that gets WORSE "
                         "as net count grows -- SNR falls as 1/N")
-    p.add_argument("--copper-seeded", action="store_true",
+    p.add_argument("--copper-seeded", action=argparse.BooleanOptionalAction, default=None,
                    help="one field per NET (distance to its trunk) instead of one "
                         "per frontier targeting a static pad; implies trunk+spokes. "
+                        "Unset = whatever the STAGE asks for (stages 0-3 ask for it). "
                         "See mzr/DESIGN_COPPER_SEEDED.md")
-    p.add_argument("--geodesic-refresh", type=int, default=16,
-                   help="macro-steps between field refreshes when --copper-seeded")
+    p.add_argument("--geodesic-refresh", type=int, default=None,
+                   help="macro-steps between field refreshes when copper-seeded "
+                        "(unset = the stage's value)")
     p.add_argument("--leg-budget", type=float, default=0.0,
                    help="fraction of the leg geodesic ONE frontier may route "
                         "before retiring (0.6 = half plus slack; 0 disables). "

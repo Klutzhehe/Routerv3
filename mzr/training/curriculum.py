@@ -1,5 +1,31 @@
 """Curriculum stages -- one mechanism per rung, each with a gate.
 
+**Revised 2026-09-02.** Stage 0 sat under its gate for many sessions. The cause
+was measured with NON-LEARNED baselines on the first 48 held-out eval seeds, so
+no policy was implicated -- `mzr/DESIGN.md` section 7.1 has the full evidence.
+Summary of what changed here:
+
+* Stage 0 is **one layer**. It was two, with pads on outer layers, so ~25% of
+  boards could not be routed without a via -- while the policy's init bias makes
+  its untrained argmax exactly `baselines.greedy`, which never vias and
+  therefore failed *exactly and only* those boards (12 of 48, 0 same-layer
+  failures). The stage conflated "route around obstacles" with "discover the
+  via" and reported one number. The via now has its own rung, `0v`.
+* `geodesic_downsample` is 1, not 4. At 4 a 3x3 keepout was invisible to the
+  field (0 coarse cells blocked) and a 10x10 could shrink to one.
+* `copper_seeded` is on, so each leg grows from one end toward its own live
+  copper. Dual-ended growth toward static pads double-routed 24 of 48 boards
+  with no policy involved at all.
+* `max_macro_steps` doubled: one frontier now covers a whole leg, not half.
+
+Measured on those 48 seeds after the change: `greedy` on stage 0 goes from
+completion 0.7500 / copper 2.00 / 24 double-routed / 40.4% right angles to
+**1.0000 / 1.000 / 0 / 0.0%**.
+
+**Standing rule:** run `layer_hop` against a stage's gate before training it.
+If a parameter-free heuristic clears the gate, the stage is not testing what it
+claims; if it cannot, neither can a policy initialised at `greedy`.
+
 `mzr/DESIGN.md` section 7. The stage 0-3 gate is **absolute 100% completion**
 (argmax, sustained 3 consecutive evals).
 
@@ -52,6 +78,38 @@ class Stage:
     #: `--bc-coef` only after a measured plateau.
     bc_coef0: float = 0.0
     reward: RewardConfig = field(default_factory=RewardConfig)
+    #: Resolution the geodesic field is relaxed at. **1 = exact.**
+    #:
+    #: This was 4 everywhere, inherited from a memory argument that only binds
+    #: at 128x128x8. On the 48x48 boards these stages actually use it made the
+    #: field a 12x12 grid, and a coarse cell counts as blocked only when every
+    #: fine cell in it is -- so obstacles vanished. Measured on a 48x48 board:
+    #:
+    #:     3x3  keepout ->  0 coarse cells blocked   (invisible)
+    #:     6x6  keepout ->  0-1, depending on alignment
+    #:     10x10 keepout -> 1-4
+    #:
+    #: `GeneratorConfig.keepout_max_cells` is 10 and keepouts are sampled from
+    #: [3, 10], so the field the whole obstacle-avoidance story rests on could
+    #: not see most of the obstacles it was supposed to route around. At these
+    #: board sizes the exact field costs a few MB.
+    geodesic_downsample: int = 1
+    #: Grow each leg from ONE end, toward the net's live copper, instead of
+    #: from both pads toward each other.
+    #:
+    #: Dual-ended growth toward *static pads* is what causes double-routing,
+    #: and it does so with no policy involved at all: the non-learned
+    #: `layer_hop` baseline double-routes 24 of 48 stage-0 boards at 1.79x
+    #: copper, because the two frontiers mirror around each other, swap
+    #: positions and each completes the whole run while `completion` reads
+    #: 1.000. Four reward patches (`leg_progress`, `tip_progress`,
+    #: `leg_budget_frac`, `wirelength` x12) were built to price that out and
+    #: none removed it. Seeding the field from live copper removes it by
+    #: construction: measured on the same 48 boards, copper_median 1.79 -> 1.00
+    #: and doubled 24 -> 0.
+    copper_seeded: bool = True
+    #: Macro-steps between field refreshes under `copper_seeded`.
+    geodesic_refresh: int = 4
     #: Quality thresholds the gate enforces ALONGSIDE completion.
     #:
     #: Completion alone passed a policy that double-routed 46.5% of boards at
@@ -112,23 +170,36 @@ _RIPUP = RipupRules(interval=8, fraction=0.25)
 
 STAGES: dict[str, Stage] = {
     "0": Stage(
-        name="0: single net, obstacles",
+        name="0: single net, one layer, obstacles -- route around things",
+        height=48, width=48, layers=1,
+        generator=GeneratorConfig(
+            num_nets=1, num_components=3, pin_pitch_cells=4, num_keepouts=3,
+            keepout_max_cells=10,
+        ),
+        ripup=_NO_RIPUP,
+        max_macro_steps=96,
+        gate=("absolute", 1.0),
+        kill="can't reach 0.95 in 500 updates -> geometry or reward bug, not a hard problem",
+    ),
+    "0v": Stage(
+        name="0v: single net, two layers -- the via is mandatory",
         height=48, width=48, layers=2,
         generator=GeneratorConfig(
             num_nets=1, num_components=3, pin_pitch_cells=4, num_keepouts=3,
             keepout_max_cells=10,
         ),
         ripup=_NO_RIPUP,
-        max_macro_steps=48,
+        max_macro_steps=96,
         gate=("absolute", 1.0),
-        kill="can't reach 0.95 in 500 updates -> geometry or reward bug, not a hard problem",
+        kill="can't reach 0.95 in 1000 updates -> the via penalty is drowning "
+             "discovery; drop RewardConfig.via or seed the layer head from layer_hop",
     ),
     "1": Stage(
         name="1: 3 simultaneous nets, price on",
         height=48, width=48, layers=2,
         generator=GeneratorConfig(num_nets=3, num_components=3, pin_pitch_cells=4),
         ripup=_RIPUP,
-        max_macro_steps=48,
+        max_macro_steps=96,
         gate=("absolute", 1.0),
         kill="can't clear 0.90 in 2000 updates -> simultaneous premise is weak; try --bc-coef 0.5",
         # Steering is required here: the geodesic field does not
@@ -141,7 +212,7 @@ STAGES: dict[str, Stage] = {
         height=64, width=64, layers=4,
         generator=GeneratorConfig(num_nets=5, num_components=4, pin_pitch_cells=4),
         ripup=_RIPUP,
-        max_macro_steps=64,
+        max_macro_steps=128,
         gate=("absolute", 1.0),
         kill="can't clear 0.90 in 3000 updates -> add h/g/f, or --bc-coef 0.5",
         # Steering is required here: the geodesic field does not
@@ -157,7 +228,7 @@ STAGES: dict[str, Stage] = {
             multi_pin_frac=0.6, max_pins_per_net=4,
         ),
         ripup=_RIPUP,
-        max_macro_steps=48,
+        max_macro_steps=96,
         gate=("absolute", 1.0),
         kill="can't clear 0.85 in 2000 updates -> the branch point is the problem, "
              "not net count; compare against stage 1 at equal leg count",
@@ -171,7 +242,7 @@ STAGES: dict[str, Stage] = {
         height=64, width=64, layers=4,
         generator=GeneratorConfig(num_nets=8, num_components=4, pin_pitch_cells=4),
         ripup=_RIPUP,
-        max_macro_steps=64,
+        max_macro_steps=128,
         gate=("absolute", 1.0),
         kill="prior can't clear 0.85 -> search is being built on a weak prior; --bc-coef 0.3",
         # Steering is required here: the geodesic field does not
