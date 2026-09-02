@@ -380,9 +380,16 @@ def main() -> int:
     for u in range(start, args.updates):
         t0 = time.time()
         buf = RolloutBuffer()
-        if expert is not None and env.t == 0:
-            expert.plan()
-        obs = collect(env, policy, buf, args.rollout, obs, expert=expert)
+        # Once the anneal has driven bc_coef to 0 the BC term is skipped in
+        # `ppo_update`, but planning and re-planning the expert still costs a
+        # full sequential route per board per cadence tick. Measured on stage 1:
+        # collect 12.2s with the expert against ~3s without, so carrying it for
+        # the 1100 updates after a 400-update anneal would burn ~2.7 hours to
+        # build demonstrations nothing reads. Drop it the moment it stops paying.
+        use_expert = expert if ppo_cfg.bc_coef > 0.0 else None
+        if use_expert is not None and env.t == 0:
+            use_expert.plan()
+        obs = collect(env, policy, buf, args.rollout, obs, expert=use_expert)
         t_collect = time.time() - t0
         with torch.no_grad():
             _last = policy.act(obs, deterministic=False)
