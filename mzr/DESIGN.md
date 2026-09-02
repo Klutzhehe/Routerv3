@@ -455,61 +455,74 @@ is not testing what it claims to test; and if a parameter-free heuristic
 *cannot* clear it, neither can a policy initialised at `greedy`.
 
 
-### 7.2 Stage 0 is solved at initialisation; PPO dips, then recovers
+### 7.2 Where analytic routing actually fails — and why 0/0v are not training stages
 
-Measured after the fixes in 7.1, on 64 held-out seeds, with an **untrained**
-`PriorPolicy`:
+`python -m mzr.scripts.baseline_gate --stage S`, 48 held-out seeds, no learned
+parameters anywhere. Completion against a gate of 1.00:
+
+| stage | `greedy` | `layer_hop` | headroom |
+|---|---|---|---|
+| **0** | 1.0000 | **1.0000** | **none** |
+| **0v** | 0.7500 | **1.0000** | **none** |
+| **1** | 0.6597 | 0.8542 | **0.146** |
+| 1m | 0.2847 | 0.4722 | 0.528 |
+| 2 | 0.5208 | 0.8083 | 0.192 |
+| 3 | 0.4115 | 0.6693 | 0.331 |
+
+**Stages 0 and 0v contain nothing to learn.** A parameter-free heuristic scores
+1.0000 on both, at copper 1.000/1.024 and right-angle 0.000/0.001. After 7.1
+and the layer-logit geodesic skip, an *untrained* `PriorPolicy` reproduces
+`layer_hop` exactly, so it starts at the gate:
 
 ```
-UNTRAINED (update 0):
-  argmax completion 1.0000   perfect 1.0000
-  copper med 1.000   right-angle 0.000   doubled 0   step_mean 0.000
-  GATE: completion PASS | quality PASS
+UNTRAINED on 0v, 64 held-out seeds:
+  argmax completion 1.0000  perfect 1.0000  via_frac 0.0156
+  copper med 1.024  right-angle 0.002  doubled 0   quality PASS   0 failing seeds
 ```
 
-That is the design's own claim — *"a near-zero-init policy starts at the greedy
-baseline"* — holding for the first time. It was false before 7.1: the same init
-scored 0.7500 completion, 2.00x copper and 40.4% right angles.
+Training these stages can therefore only *lose*, and it does. Stage 0v, with
+the skip: clean gate hit at u49 (completion 1.0000, copper 1.024, RA 0.002),
+then **regression at u74 to 0.8750 with 8 failing seeds**. The u49 numbers are
+byte-identical to the untrained policy's — that "hit" was PPO wandering back to
+its initialisation, and u74 was it wandering off again.
 
-Training then **dips below the init before recovering**, and how far it recovers
-depends on one term nobody had sized. Right-angle fraction by update:
+The eval is not at fault. `evaluate()` called four times on a frozen policy
+returns identical numbers to six decimal places, and the reused module-global
+env matches a freshly built one exactly. The swings are real policy change, at
+`approx_kl` 0.001 and `clip_frac` 0.01 — which is what happens once a head is
+near-deterministic (`ent_direction` 0.01): tiny logit changes flip the argmax
+without moving KL, and the gate reads argmax.
 
-| run | change | u24 | u49 | u74 |
+Three reward configurations were tried against this before the cause was
+understood, and the fact that they barely differ is itself the evidence that
+reward was never the lever:
+
+| run | change | RA u24 | u49 | u74 |
 |---|---|---|---|---|
 | A | `length_cost` 0 → 0.03 | 0.220 | 0.220 | 0.220 |
-| B | + `corner` 0.08 → 0.25, `entropy_coef` 0.004 → 0.02 | 0.200 | 0.220 | 0.220 |
-| C | + **`gamma` 0.99 → 0.999** | 0.220 | 0.220 | **0.000** |
+| B | + `corner` 0.08 → 0.25, `entropy_coef` ×5 | 0.200 | 0.220 | 0.220 |
+| C | + `gamma` 0.99 → 0.999 | 0.220 | 0.220 | 0.000 |
 
-Runs A and B never came back. Run C did, to copper 1.000 / right-angle 0.000 /
-completion 1.000 — a clean gate hit. Completion held at 1.000 throughout all
-three; only route *quality* dipped.
+`gamma` was a genuine mis-specification and is kept (at 0.99, with a terminal
+payout of ~12, halving time-to-arrival was worth ~1.79 while the right angles
+it caused cost ~0.34/board, so haste outpaid quality 5:1). But it did not make
+stage 0 a learning problem, because nothing can.
 
-The reason A and B could not recover is that neither touched the term that was
-paying for the bad behaviour. Rolling out fixed step policies under the actual
-reward:
+**So: stages 0 and 0v are substrate regression tests, not training rungs.**
+`verify_world` asserts the untrained argmax *is* `layer_hop`, and
+`baseline_gate` asserts the analytic ceiling. Neither should be given GPU.
+Training starts at **stage 1**, the first rung where the analytic router
+genuinely fails: `layer_hop` 0.8542 against a gate of 1.0000, and the 14.6-point
+gap is exactly the simultaneous-negotiation problem this design exists to
+solve — the geodesic field cannot see other nets' live copper, so yielding a
+channel *requires* leaving your own gradient, which is why `max_d0_frac` is
+armed at 0.95 from stage 1 and disabled below it.
 
-```
-discounted episode return, direction held at d0, 48 held-out boards
-  step=1: return +13.027  completion 1.0000  copper 1.000  right-angle 0.000
-  step=2: return +10.793  completion 0.8750  copper 1.000  right-angle 0.213
-  step=4: return  +9.594  completion 0.8125  copper 1.040  right-angle 0.476
-```
-
-Step 1 wins by +2.2 — but only once `gamma` is 0.999. At 0.99, with a terminal
-payout of ~12, halving time-to-arrival from 40 steps to 20 was worth ~1.79
-while the right angles it caused cost ~0.34 per board, so haste paid ~5x what
-quality charged and the policy correctly took the trade.
-
-The measured handle on it: 91% of the degraded policy's actions were 2-cell
-steps, and **66 of 66 right angles were preceded by a 2-cell segment.** A
-multi-cell step is a straight run in one octant and cannot track a
-diagonal-then-straight geodesic without quantisation error.
-
-**What is still open:** the dip itself. Direction entropy is 0.03 by update 20
-and `value_loss` starts at 14–18, so the first updates take a large policy step
-on advantages the critic cannot yet estimate. Stage 0 recovers because its
-optimum is also its init; a stage whose optimum is elsewhere may not be so
-lucky, so critic warm-up is worth doing before it costs a real rung.
+**One defect this surfaced and did not fix:** stage 1m shows `doubled` 83–86 of
+144 nets at copper 2.4–4.0x under every baseline. Multi-pin nets still
+double-route badly even under copper-seeded growth, so the trunk/spoke handling
+of a branch point is wrong. 1m is off the main spine, but that number should not
+be trusted until it is chased.
 
 ### Expert demonstrations are not optional — add them from stage 1
 
