@@ -187,7 +187,21 @@ class Stage:
 
 
 _NO_RIPUP = RipupRules(interval=0)
-_RIPUP = RipupRules(interval=8, fraction=0.25)
+#: Partial retraction, not whole-net rip-up. `interval=8, fraction=0.25` -- the
+#: old value -- did nothing at all at stage 1: `ripup_round` takes
+#: `floor(3 * 0.25) = 0`, so the negotiation substrate never ran and stage 1's
+#: plateau was simply the ceiling of simultaneous GREEDY growth (DESIGN.md 7.3).
+#:
+#: Measured on stage 1, layer_hop, 48 held-out boards (144 legs), no learning:
+#:
+#:     no rip-up (the old default, k=0)   0.8542  123/144   RA 0.119
+#:     whole-net rip-up, fraction 0.5     0.5625   81/144
+#:     retract 1 step every 4             0.9444  136/144   RA 0.084
+#:
+#: Gentle and frequent wins; retracting 2+ steps every 2 collapses to 0.6181,
+#: the same over-destruction whole-net rips showed. That is PathFinder's
+#: gradualness argument (DESIGN.md section 3) reproduced on this problem.
+_RIPUP = RipupRules(interval=4, retract_steps=1, retract_fraction=0.25)
 
 
 STAGES: dict[str, Stage] = {
