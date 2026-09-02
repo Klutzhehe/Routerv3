@@ -495,8 +495,25 @@ def route_world_board_live(
             if not bool(w.leg_valid[b, n, leg]) or bool(w.leg_done[b, n, leg]):
                 continue
             base = (n * w.cfg.max_legs + leg) * per_leg
-            src = tuple(int(v) for v in w.fr_pos[b, base + END_SRC])
-            dst = tuple(int(v) for v in w.fr_pos[b, base + END_DST])
+            # Each end's anchor is its LIVE frontier if that end is growing,
+            # and its PAD otherwise.
+            #
+            # Under copper-seeded single-ended growth only END_DST is alive, and
+            # `reset_frontiers` writes `fr_pos` for live frontiers only -- so
+            # END_SRC keeps its zero-init and reads (0, 0, 0). Taking it
+            # unconditionally from `fr_pos` planned every leg from the board
+            # origin, which is unroutable, so `route_board` returned no paths
+            # and `replan()` silently changed nothing. Measured before this
+            # fix: 2 open legs -> 0 paths on every board, and the "live" demo
+            # was byte-identical to the stale one.
+            def _anchor(end: int) -> tuple:
+                f = base + end
+                if bool(w.fr_alive[b, f]):
+                    return tuple(int(v) for v in w.fr_pos[b, f])
+                return tuple(int(v) for v in w.net_pad[b, n, leg, end])
+
+            src = _anchor(END_SRC)
+            dst = _anchor(END_DST)
             if src == dst:
                 continue
             legs.append((n, leg, src, dst, int(w.net_width[b, n])))
