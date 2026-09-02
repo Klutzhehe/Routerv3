@@ -1207,6 +1207,7 @@ def test_retraction_preserves_copper() -> None:
     from mzr.training.curriculum import STAGES
     from mzr.training.run import make_env
     from mzr.world import baselines
+    from mzr.world.engine import UNREACHABLE
 
     stage = STAGES["1"]
     seeds = list(range(900_000, 900_016))
@@ -1243,6 +1244,35 @@ def test_retraction_preserves_copper() -> None:
                 bad_conn += 1
 
     total = int(w.ripup_count.sum())
+
+    # A retraction must not let the policy earn `progress` twice for the same
+    # ground. Both field refreshes re-baseline `fr_prev` at the frontier's
+    # CURRENT cell, which after a retreat is the cell it was pulled back to --
+    # forgiving the ground given up, so re-walking it pays again. Measured when
+    # that was live: return_mean climbing to +1.80 while completion fell to
+    # 0.3646, below even `greedy`. Total shaping can never exceed the distance
+    # that existed to be covered at reset.
+    env2 = make_env(stage, batch=16, device="cpu", seed=0)
+    env2.world.cfg.ripup = dataclasses.replace(
+        env2.world.cfg.ripup, retract_steps=4, interval=8
+    )
+    env2.reset(seeds)
+    w2 = env2.world
+    live0 = w2.fr_alive & (w2.fr_prev < UNREACHABLE)
+    budget = float((w2.fr_prev * live0).sum())
+    earned = 0.0
+    for _ in range(stage.max_macro_steps):
+        earned += float(w2.step(*baselines.layer_hop(w2)).progress.sum())
+        if w2.episode_done():
+            break
+    ratio = earned / max(budget, 1.0)
+    check(
+        "retraction cannot farm progress -- shaping still telescopes",
+        ratio <= 1.02 and int(w2.ripup_count.sum()) > 0,
+        f"earned {earned:.1f} of {budget:.1f} cells available at reset "
+        f"(ratio {ratio:.3f}) over {int(w2.ripup_count.sum())} retractions",
+    )
+
     check(
         "retraction gives back only the retracting net's own copper",
         bad_v == 0 and bad_pad == 0 and bad_conn == 0,

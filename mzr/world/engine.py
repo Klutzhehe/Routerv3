@@ -1436,6 +1436,7 @@ class SimultaneousRouterWorld:
         self.occ = torch.where(static_mine, self.static, self.occ)
 
         # 4. move the frontier back to the vertex it retreated to
+        old_pos = self.fr_pos.clone()
         tip = torch.gather(self.route_v, 2,
                            (n_new - 1).view(B, F, 1, 1).expand(B, F, 1, 3)).squeeze(2).long()
         self.fr_pos = torch.where(sel.unsqueeze(-1), tip, self.fr_pos)
@@ -1454,6 +1455,26 @@ class SimultaneousRouterWorld:
             self._refresh_net_geo(incremental=False)
         else:
             self._rebaseline_fr_prev()
+
+        # CHARGE THE RETREAT. Both refreshes above re-baseline `fr_prev` to the
+        # distance at the frontier's CURRENT cell -- which, after a retraction,
+        # is the cell it was just pulled back to. That silently forgives the
+        # ground given up, and then re-walking it earns `progress` a second
+        # time: a policy can farm shaping reward by parking on contested cells
+        # until it is retracted. Measured on the first run with retraction
+        # enabled -- `return_mean` climbing to +1.80 while completion fell to
+        # 0.3646, below even `greedy`.
+        #
+        # Potential-based shaping is only policy-invariant when the potential is
+        # a function of state alone, so the retreat has to be priced like any
+        # other change of position. Re-baselining at the OLD cell against the
+        # NEW field charges exactly the retreat and nothing of the field
+        # refresh, which is what `_rebaseline_fr_prev` exists to keep out.
+        if bool(sel.any()):
+            fld = (self._frontier_field() if self.cfg.copper_seeded
+                   else self.fr_geo.reshape(B * F, self.num_layers, *self._geo_shape).float())
+            at_old = self._geo_at(fld, old_pos.reshape(B * F, 3)).view(B, F)
+            self.fr_prev = torch.where(sel, at_old, self.fr_prev)
         return sel.sum(dim=1)
 
     def _clear_nets(self, sel: torch.Tensor) -> None:
