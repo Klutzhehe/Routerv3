@@ -548,6 +548,8 @@ class SimultaneousRouterWorld:
         ids = torch.arange(N, device=self.device).view(1, N, 1, 1, 1) + 1
         occ5 = self.occ.unsqueeze(1)
         blocked = ((occ5 != OCC_FREE) & (occ5 != ids)).reshape(B * N, L, H, W)
+        # The field must forbid what the MOVER forbids. See geo.dilate_blocked.
+        blocked = self._dilate_for_nets(blocked)
         prev = (
             self.net_geo.reshape(B * N, L, *self._geo_shape).float()
             if incremental and self.net_geo is not None else None
@@ -583,6 +585,23 @@ class SimultaneousRouterWorld:
                 upsample=False,
             )
             self.net_geo_tip = fld_t.reshape(B, N, L, *self._geo_shape).to(torch.float16)
+
+    def _field_radius(self, width_class: torch.Tensor) -> int:
+        """Dilation radius for a geodesic field shared by these nets.
+
+        One field is relaxed per net, but the pool is dilated in a single
+        max-pool, so a shared radius is needed. Take the WIDEST net's radius:
+        under-dilating re-opens the plan-a-gap-you-cannot-enter bug this exists
+        to close, while over-dilating only makes a narrow corridor look shut,
+        which costs a detour rather than a stall.
+        """
+        if width_class.numel() == 0:
+            return 1
+        w = int(width_class.max())
+        return int(self.spec.rules.width_radius_cells(w)) + 1
+
+    def _dilate_for_nets(self, blocked: torch.Tensor) -> torch.Tensor:
+        return geo.dilate_blocked(blocked, self._field_radius(self.net_width.reshape(-1)))
 
     def _rebaseline_fr_prev(self) -> None:
         """Re-measure every frontier's distance against the NEW field.
@@ -661,6 +680,9 @@ class SimultaneousRouterWorld:
         own = (n_i + 1).view(-1, 1, 1, 1).to(self.occ.dtype)
         sub = self.occ[b_i]
         blocked = (sub != OCC_FREE) & (sub != own)
+        # Same rule as the copper-seeded path: plan only where a trace fits.
+        blocked = geo.dilate_blocked(blocked, self._field_radius(
+            self.net_width.gather(1, n_i.view(1, -1)).reshape(-1)))
 
         fld = geo.geodesic_field(
             blocked,

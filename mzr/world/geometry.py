@@ -521,6 +521,39 @@ def _relax_octile(dist: torch.Tensor) -> torch.Tensor:
     return torch.minimum(-ortho + 1.0, -diag + DIAG_COST)
 
 
+def dilate_blocked(blocked: torch.Tensor, radius: int) -> torch.Tensor:
+    """Grow an obstacle mask by the footprint a trace centred on a cell occupies.
+
+    The geodesic field and the mover must agree about what is passable. They did
+    not: `engine._refresh_net_geo` / `_refresh_geodesic` built `blocked` per
+    CELL, while `check_moves` / `move_claims` test the trace's width-dilated
+    footprint. So the field happily planned a route through a gap one cell wide,
+    the frontier was steered into it, every move was rejected, and the net sat
+    idle until it was retired.
+
+    `expert.py::_BoardRouter._dilate` already fixed exactly this on the planner
+    side, and its docstring records the cost of not having it -- "every one of
+    24 legs planned successfully and only 46% of them stamped". The engine's own
+    field never got the same treatment.
+
+    Measured on stage 1, 48 held-out boards: every one of the 21 failing nets
+    had a route available on the live board at the moment it died (found by the
+    expert's *dilated* planner), while the undilated field could not see it.
+
+    Radius is the trace's width radius plus one, the extra cell covering the
+    corner guards a 45-degree move reserves beside itself -- identical to the
+    expert.
+    """
+    if radius <= 0:
+        return blocked
+    m, L, H, W = blocked.shape
+    k = 2 * radius + 1
+    grown = F.max_pool2d(
+        blocked.reshape(m * L, 1, H, W).float(), k, stride=1, padding=radius
+    )
+    return grown.reshape(m, L, H, W) > 0.5
+
+
 def geodesic_field_multi(
     blocked: torch.Tensor,
     sources: torch.Tensor,
