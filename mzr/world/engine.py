@@ -79,6 +79,11 @@ STATUS_FAILED = 2
 #: unreachable frontier could always trigger it.
 UNREACHABLE = 1e5
 
+#: `fr_since_retract` for a frontier that has never been retracted. Any value
+#: past the observation's saturation window reads identically, so this only has
+#: to be comfortably larger than that.
+_NEVER_RETRACTED = 1_000_000
+
 #: Length charged for a via, in cell units. A via is cheap in lattice cells but
 #: expensive in reality (drill cost, stub, reliability). Without a charge a
 #: free via action will drill its way out of every problem instead of learning
@@ -329,6 +334,18 @@ class SimultaneousRouterWorld:
         #: `fr_stuck` cannot see a frontier that oscillates *legally*.
         self.fr_best = torch.full((B, F), float("inf"), dtype=torch.float32, device=dev)
         self.fr_idle = z(B, F)
+        #: Macro-steps since this frontier was last retracted; large when it
+        #: never has been. A retraction cuts the frontier's trail and teleports
+        #: it backwards, and until this existed **nothing in the observation
+        #: said so** -- the policy saw its own position jump with no cause it
+        #: could perceive, and the value head had to predict returns across a
+        #: discontinuity it had no signal for. Measured on the first run with
+        #: retraction live: 37% of the trained policy's moves were illegal
+        #: (2102 of 5654) against layer_hop's 2.5%, and completion fell from an
+        #: untrained 0.8750 to 0.3802. Same class of defect as the corner
+        #: penalty being charged on a heading the policy could not see.
+        self.fr_since_retract = torch.full((B, F), _NEVER_RETRACTED,
+                                           dtype=torch.int64, device=dev)
         #: Last accepted absolute heading, or -1 before a frontier has moved.
         #: A via does not change it: a layer change is not a corner.
         self.fr_dir = torch.full((B, F), -1, dtype=torch.long, device=dev)
@@ -421,6 +438,7 @@ class SimultaneousRouterWorld:
         self.fr_stuck.zero_()
         self.fr_best.fill_(float("inf"))
         self.fr_idle.zero_()
+        self.fr_since_retract.fill_(_NEVER_RETRACTED)
         self.fr_dir.fill_(-1)
         self.leg_D.zero_()
         self.leg_gap.zero_()
@@ -512,6 +530,9 @@ class SimultaneousRouterWorld:
         self.fr_stuck = torch.where(alive, torch.zeros_like(self.fr_stuck), self.fr_stuck)
         self.fr_best = torch.where(alive, torch.full_like(self.fr_best, float("inf")), self.fr_best)
         self.fr_idle = torch.where(alive, torch.zeros_like(self.fr_idle), self.fr_idle)
+        self.fr_since_retract = torch.where(
+            alive, torch.full_like(self.fr_since_retract, _NEVER_RETRACTED),
+            self.fr_since_retract)
         self.fr_dir = torch.where(alive, torch.full_like(self.fr_dir, -1), self.fr_dir)
         ripped = self._fr_view(alive).any(dim=3)
         tot = self._fr_view(self.fr_prev).sum(dim=3)
@@ -925,6 +946,9 @@ class SimultaneousRouterWorld:
 
         self.fr_steps = torch.where(live, self.fr_steps + 1, self.fr_steps)
         self.fr_stuck = torch.where(rejected, self.fr_stuck + 1, torch.zeros_like(self.fr_stuck))
+        self.fr_since_retract = torch.where(
+            live & (self.fr_since_retract < _NEVER_RETRACTED),
+            self.fr_since_retract + 1, self.fr_since_retract)
 
         # Idle = took a legal step and still did not beat its own best
         # cost-to-go. A tolerance of half a cell, so float noise in the field
@@ -1448,6 +1472,9 @@ class SimultaneousRouterWorld:
         self.fr_stuck = torch.where(sel, torch.zeros_like(self.fr_stuck), self.fr_stuck)
         self.fr_idle = torch.where(sel, torch.zeros_like(self.fr_idle), self.fr_idle)
         self.fr_best = torch.where(sel, torch.full_like(self.fr_best, float("inf")), self.fr_best)
+        # The policy has to be able to SEE this happen -- see fr_since_retract.
+        self.fr_since_retract = torch.where(
+            sel, torch.zeros_like(self.fr_since_retract), self.fr_since_retract)
 
         self.ripup_count += sel.sum(dim=1)
         self._refresh_geodesic(sel)

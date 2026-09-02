@@ -75,7 +75,14 @@ FIELD_CHANNELS = 7
 LENGTH_SCALE = 32.0
 
 #: Extra per-frontier scalars, counted in `frontier_feature_dim`.
-NUM_SCALARS = 12
+#: 12 -> 14 adds the two retraction features; see `build_observation`.
+NUM_SCALARS = 14
+
+#: Macro-steps over which "I was recently retracted" decays to nothing. A
+#: retraction cuts the frontier's trail and moves it backwards, so the cells
+#: ahead of it are ones it has already walked and the price field around it is
+#: about to change; a few steps is how long that stays true.
+RETRACT_WINDOW = 8.0
 
 
 def frontier_feature_dim(num_layers: int) -> int:
@@ -324,6 +331,18 @@ def build_observation(world) -> Observation:
     to_partner = (partner[:, 1:] - pos[:, 1:]).float().norm(dim=-1) / LENGTH_SCALE
     own_price = price[b_flat, pos[:, 0], pos[:, 1], pos[:, 2]]
 
+    # Was this frontier just retracted, and how recently? Until these existed
+    # the policy watched its own position jump backwards every few steps with
+    # no observable cause, and the value head had to price returns across a
+    # discontinuity it could not see. Measured on the first run with retraction
+    # live: 37% of the trained policy's moves were illegal (2102 of 5654)
+    # against layer_hop's 2.5%, and completion collapsed from an untrained
+    # 0.8750 to 0.3802 by update 49. Same defect as charging a corner penalty
+    # on a heading the policy was never shown.
+    since = world.fr_since_retract.reshape(M).float()
+    just_retracted = (since <= 1.0).float()
+    retract_recency = (1.0 - (since / RETRACT_WINDOW)).clamp(0.0, 1.0)
+
     scalars = torch.stack(
         [
             dist,
@@ -338,6 +357,8 @@ def build_observation(world) -> Observation:
             (world.net_vias.gather(1, net).reshape(M).float() / 8.0).clamp(0.0, 4.0),
             free_ego[:, 0].float() / float(max(STEP_LENGTHS)),
             torch.full((M,), world.step_count / max(1, world.cfg.max_macro_steps), device=dev),
+            just_retracted,
+            retract_recency,
         ],
         dim=-1,
     )
