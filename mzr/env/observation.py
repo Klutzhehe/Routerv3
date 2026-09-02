@@ -119,6 +119,12 @@ class Observation:
     #: policy spends most of its actions attempting impossible vias -- measured
     #: at a 92.6% rejected-action rate against a 1.6% baseline.
     via_safe: torch.Tensor
+    #: (B, F, L, C) bool -- the same question per via CLASS. The `via` head is
+    #: gated on this given the layer actually chosen, exactly as the `step` head
+    #: is gated on the direction actually chosen: marginalising them separately
+    #: lets the policy pick a layer legal for a small via and a class that does
+    #: not fit, which nothing then rejects until the engine does.
+    via_class_safe: torch.Tensor
     #: (B, F, L) float32 -- cost-to-go from this (y, x) on **every** layer,
     #: relative to the current one. Negative means that layer is closer. This is
     #: the layer head's whole decision basis, and it is why the geodesic field is
@@ -154,6 +160,7 @@ def stack_observations(obs_list: list[Observation]) -> Observation:
         frontier_mask=torch.cat([o.frontier_mask for o in obs_list], dim=0),
         safety=torch.cat([o.safety for o in obs_list], dim=0),
         via_safe=torch.cat([o.via_safe for o in obs_list], dim=0),
+        via_class_safe=torch.cat([o.via_class_safe for o in obs_list], dim=0),
         geo_layer=torch.cat([o.geo_layer for o in obs_list], dim=0),
         bearing=torch.cat([o.bearing for o in obs_list], dim=0),
         is_pair=torch.cat([o.is_pair for o in obs_list], dim=0),
@@ -300,18 +307,30 @@ def build_observation(world) -> Observation:
         tl = torch.arange(L, device=dev)
         lo = torch.minimum(pos[:, 0:1], tl.view(1, L)).reshape(-1)
         hi = torch.maximum(pos[:, 0:1], tl.view(1, L)).reshape(-1)
-    via_safe = torch.zeros(M, L, dtype=torch.bool, device=dev)
+    # Legality per (target layer, via CLASS). It used to be computed for class 0
+    # alone while `engine._plan` validates the class the policy actually chose,
+    # so a bigger via was never checked by anything: the layer head was masked
+    # against the smallest footprint, the via head against nothing at all, and
+    # `RewardConfig.via` is flat across classes so nothing else constrained it.
+    # Measured on a stage-1 policy: 2424 via attempts in 3674 frontier-steps
+    # (66%), 1429 of them illegal, against layer_hop's 141 attempts.
+    n_via = world.spec.rules.num_via_classes
+    via_class_safe = torch.zeros(M, L, n_via, dtype=torch.bool, device=dev)
     for l in range(L):
         if world.spec.layers.through_only:
             vlo, vhi = lo, hi
         else:
             vlo = torch.minimum(pos[:, 0], torch.full_like(pos[:, 0], l))
             vhi = torch.maximum(pos[:, 0], torch.full_like(pos[:, 0], l))
-        vflat, vvalid = geo.via_claims(
-            world.occ, b_flat, vlo, vhi, pos[:, 1], pos[:, 2],
-            torch.zeros(M, dtype=torch.long, device=dev), world.tables,
-        )
-        via_safe[:, l] = geo.claims_passable(world.occ, vflat, vvalid, n_flat)
+        for c in range(n_via):
+            vflat, vvalid = geo.via_claims(
+                world.occ, b_flat, vlo, vhi, pos[:, 1], pos[:, 2],
+                torch.full((M,), c, dtype=torch.long, device=dev), world.tables,
+            )
+            via_class_safe[:, l, c] = geo.claims_passable(world.occ, vflat, vvalid, n_flat)
+    # `via_diameters` ascends, so class 0 is the smallest footprint and the
+    # right marginal for the LAYER head: if no class fits, class 0 does not.
+    via_safe = via_class_safe[..., 0].clone()
     # Staying put is always "legal"; the layer head reads index 0 as stay.
     via_safe[:, 0] = via_safe[:, 0] | (pos[:, 0] == 0)
 
@@ -391,6 +410,7 @@ def build_observation(world) -> Observation:
         frontier_mask=alive,
         safety=safety_ego.view(B, F, NUM_DIRECTIONS, NUM_STEPS),
         via_safe=via_safe.view(B, F, L),
+        via_class_safe=via_class_safe.view(B, F, L, n_via),
         geo_layer=geo_layer.view(B, F, L),
         bearing=bearing.view(B, F),
         is_pair=is_pair,

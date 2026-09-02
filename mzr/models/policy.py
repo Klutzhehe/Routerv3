@@ -324,6 +324,38 @@ class PriorPolicy(nn.Module):
     # -- rollout / update API -------------------------------------------
 
     @staticmethod
+    def _via_logits_given_layer(
+        via_logits: torch.Tensor, via_class_safe: torch.Tensor, layer: torch.Tensor
+    ) -> torch.Tensor:
+        """Mask the via head by the legality of (layer, via class) JOINTLY.
+
+        The exact analogue of `_step_logits_given_direction`, and it exists for
+        the same reason. `via_safe` gates the LAYER head using via class 0 -- the
+        smallest footprint -- while `engine._plan` validates the class the
+        policy actually chose. Marginalising those separately lets the policy
+        pick a layer that admits a small via and a class that does not fit, a
+        combination neither mask forbids. Nothing else constrained it either:
+        `RewardConfig.via` is flat across classes.
+
+        Measured on a stage-1 policy before this existed: 2424 via attempts over
+        3674 frontier-steps (66%), 1429 of them illegal, against `layer_hop`'s
+        141 attempts. Completion fell from an untrained 0.8750 to 0.7014.
+
+        `layer` is the layer ACTION: 0 = stay, j > 0 = via to layer j-1. When it
+        is 0 the head is unread, so the row is left unmasked.
+        """
+        B, F, L, C = via_class_safe.shape
+        tgt = (layer - 1).clamp(0, L - 1)
+        ok = torch.gather(
+            via_class_safe, 2, tgt.view(B, F, 1, 1).expand(B, F, 1, C)
+        ).squeeze(2)
+        # Staying put reads no via class, and an all-masked row would NaN the
+        # Categorical -- leave both cases open.
+        ok = torch.where((layer > 0).unsqueeze(-1), ok, torch.ones_like(ok))
+        ok = torch.where(ok.any(dim=-1, keepdim=True), ok, torch.ones_like(ok))
+        return via_logits - _BIG * (~ok).float()
+
+    @staticmethod
     def _step_logits_given_direction(
         step_logits: torch.Tensor, safety: torch.Tensor, direction: torch.Tensor
     ) -> torch.Tensor:
@@ -368,8 +400,15 @@ class PriorPolicy(nn.Module):
         logits["step"] = self._step_logits_given_direction(
             logits["step"], obs.safety, action["direction"]
         )
+        # Layer must be drawn before `via`, which is only meaningful given it.
+        l_dist = torch.distributions.Categorical(logits=logits["layer"])
+        action["layer"] = pick(l_dist)
+        logp["layer"] = l_dist.log_prob(action["layer"])
+        logits["via"] = self._via_logits_given_layer(
+            logits["via"], obs.via_class_safe, action["layer"]
+        )
         for k, dist in self._dists(
-            {k: v for k, v in logits.items() if k != "direction"}
+            {k: v for k, v in logits.items() if k not in ("direction", "layer")}
         ).items():
             a = pick(dist)
             action[k] = a
@@ -409,6 +448,10 @@ class PriorPolicy(nn.Module):
         logits["step"] = self._step_logits_given_direction(
             logits["step"], obs.safety, action["direction"]
         )
+        if "layer" in action:
+            logits["via"] = self._via_logits_given_layer(
+                logits["via"], obs.via_class_safe, action["layer"]
+            )
         dists = self._dists(logits)
         m = obs.frontier_mask.float()
         logp = torch.zeros_like(m)
