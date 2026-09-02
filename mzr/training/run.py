@@ -210,6 +210,10 @@ def main() -> int:
                         "line, charged per completed net across BOTH frontiers")
     p.add_argument("--corner", type=float, default=None,
                    help="per 45-degree octant of bend beyond the first")
+    p.add_argument("--gamma", type=float, default=None,
+                   help="PPO discount (unset = the stage's, 0.999). At 0.99 the "
+                        "terminal payout makes finishing fast worth ~5x what the "
+                        "corner penalty charges, and the policy takes long steps")
     p.add_argument("--length-cost", type=float, default=None,
                    help="per cell of copper laid. A flat --step-cost discounts "
                         "long steps; this charges what they actually lay, which "
@@ -310,6 +314,7 @@ def main() -> int:
         lr=args.lr, bc_coef=bc, epochs=args.epochs,
         minibatches=args.minibatches, entropy_coef=args.entropy_coef,
         per_frontier_adv=args.per_frontier_adv,
+        gamma=stage.gamma if args.gamma is None else args.gamma,
     )
 
     start, best = 0, -1.0

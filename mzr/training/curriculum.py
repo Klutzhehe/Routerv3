@@ -110,6 +110,28 @@ class Stage:
     copper_seeded: bool = True
     #: Macro-steps between field refreshes under `copper_seeded`.
     geodesic_refresh: int = 4
+    #: PPO discount. **0.999, not the usual 0.99**, and the difference is the
+    #: whole route-quality story on stage 0.
+    #:
+    #: These episodes are short and hard-bounded by `max_macro_steps`, so there
+    #: is no reason for a strong time preference -- but 0.99 imposes one. With a
+    #: terminal payout of ~12 (`arrival` 2 + `completion` 10), halving
+    #: time-to-arrival from 40 steps to 20 is worth
+    #:
+    #:     0.99**20 * 12 - 0.99**40 * 12  ~=  1.79
+    #:
+    #: while the right angles that haste causes cost ~0.34 per board at
+    #: `corner` 0.25. So finishing fast paid about 5x what quality charged, and
+    #: the policy took the trade -- correctly, under the reward it was given.
+    #:
+    #: Measured on the first two post-fix runs: the step-class histogram came
+    #: out {1 cell: 34, 2 cells: 334} and **every one of the 66 right angles
+    #: was preceded by a 2-cell segment** -- 66 of 66. Raising `corner` from
+    #: 0.08 to 0.25 and `entropy_coef` from 0.004 to 0.02 moved right-angle
+    #: 0.22 -> 0.20, i.e. not at all, because neither touches the term that was
+    #: actually paying. At 0.999 the same haste is worth ~0.23, which is the
+    #: same order as the quality terms.
+    gamma: float = 0.999
     #: Quality thresholds the gate enforces ALONGSIDE completion.
     #:
     #: Completion alone passed a policy that double-routed 46.5% of boards at
