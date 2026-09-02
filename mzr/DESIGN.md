@@ -454,6 +454,58 @@ frame as the action*.
 is not testing what it claims to test; and if a parameter-free heuristic
 *cannot* clear it, neither can a policy initialised at `greedy`.
 
+
+### 7.2 Stage 0 is now solved at initialisation — and PPO degrades it
+
+Measured after the fixes in 7.1, on 64 held-out seeds, with an **untrained**
+`PriorPolicy`:
+
+```
+UNTRAINED (update 0):
+  argmax completion 1.0000   perfect 1.0000
+  copper med 1.000   right-angle 0.000   doubled 0   step_mean 0.000
+  GATE: completion PASS | quality PASS
+```
+
+That is the design's own claim — *"a near-zero-init policy starts at the greedy
+baseline"* — holding for the first time. It was false before 7.1: the same init
+scored 0.7500 completion, 2.00x copper and 40.4% right angles.
+
+**But training makes it worse.** Across three runs with materially different
+rewards, the trained policy converged within ~20 updates to the *same* degraded
+behaviour — copper 1.035, right-angle 0.22, direction entropy 0.01 — identical
+to three decimal places each time:
+
+| run | change | right-angle at u24 / u49 |
+|---|---|---|
+| A | `length_cost` 0 → 0.03 | 0.220 / 0.220 |
+| B | + `corner` 0.08 → 0.25, `entropy_coef` 0.004 → 0.02 | 0.200 / 0.220 |
+| C | + `gamma` 0.99 → 0.999 | 0.220 / 0.220 |
+
+Reward changes moving nothing is itself the diagnosis: the reward is not what
+selects the behaviour. Rolling out fixed step policies under the *actual*
+reward confirms the specification is right:
+
+```
+discounted episode return, direction held at d0, 48 held-out boards
+  step=1: return +13.027  completion 1.0000  copper 1.000  right-angle 0.000
+  step=2: return +10.793  completion 0.8750  copper 1.000  right-angle 0.213
+  step=4: return  +9.594  completion 0.8125  copper 1.040  right-angle 0.476
+```
+
+Step 1 wins by +2.2, and it is what the init bias already selects. The policy
+moves *away* from the optimum and cannot return: direction entropy is 0.03 by
+update 20, and `value_loss` starts at 14–18, so the first few updates take a
+large policy step on advantages the critic cannot yet estimate. This is
+ordinary premature convergence, and it is a **training-stability** problem, not
+a routing one — but it will follow the policy up the curriculum, so it is the
+next thing to fix rather than something to tune around.
+
+The measured handle on it: 91% of the trained policy's actions were 2-cell
+steps, and **66 of 66 right angles were preceded by a 2-cell segment.** A
+multi-cell step is a straight run in one octant and cannot track a
+diagonal-then-straight geodesic without quantisation error.
+
 ### Expert demonstrations are not optional — add them from stage 1
 
 **PRIMAL** (Sartoretti et al. 2019) is the closest published analogue to what
