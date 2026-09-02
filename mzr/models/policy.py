@@ -344,8 +344,20 @@ class PriorPolicy(nn.Module):
             "mask": obs.frontier_mask,
         }
 
-    def evaluate(self, obs: Observation, action: dict[str, torch.Tensor]) -> dict:
-        out = self.forward(obs)
+    def evaluate(self, obs: Observation, action: dict[str, torch.Tensor],
+                 out: "PolicyOutput | None" = None) -> dict:
+        """Score `action` under the policy at `obs`.
+
+        `out` lets a caller supply an already-computed forward pass. Behaviour
+        cloning scores TWO action sets at the same observation -- the policy's
+        own and the expert's -- and running `forward()` twice re-runs the 3-D
+        field encoder on identical input. Measured on stage 0, that doubled
+        the PPO phase from 2.6s to 5.3s per update while `collect` was
+        unchanged at 1.3s. The encoder is already known to dominate here (see
+        `stack_observations`: "~30 s of the ~40 s update").
+        """
+        if out is None:
+            out = self.forward(obs)
         logits = dict(out.logits)
         # Condition on the direction that was actually taken, so this is the
         # same distribution act() drew from. See _step_logits_given_direction.

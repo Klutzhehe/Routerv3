@@ -204,7 +204,11 @@ def ppo_update(
 
             mb_oldval = torch.cat([buf.values[tt] for tt in steps], dim=0)     # (k*B,)
 
-            ev = policy.evaluate(mb_obs, mb_act)
+            # One forward pass, scored twice: the PPO ratio uses the policy's
+            # own action, behaviour cloning the expert's. Both at the same
+            # observation, so the (heavy) field encoder runs once.
+            _fwd = policy.forward(mb_obs)
+            ev = policy.evaluate(mb_obs, mb_act, out=_fwd)
             new_logp = ev["logp"]                                              # (k*B, F)
             n_live = mb_mask.sum().clamp_min(1.0)
 
@@ -233,7 +237,9 @@ def ppo_update(
                     for key in buf.bc_actions[steps[0]]["action"]
                 }
                 w = torch.cat([buf.bc_actions[t]["mask"] for t in steps], dim=0).float()
-                evb = policy.evaluate(mb_obs, mb_bc)
+                # Reuse the forward pass the PPO term already computed --
+                # same observation, so the field encoder must not run twice.
+                evb = policy.evaluate(mb_obs, mb_bc, out=_fwd)
                 bc_term = -(evb["logp"] * w).sum() / w.sum().clamp_min(1.0)
 
             loss = (
