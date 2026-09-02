@@ -583,6 +583,18 @@ def dilate_blocked(blocked: torch.Tensor, radius: int) -> torch.Tensor:
     return grown.reshape(m, L, H, W) > 0.5
 
 
+#: How often the relaxation loops check whether they have converged.
+#:
+#: `torch.equal` forces a GPU->CPU synchronisation, so checking every iteration
+#: serialises the whole loop against the host. That was affordable while the
+#: field warm-started from the previous one and needed a handful of sweeps; it
+#: is not once a price toll is in the cost, because a toll can RAISE distances
+#: and the relaxation has to run from `inf` every refresh. Checking on a stride
+#: keeps the early exit while paying for one sync per `CONVERGENCE_STRIDE`
+#: sweeps -- the cost of overshooting is a few redundant sweeps, and the cost of
+#: not checking at all is the full iteration cap every single time.
+CONVERGENCE_STRIDE = 16
+
 def coarsen_price(price: torch.Tensor, downsample: int) -> torch.Tensor:
     """Average a full-resolution price field down to the geodesic grid.
 
@@ -684,7 +696,7 @@ def geodesic_field_multi(
     if price is not None and price_weight > 0.0:
         toll = price_weight * coarsen_price(price.float(), ds)
 
-    for _ in range(iterations):
+    for it in range(iterations):
         cand = _relax_octile(dist, coarse)
         if toll is not None:
             cand = cand + toll
@@ -699,7 +711,7 @@ def geodesic_field_multi(
         cand = torch.where(coarse, torch.full_like(cand, float("inf")), cand)
         new = torch.minimum(dist, cand)
         new = torch.where(src, torch.zeros_like(new), new)
-        if torch.equal(new, dist):
+        if it % CONVERGENCE_STRIDE == CONVERGENCE_STRIDE - 1 and torch.equal(new, dist):
             dist = new
             break
         dist = new
@@ -795,7 +807,7 @@ def geodesic_field(
     if price is not None and price_weight > 0.0:
         toll = price_weight * coarsen_price(price.float(), ds)
 
-    for _ in range(iterations):
+    for it in range(iterations):
         # In-plane relaxation: octile-weighted, no corner cutting.
         cand = _relax_octile(dist, coarse)
         if toll is not None:
@@ -812,7 +824,7 @@ def geodesic_field(
         cand = torch.where(coarse, torch.full_like(cand, float("inf")), cand)
         new = torch.minimum(dist, cand)
         new[idx, tl, ty, tx] = 0.0
-        if torch.equal(new, dist):
+        if it % CONVERGENCE_STRIDE == CONVERGENCE_STRIDE - 1 and torch.equal(new, dist):
             dist = new
             break
         dist = new
